@@ -138,6 +138,122 @@ fn retention_dangling_predecessor_frontier_preserves_original_authority() {
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
+fn historical_retention_fixture(service: &Service, owner: &str, with_seed: bool) -> Session {
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("historical-retention".into()),
+        completed_requests: 1,
+        ..Session::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"historical source"})])
+        .unwrap();
+    session.primary.calls = 1;
+    session.primary.cost_usd = 0.002;
+    let mut evidence = crate::proxy_savings::RequestEvidence::default();
+    evidence.prior_untracked(1);
+    session.request_evidence = Some(evidence);
+    if with_seed {
+        let estimate = crate::proxy_savings::Estimate {
+            observed_primary_cost: Some(0.002),
+            coverage: crate::proxy_savings::Coverage {
+                primary_responses: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let seed = json!({"format":"carry-historical-success-seed-v1", "prefixes":[{
+            "source_sha256":"a".repeat(64), "owner":owner, "history_namespace":"historical-retention",
+            "primary_attempts":1, "reviewer_attempts":0, "estimate":estimate
+        }]});
+        std::fs::write(
+            service.config.state_dir.join("historical-success.seed"),
+            serde_json::to_vec(&seed).unwrap(),
+        )
+        .unwrap();
+    }
+    session
+}
+
+#[test]
+fn retention_import_accounts_validated_historical_success_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let owner = "b".repeat(64);
+    let session = historical_retention_fixture(&service, &owner, true);
+    let session = recover_success_prefix(&service, &owner, session).unwrap();
+    let expected = serde_json::to_value(
+        session
+            .request_evidence
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .dashboard(false),
+    )
+    .unwrap();
+    assert_eq!(expected["observed_primary_cost"], 0.002);
+    save(&service, &owner, &session).unwrap();
+    let path = directory.path().join("history.index");
+    let predecessor = history::fixture::read_index(&path);
+    std::fs::write(&path, predecessor).unwrap();
+    std::fs::remove_file(directory.path().join("historical-success.seed")).unwrap();
+    history::initialize(&service).unwrap();
+    let page = history::accounting(&service, 0, "", 100).unwrap();
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        page["records"][0]["estimate"], expected,
+        "import must validate embedded historical proof before freezing the accounting observation"
+    );
+}
+
+#[test]
+fn retention_evidence_transition_adds_observation_without_rewriting_money() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let owner = "b".repeat(64);
+    let session = historical_retention_fixture(&service, &owner, false);
+    save(&service, &owner, &session).unwrap();
+    let first = history::accounting(&service, 0, "", 100).unwrap()["records"][0].clone();
+    historical_retention_fixture(&service, &owner, true);
+    let validated = load(&service, &owner).unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            validated
+                .request_evidence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .dashboard(false)
+        )
+        .unwrap()["observed_primary_cost"],
+        0.002
+    );
+    save(&service, &owner, &validated).unwrap();
+    let records = history::accounting(&service, 0, "", 100).unwrap()["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        records.len(),
+        2,
+        "new validated evidence must not be suppressed by unchanged paid counters"
+    );
+    assert_eq!(
+        records[0], first,
+        "old frozen money/provenance must remain immutable"
+    );
+    assert_eq!(records[1]["primary"], records[0]["primary"]);
+    assert_eq!(records[1]["estimate"]["observed_primary_cost"], 0.002);
+    save(&service, &owner, &validated).unwrap();
+    assert_eq!(
+        history::accounting(&service, 0, "", 100).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 #[test]
 fn retention_predecessor_import_preserves_money_bindings_and_rejects_capacity_atomically() {
     at_decision_clock(&[5_000_000], || {
