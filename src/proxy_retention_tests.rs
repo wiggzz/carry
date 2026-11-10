@@ -26,13 +26,17 @@ fn a_retention_existing_owner_admission_completes_without_lock_recursion() {
         }
         let output = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("retention-admission: durable owner and direct pin ready"),
-            "{mode} failed fixture preconditions: {output:?}"
-        );
         // Bypass libtest capture: other tests may be stalled on the same
-        // production lock, so preserve qualified outcomes before suite exit.
+        // production lock, so preserve setup errors and qualified outcomes.
         use std::io::Write as _;
+        if !stderr.contains("retention-admission: durable owner and direct pin ready") {
+            writeln!(
+                std::io::stderr(),
+                "retention-admission: {mode} fixture preconditions failed: {output:?}"
+            )
+            .unwrap();
+            panic!("{mode} failed fixture preconditions: {output:?}");
+        }
         writeln!(
             std::io::stderr(),
             "retention-admission: {mode} seed_ready=true timed_out={timed_out} status={:?}",
@@ -56,6 +60,9 @@ fn retention_existing_owner_admission_child() {
     };
     let directory = tempfile::tempdir().unwrap();
     let service = checkpoint_service(directory.path());
+    // Production establishes the durable store at namespace resolution before
+    // either candidate lookup or owner resolution can read it.
+    history::initialize(&service).unwrap();
     let input = vec![json!({"role":"user","content":"retained continuation"})];
     let body = json!({"input":input});
     let (id, pin) = history::resolve(&service, "admission-namespace", &body).unwrap();
