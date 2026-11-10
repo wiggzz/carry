@@ -720,6 +720,124 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(len(fixture.reviews), 1)
 
 
+    def test_shared_prefix_preserves_applied_projection_and_native_sizing_after_auxiliary_cancel(self):
+        """Real wires/receipts: applied A is not B's current mutable tip."""
+        import base64
+        import socket
+        import threading
+        import zlib
+        root = self.state
+        outcomes = []
+        for arm in ("direct", "sibling", "sibling_restart"):
+            with self.subTest(arm=arm):
+                self.state = root / arm
+                self.state.mkdir()
+                held, release = threading.Event(), threading.Event()
+                self.stack.callback(release.set)
+                a = [{"role": "user", "content": "R8_PROTECTED_GOAL"},
+                     {"role": "assistant", "content": "R8_RAW_A " + "payload " * 6000},
+                     {"role": "user", "content": "R8_KEEP_SEPARATOR"},
+                     {"type": "reasoning", "summary": [], "encrypted_content": "R8_NATIVE_OPAQUE_A"},
+                     {"role": "user", "content": "R8_A_BOUNDARY"}]
+                b = a + [{"role": "assistant", "content": "R8_RAW_B " + "branch " * 6000},
+                         {"role": "user", "content": "R8_B_BOUNDARY"}]
+                c = a + [{"role": "user", "content": "R8_FOREGROUND_C"}]
+                receipts = []
+                def primary(body, n):
+                    if arm != "direct" and n == 4:
+                        held.set()
+                        self.assertTrue(release.wait(10), "release cancelled auxiliary after publication")
+                    tokens = 50000 if a[1] in body["input"] else 20000 if b[-2] in body["input"] else 10000
+                    value = completed(response_id=f"r8_{arm}_{n}", input_tokens=tokens)
+                    receipts.append(value)
+                    return 200, value
+                def review(body, _n):
+                    is_b = "R8_B_BOUNDARY" in json.dumps(body)
+                    return 200, advice_response({"protected": [2] if is_b else [1],
+                        "removable": [6] if is_b else [2], "memories": [
+                            {"source_ids": [6 if is_b else 2], "text": "R8_B_ONLY_FACT" if is_b else "R8_A_FACT"}]})
+                fixture = self.fixture(primary, review)
+                seed_options = ["--review-replayed-history", "--payoff-requests", "1",
+                                "--classifier-cache-policy", "disabled"]
+                quiet_options = ["--review-every-requests", "100", "--payoff-requests", "1",
+                                 "--classifier-cache-policy", "disabled"]
+                proxy = self.proxy(fixture, seed_options)
+                self.assertEqual(proxy.send(a)[0], 200)
+                self.assertEqual(proxy.send(a)[0], 200)
+                owner_a, applied = proxy.checkpoint(a)
+                self.assertNotIn(a[1], fixture.primaries[-1]["input"], "A must really apply before branching")
+                self.assertIn("R8_A_FACT", json.dumps(fixture.primaries[-1]["input"]))
+                self.assertIn(a[3], fixture.primaries[-1]["input"], "opaque native member remains exact")
+                self.assertTrue(applied["last_submitted_ids"], "actual submitted selection is established")
+                if arm != "direct":
+                    self.assertEqual(proxy.send(b)[0], 200)
+                    self.assertTrue(any(m["text"] == "R8_B_ONLY_FACT" for m in proxy.advice()["memories"]),
+                                    "B-only fact must be genuinely accepted, not an unused canary")
+                    proxy.close()
+                    proxy = self.proxy(fixture, quiet_options)
+                    # The provider arrival follows Carry's durable input frontier
+                    # publication. Disconnect before headers, then let the real
+                    # attempted-dispatch receipt owner finish and cold-read it.
+                    connection = http.client.HTTPConnection(*proxy.address, timeout=10)
+                    self.stack.callback(connection.close)
+                    connection.request("POST", "/v1/responses", wire({"model": "gpt-6-luna", "input": b}),
+                                       headers={"Content-Type": "application/json"})
+                    self.assertTrue(held.wait(3), "auxiliary must reach actual provider before cancellation")
+                    self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                    self.assertIn(a[1], fixture.primaries[-1]["input"], "B's changed protection must actually restore A")
+                    self.assertIn("R8_B_ONLY_FACT", json.dumps(fixture.primaries[-1]["input"]))
+                    self.assertNotIn(b[-2], fixture.primaries[-1]["input"], "B-only projection must really apply")
+                    connection.sock.shutdown(socket.SHUT_RDWR)
+                    connection.close()
+                    release.set()
+                    deadline = time.monotonic() + 5
+                    while proxy.checkpoint(b)[1]["primary"]["calls"] != 4:
+                        self.assertLess(time.monotonic(), deadline, "cancelled auxiliary must settle its actual receipt")
+                        time.sleep(.01)
+                    if arm == "sibling_restart":
+                        proxy.close()
+                        proxy = self.proxy(fixture, quiet_options)
+                else:
+                    proxy.close()
+                    proxy = self.proxy(fixture, quiet_options)
+                before_reviews = len(fixture.reviews)
+                self.assertEqual(proxy.send(c)[0], 200)
+                owner_c, child = proxy.checkpoint(c)
+                index = read_index(self.state / "history.index")
+                states = index["snapshots"]
+                expected_calls = 3 if arm == "direct" else 5
+                self.assertEqual(len(fixture.primaries), expected_calls)
+                self.assertEqual(len(receipts), expected_calls)
+                self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                    sum(v["usage"]["input_tokens"] * .10 / 1e6 + .50 / 1e6 for v in receipts), places=12)
+                self.assertEqual(sum(s["shadow"]["calls"] for s in states.values()), before_reviews)
+                self.assertAlmostEqual(sum(s["shadow"]["cost_usd"] for s in states.values()),
+                                       before_reviews * (100 * .10 + .50) / 1e6, places=12)
+                self.assertEqual(len(fixture.reviews), before_reviews, "no paid rescue review")
+                self.assertTrue(all(s["primary"]["unavailable_cost_calls"] == 0 for s in states.values()))
+                sent = fixture.primaries[-1]["input"]
+                self.assertIn(a[0], sent)
+                self.assertIn(a[3], sent)
+                self.assertIn(c[-1], sent)
+                self.assertNotIn("R8_B_ONLY_FACT", json.dumps(sent), "never borrow B-only advice")
+                self.assertNotIn("R8_B_BOUNDARY", json.dumps(sent))
+                if arm != "direct":
+                    self.assertNotEqual(owner_c, owner_a, "genuine siblings remain separate accounting owners")
+                    self.assertEqual(child["primary"]["calls"], 1)
+                    self.assertEqual(child["shadow"]["calls"], 0)
+                outcome = {"arm": arm, "owner_a": owner_a.name, "owner_c": owner_c.name,
+                           "applied_a": applied, "child": child, "primaries": fixture.primaries,
+                           "reviews": fixture.reviews, "receipts": receipts}
+                outcomes.append(outcome)
+                print("R8_EVIDENCE_ZLIB_BASE64=" + base64.b64encode(zlib.compress(wire(outcome))).decode(), flush=True)
+                self.evidence[arm] = outcome
+                # Complete money/wire/isolation guards before the reported seam.
+                self.assertNotIn(a[1], sent, "shared A's applied projection/native sizing must survive B's sole-tip advance")
+                self.assertIn("R8_A_FACT", json.dumps(sent))
+                proxy.close()
+        self.state = root
+
     def test_empty_selection_retires_historical_memory_authority(self):
         def review(body, n):
             return 200, advice_response({"protected": [], "removable": [ledger(body)["eligible_memory_ids"][0]] if n == 2 else [],
