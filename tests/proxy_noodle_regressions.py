@@ -1,4 +1,5 @@
 """PR184 review regressions against the actual CLI; synthetic loopback only."""
+from history_store import read_index, write_index
 import json
 import time
 import unittest
@@ -26,12 +27,12 @@ class NoodleRegressions(unittest.TestCase):
     def attest_cache(self):
         # Only synthetic route capability; never manufacture a native receipt.
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for snapshot in index["snapshots"].values():
             snapshot["model_resolution"]["primary"]["cache"] = {
                 "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,
                 "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
-        path.write_bytes(wire(index))
+        write_index(path, index)
 
     def snapshot(self, proxy, saved=None):
         # Join immutable request facts to their real HTTP projection, never to a
@@ -90,12 +91,12 @@ class NoodleRegressions(unittest.TestCase):
                 # pre-window initialization is due in BOTH arms before the cap
                 # decision. A fitting allowance is not a new HistoryContract.
                 path = self.state / "history.index"
-                index = json.loads(path.read_text())
+                index = read_index(path)
                 for state in index["snapshots"].values():
                     state["request_evidence"]["scenario"] = {
                         "context_window": 200 + restored // 2, "reserve":100,
                         "keep_recent":100, "summary":50}
-                path.write_bytes(wire(index))
+                write_index(path, index)
                 proxy = self.proxy(fixture, options)
                 baseline = self.snapshot(proxy, proxy.checkpoint(h)[1])
                 self.assertEqual(baseline["request_evidence"]["observations"],
@@ -466,7 +467,7 @@ class NoodleRegressions(unittest.TestCase):
         proxy = self.proxy(fixture,options)
         self.assertEqual(proxy.send(h)[0],200)
         _, failed = proxy.checkpoint(h)
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         self.assertFalse(index["reviews"])
         self.assertEqual(failed["shadow"]["calls"],1)
         self.assertEqual(failed["shadow"]["unavailable_cost_calls"],int(not rejected))
@@ -491,7 +492,7 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(accepted["shadow"]["calls"],2)
         self.assertEqual(accepted["shadow"]["input_tokens"],200 if rejected else 100)
         self.assertEqual(accepted["shadow"]["unavailable_cost_calls"],int(not rejected))
-        self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"],
+        self.assertTrue(read_index(self.state / "history.index")["reviews"],
                         "accepted empty advice is a durable semantic completion")
         proxy.close()
         proxy = self.proxy(fixture,options)

@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 #[path = "proxy_store.rs"]
 mod storage;
 use storage::Store;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/history_store.rs"]
+pub(super) mod fixture;
 static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static PINS: std::sync::Mutex<BTreeMap<(PathBuf, String), Owner>> =
     std::sync::Mutex::new(BTreeMap::new());
@@ -119,7 +123,7 @@ pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
     Ok(())
 }
 fn read(service: &Service) -> std::io::Result<Store> {
-    Store::open(service, pinned(service))
+    Store::open(service, pinned(service), false)
 }
 fn read_failure(error: std::io::Error) -> Failure {
     let status = match error.kind() {
@@ -402,7 +406,7 @@ pub(super) fn committed(
         return Ok(());
     };
     let _guard = IO.lock().unwrap();
-    let store = read(service)?;
+    let store = Store::open(service, pinned(service), true)?;
     store.begin()?;
     let input = session
         .history
@@ -490,7 +494,7 @@ pub(super) fn publish(
         .as_deref()
         .ok_or_else(|| std::io::Error::other("review namespace missing"))?;
     let _guard = IO.lock().unwrap();
-    let store = read(service)?;
+    let store = Store::open(service, pinned(service), true)?;
     store.begin()?;
     let input = subject
         .history
@@ -518,7 +522,7 @@ pub(super) fn observe_cache(
     time: crate::proxy_cache::ObservationTime,
 ) -> std::io::Result<Vec<CacheEvidence>> {
     let _guard = IO.lock().unwrap();
-    let store = read(service)?;
+    let store = Store::open(service, pinned(service), true)?;
     store.begin()?;
     let mut cache = store.get("upstream_cache", "current")?.unwrap_or_default();
     if crate::proxy_cache::observe(&mut cache, body, usage, resolved, credential, time) {

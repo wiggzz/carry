@@ -219,14 +219,14 @@ fn dashboard_read_view_rechecks_expiry_pins_and_capacity_without_writing() {
         save(&service, id, &session).unwrap();
     }
     let path = directory.path().join("history.index");
-    let original = std::fs::read(&path).unwrap();
+    let original = history::fixture::read_index(&path);
     let old_view = history::ReadView::new(&service).unwrap();
     let mut expired: Value = serde_json::from_slice(&original).unwrap();
     for reference in expired["tips"].as_object_mut().unwrap().values_mut() {
         reference["at"] = json!(0);
     }
     let staged = serde_json::to_vec(&expired).unwrap();
-    std::fs::write(&path, &staged).unwrap();
+    history::fixture::write_index(&path, &staged);
     let pin = history::pin(&service, &ids[0]).unwrap();
     let pinned = history::ReadView::new(&service).unwrap();
     assert!(pinned.shared(&ids[0]).unwrap().is_some());
@@ -238,15 +238,15 @@ fn dashboard_read_view_rechecks_expiry_pins_and_capacity_without_writing() {
         old_view.shared(&ids[1]).unwrap().is_some(),
         "an existing view is one coherent generation"
     );
-    assert_eq!(std::fs::read(&path).unwrap(), staged);
+    assert_eq!(history::fixture::read_index(&path), staged);
 
-    std::fs::write(&path, &original).unwrap();
+    history::fixture::write_index(&path, &original);
     service.config.history_max_nodes = 1;
     let pin = history::pin(&service, &ids[0]).unwrap();
     let bounded = history::ReadView::new(&service).unwrap();
     assert!(bounded.shared(&ids[0]).unwrap().is_some());
-    assert!(bounded.shared(&ids[1]).is_err());
-    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(bounded.shared(&ids[1]).unwrap().is_some(), "a working-set cap cannot expire an unrelated retained owner");
+    assert_eq!(history::fixture::read_index(&path), original);
     drop(pin);
 }
 

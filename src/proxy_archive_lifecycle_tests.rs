@@ -246,7 +246,7 @@ fn archive_orphan_generation_publication_failure_keeps_canonical_cut_and_reuses_
         } else {
             format!(".{id}.tmp")
         });
-        std::fs::create_dir(&fault).unwrap();
+        if shared { history::fixture::checkpoint_fault(&directory.path().join("history.index"), true); } else { std::fs::create_dir(&fault).unwrap(); }
         assert!(save(&service, &id, &session).is_err());
         let prior = load(&checkpoint_service(directory.path()), &id).unwrap();
         assert_eq!(prior.primary.calls, 1);
@@ -277,7 +277,7 @@ fn archive_orphan_generation_publication_failure_keeps_canonical_cut_and_reuses_
             })
             .count();
         assert_eq!(branches, 2); // complete orphan fork exists, not authority
-        std::fs::remove_dir(&fault).unwrap();
+        if shared { history::fixture::checkpoint_fault(&directory.path().join("history.index"), false); } else { std::fs::remove_dir(&fault).unwrap(); }
         save(&service, &id, &session).unwrap();
         let current = load(&checkpoint_service(directory.path()), &id).unwrap();
         assert_eq!(current.primary.calls, 2);
@@ -464,7 +464,7 @@ fn archive_orphan_genuine_capture_beyond_pending_bound_and_cold_authority_restar
         // Shared indexed authority, not its diagnostic mirror, selects the fork.
         if shared {
             let index: Value = serde_json::from_slice(
-                &std::fs::read(directory.path().join("history.index")).unwrap(),
+                &history::fixture::read_index(&directory.path().join("history.index")),
             )
             .unwrap();
             assert_eq!(

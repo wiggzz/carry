@@ -1,4 +1,5 @@
 """Receipt-calibrated occurrence pool; real review/restart and loopback receipts."""
+from history_store import read_index, write_index
 import json
 import shutil
 import unittest
@@ -122,10 +123,10 @@ class VisiblePool(unittest.TestCase):
             shutil.copytree(seed_dir, directory)
             if name == 'without_advice':
                 index_path = directory / 'history.index'
-                index = json.loads(index_path.read_text())
+                index = read_index(index_path)
                 self.assertEqual(len(index['reviews']), 1)
                 index['reviews'] = {}
-                index_path.write_text(json.dumps(index))
+                write_index(index_path, index)
             proxy = support.Proxy(directory, fixture, [
                 '--classifier-cache-policy', 'disabled', '--payoff-requests', '1',
                 '--review-every-requests', '100', '--primary-context-tokens', '1024',

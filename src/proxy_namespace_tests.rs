@@ -269,11 +269,11 @@ fn unsupported_namespace_rejects_without_rewriting_persisted_authority() {
             // Stage unsupported bytes directly: rejection needs no old producer,
             // compatibility decoder or successful load of predecessor state.
             let mut index: Value =
-                serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+                serde_json::from_slice(&history::fixture::read_index(&index_path)).unwrap();
             index["format"] = json!("carry-prefix-history-v3");
-            std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+            history::fixture::write_index(&index_path, &serde_json::to_vec(&index).unwrap());
         }
-        let index = std::fs::read(&index_path).unwrap();
+        let index = history::fixture::read_index(&index_path);
         let mirror = std::fs::read(&mirror_path).unwrap();
         for restart in 0..2 {
             let service = checkpoint_service(directory.path());
@@ -295,7 +295,7 @@ fn unsupported_namespace_rejects_without_rewriting_persisted_authority() {
                     "legacy={legacy}, restart={restart}: unexpected acceptance/rejection"
                 )),
             }
-            if std::fs::read(&index_path).unwrap() != index {
+            if history::fixture::read_index(&index_path) != index {
                 failures.push(format!(
                     "legacy={legacy}, restart={restart}: rewrote authoritative index"
                 ));
@@ -328,7 +328,7 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
             drop(service);
             let index_path = directory.path().join("history.index");
             let mirror_path = directory.path().join(format!("{id}.json"));
-            let index = std::fs::read(&index_path).unwrap();
+            let index = history::fixture::read_index(&index_path);
             let mirror = std::fs::read(&mirror_path).unwrap();
             // Supported current restart retains every paid/free quantity and
             // frozen monetary field, without normalizing or writing either file.
@@ -339,7 +339,7 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                     serde_json::to_value(loaded.request_evidence.unwrap()).unwrap(),
                     frozen
                 );
-                assert_eq!(std::fs::read(&index_path).unwrap(), index);
+                assert_eq!(history::fixture::read_index(&index_path), index);
                 assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror);
             }
             for shape in [
@@ -369,15 +369,15 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                 if shared {
                     let mut saved: Value = serde_json::from_slice(&index).unwrap();
                     saved["snapshots"][&id]["request_evidence"] = unsupported;
-                    std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+                    history::fixture::write_index(&index_path, &serde_json::to_vec(&saved).unwrap());
                     std::fs::write(&mirror_path, &mirror).unwrap();
                 } else {
                     let mut saved: Value = serde_json::from_slice(&mirror).unwrap();
                     saved["request_evidence"] = unsupported;
                     std::fs::write(&mirror_path, serde_json::to_vec(&saved).unwrap()).unwrap();
-                    std::fs::write(&index_path, &index).unwrap();
+                    history::fixture::write_index(&index_path, &index);
                 }
-                let staged_index = std::fs::read(&index_path).unwrap();
+                let staged_index = history::fixture::read_index(&index_path);
                 let staged_mirror = std::fs::read(&mirror_path).unwrap();
                 for restart in 0..2 {
                     let service = checkpoint_service(directory.path());
@@ -389,7 +389,7 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                             }
                         }
                     }
-                    assert_eq!(std::fs::read(&index_path).unwrap(), staged_index);
+                    assert_eq!(history::fixture::read_index(&index_path), staged_index);
                     assert_eq!(std::fs::read(&mirror_path).unwrap(), staged_mirror);
                 }
             }
@@ -435,7 +435,7 @@ fn namespace_preparation_is_read_only_at_exact_capacity() {
         let mut service = checkpoint_service(directory.path());
         let index_path = directory.path().join("history.index");
         let mirror_path = directory.path().join(format!("{id}.json"));
-        let before = std::fs::read(&index_path).unwrap();
+        let before = history::fixture::read_index(&index_path);
         let mirror = std::fs::read(&mirror_path).unwrap();
         let old: Value = serde_json::from_slice(&before).unwrap();
         assert_eq!(old["tips"].as_object().unwrap().len(), 1);
@@ -444,7 +444,7 @@ fn namespace_preparation_is_read_only_at_exact_capacity() {
         service.config.history_max_bytes =
             u32::try_from(before.len() + if roomy { 8192 } else { 0 }).unwrap();
         let outcome = history::namespace(&service, &headers, &body);
-        let after = std::fs::read(&index_path).unwrap();
+        let after = history::fixture::read_index(&index_path);
         let current: Value = serde_json::from_slice(&after).unwrap();
         assert_eq!(current["snapshots"][&id]["request_evidence"], frozen_money);
         assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror);
@@ -479,14 +479,14 @@ fn namespace_preparation_is_read_only_at_exact_capacity() {
             history::namespace(&service, &headers, &body).unwrap(),
             namespace
         );
-        assert_eq!(std::fs::read(&index_path).unwrap(), after);
+        assert_eq!(history::fixture::read_index(&index_path), after);
         drop(service);
         let service = checkpoint_service(directory.path());
         assert_eq!(
             history::namespace(&service, &headers, &body).unwrap(),
             namespace
         );
-        assert_eq!(std::fs::read(&index_path).unwrap(), after);
+        assert_eq!(history::fixture::read_index(&index_path), after);
     }
 }
 

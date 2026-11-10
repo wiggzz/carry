@@ -3,6 +3,7 @@
 CARRY_TEST_BINARY=/absolute/carry python3 -B tests/proxy_comparison_population.py -v
 Paid ledgers remain all-attempt; no providers, production state or credentials.
 """
+from history_store import read_index, write_index
 import json
 import unittest
 import proxy_state_regressions as support
@@ -338,7 +339,7 @@ class ComparisonPopulation(unittest.TestCase):
         paid = proxy.saved()['primary']
         proxy.close()
         index_path = self.state / 'history.index'
-        index = json.loads(index_path.read_text())
+        index = read_index(index_path)
         mirror = next(self.state.glob('*.json'))
         staged = json.loads(mirror.read_text())
         for saved in (staged, *index['snapshots'].values()):
@@ -347,7 +348,7 @@ class ComparisonPopulation(unittest.TestCase):
             owner['result'] = dict(owner.get('result', {}), traditional_cost=12345,
                                    carry_cost=9000, summary_cost=100)
         mirror.write_text(json.dumps(staged))
-        index_path.write_text(json.dumps(index))
+        write_index(index_path, index)
         proxy = support.Proxy(self.state, fixture, options)
         self.stack.callback(proxy.close)
         after = proxy.request('GET', '/carry/dashboard/stats')[1]
@@ -374,7 +375,7 @@ class ComparisonPopulation(unittest.TestCase):
                 # Stage genuinely absent success-scoped fields in both authoritative
                 # shared snapshot and diagnostic mirror, with the fixture process stopped.
                 index_path = state / 'history.index'
-                index = json.loads(index_path.read_text())
+                index = read_index(index_path)
                 mirror = next(state.glob('*.json'))
                 staged = json.loads(mirror.read_text())
                 for saved in (staged, *index['snapshots'].values()):
@@ -390,7 +391,7 @@ class ComparisonPopulation(unittest.TestCase):
                             if 'Primary' in observation:
                                 observation['Primary']['facts']['cost'] = None
                 mirror.write_text(json.dumps(staged))
-                index_path.write_text(json.dumps(index))
+                write_index(index_path, index)
                 proxy = support.Proxy(state, fixture, options)
                 self.stack.callback(proxy.close)
                 stats = proxy.request('GET', '/carry/dashboard/stats')[1]

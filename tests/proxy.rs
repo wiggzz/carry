@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "support/admission.rs"]
 mod admission;
+#[allow(dead_code)]
+mod history_store;
 #[path = "support/pr154.rs"]
 mod pr154;
 
@@ -2497,8 +2499,10 @@ fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
     // Advice becomes authority at the atomic index publication, not at its
     // earlier per-session diagnostic mirror write. Explicit legacy sessions
     // remain mirror-owned; implicit selected snapshots are index-owned.
-    let index = std::fs::read(path.join("history.index"))
-        .ok()
+    let index = path
+        .join("history.index")
+        .exists()
+        .then(|| history_store::read_index(&path.join("history.index")))
         .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
     std::fs::read_dir(path)
         .unwrap()
@@ -4586,7 +4590,7 @@ async fn api_key_model_discovery_remains_an_authenticated_upstream_relay() {
 fn advice_for_checkpoint(path: &std::path::Path, state: &serde_json::Value) -> serde_json::Value {
     use sha2::{Digest, Sha256};
     let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path.join("history.index")).unwrap()).unwrap();
+        serde_json::from_slice(&history_store::read_index(&path.join("history.index"))).unwrap();
     let mut key = state["history_namespace"].as_str().unwrap().to_owned();
     let mut found = serde_json::Value::Null;
     for item in state["history"].as_array().unwrap() {

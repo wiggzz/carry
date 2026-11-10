@@ -5,6 +5,7 @@ The numeric archive (when implemented) is never staged or manufactured.
 """
 import copy
 import hashlib
+from history_store import read_index, write_index
 import json
 import unittest
 import proxy_state_regressions as support
@@ -14,7 +15,7 @@ def canonical_saved(proxy):
     saved = proxy.saved()
     if saved.get('history_shared'):
         owner = next(proxy.state.glob('*.json')).stem
-        return json.loads((proxy.state / 'history.index').read_text())['snapshots'][owner]
+        return read_index(proxy.state / 'history.index')['snapshots'][owner]
     return saved
 
 
@@ -43,7 +44,7 @@ class EvidenceArchive(unittest.TestCase):
         checkpoint = next(self.state.glob('*.json'))
         owner = checkpoint.stem
         index_path = self.state / 'history.index'
-        index = json.loads(index_path.read_text())
+        index = read_index(index_path)
         saturated = copy.deepcopy(original)
         observations = saturated['request_evidence']['observations']
         if bound == 'observations':
@@ -55,7 +56,7 @@ class EvidenceArchive(unittest.TestCase):
         checkpoint.write_text(json.dumps(saturated))
         if owner in index['snapshots']:
             index['snapshots'][owner]['request_evidence'] = saturated['request_evidence']
-            index_path.write_text(json.dumps(index))
+            write_index(index_path, index)
         proxy = support.Proxy(self.state, fixture, options)
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(history)[0], 200)

@@ -170,7 +170,11 @@ pub struct ProxyCli {
     #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_BYTES", default_value_t = 33554432, value_parser = clap::value_parser!(u32).range(2..=67108864))]
     history_max_bytes: u32,
     /// Hard disk admission ceiling. Capacity rejects writes, never evicts history.
-    #[arg(long, env = "CARRY_PROXY_HISTORY_DISK_BYTES", default_value_t = 1073741824)]
+    #[arg(
+        long,
+        env = "CARRY_PROXY_HISTORY_DISK_BYTES",
+        default_value_t = 1073741824
+    )]
     history_disk_bytes: u64,
     /// Detailed history age. Disk/reference pressure cannot shorten this window.
     #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_AGE_SECS", default_value_t = 604800, value_parser = clap::value_parser!(u64).range(0..=31536000))]

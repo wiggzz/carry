@@ -6,6 +6,7 @@ survive unavailable money; contradictory partitions must not create write proof.
 """
 import copy
 import http.client
+from history_store import read_index, write_index
 import json
 import unittest
 
@@ -94,7 +95,7 @@ class CachePartitions(unittest.TestCase):
             else:
                 self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
             saved = proxy.saved()
-            records = json.loads((self.harness.state / "history.index").read_text())["upstream_cache"]
+            records = read_index(self.harness.state / "history.index")["upstream_cache"]
             status, dashboard = proxy.request("GET", "/carry/dashboard/stats")
             self.assertEqual(status, 200)
             self.assertEqual(len(dashboard["sessions"]), 1)

@@ -1,5 +1,6 @@
 """Transparent, caller-owned history matching through real loopback review."""
 import http.client
+from history_store import read_index, write_index
 import json
 import time
 import unittest
@@ -20,7 +21,7 @@ class TransparentProxy(Proxy):
 
     def checkpoint(self, items):
         # The server's bounded index owns file identity; never pick the first JSON.
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         found = []
         for reference in index["tips"].values():
             path = self.state / (reference["session"] + ".json")
@@ -54,7 +55,7 @@ class TransparentProxy(Proxy):
         # Settle the exact completed response, not an unrelated/orphaned worker.
         path = self.state / "history.index"
         if path.exists():
-            index = json.loads(path.read_text())
+            index = read_index(path)
             for reference in index["transcripts"].values():
                 if reference["external_id"] == getattr(self, "response_id", None):
                     return index.get("snapshots", {}).get(reference["session"], {})
@@ -101,7 +102,7 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(settled["shadow"]["input_tokens"], 100 * count)
                 self.assertEqual(settled["shadow"]["output_tokens"], count)
                 self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
-                index = json.loads((self.state / "history.index").read_text())
+                index = read_index(self.state / "history.index")
                 self.assertEqual(len(index["reviews"]), int(prior), "rejection is not a semantic completion")
                 self.assertTrue(all("999" not in record["opinions"] for record in index["reviews"].values()),
                                 "unknown protection must gain no authority")
@@ -231,7 +232,7 @@ class TransparentHistory(unittest.TestCase):
         connection.close()
         deadline = time.monotonic() + 5
         while True:
-            index = json.loads((self.state / "history.index").read_text())
+            index = read_index(self.state / "history.index")
             snapshots = list(index["snapshots"].values())
             if snapshots and not snapshots[0]["primary_pending"]: break
             self.assertLess(time.monotonic(),deadline)
@@ -273,7 +274,7 @@ class TransparentHistory(unittest.TestCase):
         while not any('"background_review_merged"' in p.read_text() and '"receipt_durable":false' in p.read_text()
                       for p in (self.state / "diagnostics").glob("*.jsonl")):
             self.assertLess(time.monotonic(),deadline); time.sleep(.01)
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         self.assertFalse(index["reviews"])
         paid = list(index["snapshots"].values())[0]
         self.assertTrue(paid["background_review_pending"])
@@ -316,7 +317,7 @@ class TransparentHistory(unittest.TestCase):
             before = len(fixture.reviews)
             self.assertEqual(proxy.send(history)[0], 200)
             self.assertEqual(len(fixture.reviews), before + 1, "each credential control must dispatch an actual reviewer")
-            index = json.loads((self.state / "history.index").read_text())
+            index = read_index(self.state / "history.index")
             latest = [entry for entry in index["upstream_cache"]
                       if entry["credential_sha256"] == fixture.review_auth_hashes[-1]]
             self.evidence.update(cache=index["upstream_cache"], actual_auth_hashes=fixture.review_auth_hashes)
@@ -357,12 +358,12 @@ class TransparentHistory(unittest.TestCase):
         # Attest only this synthetic fixture's cache capability on the frozen
         # pair; native cache activity still comes solely from actual HTTP usage.
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for snapshot in index["snapshots"].values():
             snapshot["model_resolution"]["primary"]["cache"] = {
                 "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,
                 "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
-        path.write_bytes(wire(index))
+        write_index(path, index)
         options += ["--review-every-requests", "100"]
         # Advertised fixture capability precedes a real canonical dispatch.
         # No saved cache receipt is manufactured by the attestation above.
@@ -380,7 +381,7 @@ class TransparentHistory(unittest.TestCase):
         # Stage elapsed provider TTL only, not semantic advice, a receipt or a
         # planner result. Every outgoing body is still rendered by the real CLI.
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for entry in index.get("upstream_cache", []):
             if entry.get("write_window"):
                 entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
@@ -389,7 +390,7 @@ class TransparentHistory(unittest.TestCase):
                 for entry in snapshot.get(field, []):
                     if entry.get("write_window"):
                         entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
-        path.write_bytes(wire(index))
+        write_index(path, index)
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertNotIn(history[1], fixture.primaries[-1]["input"], "expired prefix permits cold omission")
@@ -397,11 +398,11 @@ class TransparentHistory(unittest.TestCase):
         proxy.close()
         # If both shapes are warm the smaller compact view can remain cheaper.
         # Expire its new receipt before genuinely re-warming canonical H alone.
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for entry in index["upstream_cache"]:
             if entry.get("write_window"):
                 entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
-        path.write_bytes(wire(index))
+        write_index(path, index)
         # Audit mode genuinely dispatches canonical H. Only its terminal provider
         # receipt may re-warm that exact shape; no invented saved cache entries.
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
@@ -438,12 +439,12 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history)[0], 200)
         proxy.close()
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for snapshot in index["snapshots"].values():
             snapshot["model_resolution"]["primary"]["cache"] = {
                 "minimum_prefix_tokens":1024,"max_read_breakpoints":50,
                 "max_write_breakpoints":4,"implicit_breakpoint_uses_write_slot":True}
-        path.write_bytes(wire(index))
+        write_index(path, index)
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
         self.stack.callback(proxy.close)
         snapshots = []
@@ -451,7 +452,7 @@ class TransparentHistory(unittest.TestCase):
         # No sleep, clock change, receipt injection, or increasing request body.
         for fraction in (0, .75, 0):
             self.assertEqual(proxy.send(history)[0], 200)
-            index = json.loads(path.read_text())
+            index = read_index(path)
             records = index["upstream_cache"]
             snapshots.append({"expected":fraction,"records":records,
                               "paid":proxy.checkpoint(history)[1]["primary"]})
@@ -468,7 +469,7 @@ class TransparentHistory(unittest.TestCase):
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
         self.stack.callback(proxy.close)
-        self.assertEqual(json.loads(path.read_text())["upstream_cache"], snapshots[-1]["records"])
+        self.assertEqual(read_index(path)["upstream_cache"], snapshots[-1]["records"])
 
     def test_repeated_projection_prices_current_omission_once_after_restart(self):
         """Real advice/planner/receipts: identical H and N must not invent growth."""
@@ -545,12 +546,12 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(proxy.send(h)[0],200)
         proxy.close()
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         # Clock seam only: no manufactured advice, wire/cache receipt or plan.
         for records in index["reviews"].values():
             for record in (records if isinstance(records,list) else [records]):
                 record["at"] = int(time.time()) - 2*86400
-        path.write_bytes(wire(index))
+        write_index(path, index)
         proxy = self.proxy(fixture,["--review-every-requests","100","--payoff-requests","1","--classifier-cache-policy","disabled"])
         self.assertEqual(proxy.send(original+[{"role":"user","content":"sibling"}])[0],200)
         self.evidence.update(index=index,primaries=fixture.primaries)
@@ -875,7 +876,7 @@ class TransparentHistory(unittest.TestCase):
                                                              "--review-every-requests", "100"])
                 old_path, old = proxy.checkpoint(history)
                 self.assertEqual(old["primary"]["calls"], 1)
-                self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"], "real completed advice supplies old authority")
+                self.assertTrue(read_index(self.state / "history.index")["reviews"], "real completed advice supplies old authority")
                 time.sleep(ttl + 1.05)
                 if restart:
                     proxy.close()
@@ -979,7 +980,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertGreaterEqual(len(fixture.reviews), 2)
         _, parent = proxy.checkpoint(b)
         self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in proxy.advice()["memories"]))
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         self.assertTrue(any(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in p["memories"])
                             for p in index["reviews"].values()),
                         "later compatible reviews must be committed too, not first-raw-only: "
@@ -1014,7 +1015,7 @@ class TransparentHistory(unittest.TestCase):
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"])
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(history)[0], 200)
-        archive = json.loads((self.state / "history.index").read_text())
+        archive = read_index(self.state / "history.index")
         references = [r for r in archive["transcripts"].values() if r["external_id"] == "native_1"]
         self.assertEqual(len(references), 1, "native reset must not erase the observed canonical transcript")
         frontier, observed = references[0]["frontier"], []
@@ -1033,9 +1034,7 @@ class TransparentHistory(unittest.TestCase):
 
     def test_history_empty_envelope_limits_two_requests_and_restart(self):
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"minimum_{n}")))
-        minimum = len(wire({"format": "carry-prefix-history-v4", "nodes": {},
-                            "upstream_cache": [], "tips": {}, "reviews": {},
-                            "transcripts": {}, "snapshots": {}}))
+        minimum = 256  # minimum decoded-record working set, not a whole-index size
         for limit in (2, minimum - 1):
             with self.subTest(rejected_limit=limit):
                 with self.assertRaises(AssertionError, msg="impossible history byte limits must reject startup"):
@@ -1051,8 +1050,8 @@ class TransparentHistory(unittest.TestCase):
             self.assertNotIn("id", result)
             index = proxy.state / "history.index"
             if index.exists():
-                self.assertLessEqual(index.stat().st_size, minimum)
-                json.loads(index.read_bytes())
+                self.assertFalse(read_index(index)["snapshots"])
+                self.assertFalse(read_index(index)["transcripts"])
         self.assertEqual(fixture.primaries, [])
         proxy.close()
         proxy = self.proxy(fixture, options)
@@ -1110,7 +1109,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
         child = history + [{"role": "user", "content": "C_ONLY"}]
         self.assertEqual(proxy.send(child)[0], 200)
-        archive = json.loads((self.state / "history.index").read_text())
+        archive = read_index(self.state / "history.index")
         checkpoints = [json.loads(p.read_text()) for p in self.state.glob("*.json")]
         self.assertGreaterEqual(len(checkpoints), 2)
         for state in checkpoints:
@@ -1202,7 +1201,7 @@ class TransparentHistory(unittest.TestCase):
         child = history + [{"role": "user", "content": "C_ONLY"}]
         self.assertEqual(proxy.send(child)[0], 200)
         self.assertIn("RAW_A", json.dumps(fixture.primaries[-1]))
-        points = [p for ps in json.loads((self.state / "history.index").read_text())["reviews"].values()
+        points = [p for ps in read_index(self.state / "history.index")["reviews"].values()
                   for p in ps]
         self.assertEqual(points, [], "failed review cannot publish semantic authority")
         for point in points:
@@ -1328,7 +1327,7 @@ class TransparentHistory(unittest.TestCase):
                     status, _ = proxy.send([{"role": "user", "content":
                         f"UNRELATED_{n} " + ("x" * 40000 if pressure == "bytes" else "x")}], wait=False)
                     self.assertIn(status, (200, 500, 507))
-                index = json.loads((self.state / "history.index").read_text())
+                index = read_index(self.state / "history.index")
                 try:
                     self.assertIn(owner, index["snapshots"],
                                   "GC must not delete an in-flight review's accounting/removal owner")
@@ -1337,7 +1336,7 @@ class TransparentHistory(unittest.TestCase):
                     release.set()
                 deadline = time.monotonic() + 5
                 while True:
-                    index = json.loads((self.state / "history.index").read_text())
+                    index = read_index(self.state / "history.index")
                     settled = index["snapshots"].get(owner, {})
                     if not settled.get("background_review_pending", True) and proxy.reviewers_settled():
                         break
@@ -1355,7 +1354,7 @@ class TransparentHistory(unittest.TestCase):
                     reviews_before = len(fixture.reviews)
                     proxy = TransparentProxy(self.state, fixture, options, env)
                     self.stack.callback(proxy.close)
-                    restarted = json.loads((self.state / "history.index").read_text())
+                    restarted = read_index(self.state / "history.index")
                     self.assertEqual(restarted["snapshots"][owner]["shadow"]["calls"], 1,
                                      "restart must retain the exact settled paid receipt")
                     followup = history + [{"role": "user", "content": "PINNED_CONTINUE"}]
@@ -1425,7 +1424,7 @@ class TransparentHistory(unittest.TestCase):
                 # primary intentionally holds that owner's reviewer settlement.
                 self.assertIn(proxy.send([{"role": "user", "content": f"PRIMARY_PRESSURE_{n}"}], wait=False)[0], (200, 500, 507))
             try:
-                index = json.loads((self.state / "history.index").read_text())
+                index = read_index(self.state / "history.index")
                 self.assertIn(owner, index["snapshots"], "primary transport owns its selected snapshot")
             finally:
                 release.set()
@@ -1447,7 +1446,7 @@ class TransparentHistory(unittest.TestCase):
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, options, env)
         self.stack.callback(proxy.close)
-        restarted = json.loads((self.state / "history.index").read_text())["snapshots"][owner]
+        restarted = read_index(self.state / "history.index")["snapshots"][owner]
         self.assertEqual(restarted["primary"], after["primary"], "restart must not duplicate a settled primary")
         self.assertEqual(restarted["shadow"], after["shadow"], "restart must not duplicate a settled review")
         receipts_before = len(owner_receipts)
@@ -1468,8 +1467,7 @@ class TransparentHistory(unittest.TestCase):
         sent = owner_primaries[-1]["input"]
         self.assertIn(history[0], sent)
         if history[1] not in sent:
-            self.assertTrue(any(r["drops"] for r in json.loads(
-                (self.state / "history.index").read_text())["reviews"].values()),
+            self.assertTrue(any(r["drops"] for r in read_index(self.state / "history.index")["reviews"].values()),
                 "omission requires retained advice; advice does not require omission")
         self.evidence.update(before=before, after=after, restarted=restarted, resumed=resumed,
                              owner_primaries=owner_primaries, owner_review_wires=owner_wires, owner_receipts=owner_receipts)
@@ -1485,7 +1483,7 @@ class TransparentHistory(unittest.TestCase):
             child = history + [{"role": "user", "content": f"STORAGE_CHILD_{n}"}]
             self.assertEqual(proxy.send(child)[0], 200)
             path = self.state / "history.index"
-            index = json.loads(path.read_text())
+            index = read_index(path)
             mirrors = list(self.state.glob("*.json"))
             observation = {"index_bytes": path.stat().st_size,
                 "diagnostic_mirror_bytes": sum(p.stat().st_size for p in mirrors),

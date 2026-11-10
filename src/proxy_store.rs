@@ -24,21 +24,31 @@ pub(super) struct Store {
     pins: HashSet<String>,
 }
 impl Store {
-    pub(super) fn open(service: &Service, pins: HashSet<String>) -> std::io::Result<Self> {
+    pub(super) fn open(
+        service: &Service,
+        pins: HashSet<String>,
+        write: bool,
+    ) -> std::io::Result<Self> {
         let path = service.config.state_dir.join("history.index");
-        // Do not follow a planted file, or mistake an unsupported old format for
-        // an empty store. A separate explicit import owns legacy generations.
-        if let Ok(metadata) = std::fs::symlink_metadata(&path)
-            && !metadata.is_file()
-        {
-            return Err(std::io::Error::other(
-                "history authority is not a regular file",
-            ));
-        }
-        if !path.exists() {
+        let exists = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => true,
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "history authority is not a regular file",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        if !exists && write {
             drop(private_file(&path, false)?);
         }
-        let connection = Connection::open(&path).map_err(error)?;
+        let connection = if exists || write {
+            Connection::open(&path)
+        } else {
+            Connection::open_in_memory()
+        }
+        .map_err(error)?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(error)?;
@@ -49,12 +59,12 @@ impl Store {
         if version != 0 && version != 1 {
             return Err(std::io::Error::other("unsupported history store version"));
         }
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS records_age ON records(kind,at);
-            CREATE INDEX IF NOT EXISTS records_owner ON records(kind,owner);
-            PRAGMA user_version=1;").map_err(error)?;
-        // This is a disk-admission ceiling, never an eviction target. A failed
-        // transaction leaves every previously committed record intact.
+        if version == 0 {
+            connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE records(kind TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;
+                CREATE INDEX records_age ON records(kind,at);
+                CREATE INDEX records_owner ON records(kind,owner);
+                PRAGMA user_version=1;").map_err(error)?;
+        }
         let pages = (service.config.history_disk_bytes / 4096).max(16);
         connection
             .pragma_update(None, "max_page_count", pages)
@@ -135,7 +145,7 @@ impl Store {
                 "history path exceeds working-set bound",
             ));
         }
-        let keys = history::path(namespace, input);
+        let keys = super::path(namespace, input);
         let mut parent = namespace.to_owned();
         for (key, value) in keys.iter().zip(input) {
             self.put(

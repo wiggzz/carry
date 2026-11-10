@@ -6,6 +6,7 @@ No saved write evidence is injected. JSON/SSE share the real terminal commit.
 """
 import copy
 import http.client
+from history_store import read_index, write_index
 import json
 import time
 import unittest
@@ -72,7 +73,7 @@ class ObservedWrites(unittest.TestCase):
                 self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
             after = time.time_ns() // 1_000_000_000
             saved = proxy.saved()
-            records = json.loads((self.harness.state / "history.index").read_text())["upstream_cache"]
+            records = read_index(self.harness.state / "history.index")["upstream_cache"]
             paid += ((2000 - cached - written) * 2 + cached * .1 + written * 2.5 + 10 * 10) / 1e6
             self.assertEqual(saved["primary"]["calls"], step + 1)
             self.assertEqual(saved["primary"]["cached_tokens"], sum(x[0] for x in receipts[:step + 1]))

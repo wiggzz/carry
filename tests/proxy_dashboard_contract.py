@@ -1,6 +1,7 @@
 """Synthetic actual-binary dashboard contract; no provider or live state access."""
 import contextlib
 import copy
+from history_store import read_index, write_index
 import json
 import os
 from pathlib import Path
@@ -58,7 +59,7 @@ class DashboardDispatchContract(unittest.TestCase):
                 self.assertEqual(proxy.send(source)[0], 200)
                 owner = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["id"]
                 authority_path = root / ("history.index" if shared else owner + ".json")
-                saved = json.loads(authority_path.read_bytes())
+                saved = read_index(authority_path)
                 for version in (0, 3, 999):
                     authority = copy.deepcopy(saved)
                     session = authority["snapshots"][owner] if shared else authority
@@ -67,7 +68,7 @@ class DashboardDispatchContract(unittest.TestCase):
                     # not semantic authority, even if stale facts are injected.
                     session["memories"] = [{"id": 1, "source_ids": [1], "text": "STALE_NOT_CURRENT"}]
                     frozen = json.dumps(authority).encode()
-                    authority_path.write_bytes(frozen)
+                    write_index(authority_path, authority) if shared else authority_path.write_bytes(frozen)
                     code, stats = proxy.request("GET", "/carry/dashboard/stats")
                     self.assertEqual(code, 200)
                     transcript_code, transcript = proxy.request("GET", "/carry/dashboard/transcript/" + owner)
@@ -81,7 +82,8 @@ class DashboardDispatchContract(unittest.TestCase):
                         self.assertEqual(stats["unavailable_sessions"], 1)
                         self.assertEqual(stats["sessions"], [])
                         self.assertNotEqual(transcript_code, 200)
-                    self.assertEqual(authority_path.read_bytes(), frozen)
+                    self.assertEqual(read_index(authority_path), authority)
+                    if not shared: self.assertEqual(authority_path.read_bytes(), frozen)
                 self.assertEqual(fixture.errors, [])
 
     def test_pruned_or_unreadable_authority_cannot_resurrect_false_diagnostic_mirror(self):
@@ -101,7 +103,7 @@ class DashboardDispatchContract(unittest.TestCase):
             mirror_bytes = json.dumps(false_authority).encode()
             mirror.write_bytes(mirror_bytes)
             index_path = root / "history.index"
-            expired = json.loads(index_path.read_bytes())
+            expired = read_index(index_path)
             for reference in expired["tips"].values():
                 reference["at"] = 0
             empty = {key: {} if isinstance(value, dict) else value for key, value in expired.items()}
@@ -110,7 +112,7 @@ class DashboardDispatchContract(unittest.TestCase):
                     if authority is None:
                         index_path.unlink()
                     else:
-                        index_path.write_bytes(authority)
+                        write_index(index_path, json.loads(authority)) if authority.startswith(b"{") else index_path.write_bytes(authority)
                     code, stats = proxy.request("GET", "/carry/dashboard/stats")
                     self.assertEqual(code, 200)
                     self.assertEqual(stats["sessions"], [])
@@ -119,7 +121,7 @@ class DashboardDispatchContract(unittest.TestCase):
                     if authority is None:
                         self.assertFalse(index_path.exists())
                     else:
-                        self.assertEqual(index_path.read_bytes(), authority)
+                        self.assertEqual(read_index(index_path), json.loads(authority)) if authority.startswith(b"{") else self.assertEqual(index_path.read_bytes(), authority)
                     self.assertEqual(mirror.read_bytes(), mirror_bytes)
             self.assertEqual(fixture.errors, [])
 
@@ -434,10 +436,10 @@ class DashboardDispatchContract(unittest.TestCase):
                 without_selection_history(saved)
                 checkpoint.write_text(json.dumps(saved))
             index_path = root / "history.index"
-            index = json.loads(index_path.read_text())
+            index = read_index(index_path)
             for saved in index["snapshots"].values():
                 without_selection_history(saved)
-            index_path.write_text(json.dumps(index))
+            write_index(index_path, index)
             proxy = ImplicitProxy(root, fixture, wait_reviews=False)
             stack.callback(proxy.close)
             self.assertEqual(proxy.send(source)[0], 200)
