@@ -96,6 +96,102 @@ fn dashboard_observed_money_survives_raw_expiry_without_summing_cumulative_snaps
 }
 
 #[tokio::test]
+async fn dashboard_session_pages_keep_population_money_independent_of_raw_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let ids = (0..7).map(|n| format!("{n:064x}")).collect::<Vec<_>>();
+    {
+        let service = checkpoint_service(directory.path());
+        for (n, id) in ids.iter().enumerate() {
+            let mut session = Session {
+                history_shared: true,
+                history_namespace: Some(format!("paged-dashboard-{id}")),
+                request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+                ..Session::default()
+            };
+            session
+                .ingest(&[json!({"role":"user","content":format!("owned page source {n}")})])
+                .unwrap();
+            numeric_primary(&mut session, 0);
+            save(&service, id, &session).unwrap();
+            if n == 0 {
+                numeric_primary(&mut session, 1);
+                save(&service, id, &session).unwrap();
+            }
+        }
+    }
+    // Reopen the durable authority rather than relying on an in-memory owner
+    // list. Repeated cumulative snapshots must not inflate population money.
+    let service = Arc::new(checkpoint_service(directory.path()));
+    let frozen = history::accounting(&service, 0, "", 100).unwrap()["records"].clone();
+    assert_eq!(frozen.as_array().unwrap().len(), 8);
+    for (n, id) in ids.iter().enumerate() {
+        let session = history::restore(&service, id).unwrap();
+        assert_eq!(session.primary.calls, if n == 0 { 2 } else { 1 });
+        assert_eq!(session.history.len(), 1);
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/carry/dashboard/stats", get(dashboard_stats))
+        .with_state(service.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let mut after = String::new();
+    let mut seen = Vec::new();
+    for page_number in 0..4 {
+        let bytes = client
+            .get(format!("http://{address}/carry/dashboard/stats"))
+            .query(&[("limit", "2"), ("after_id", after.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let stats: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            stats["cost_estimate"]["observed_primary_cost"]
+                .as_f64()
+                .is_some_and(|money| (money - 0.016).abs() < 1e-12),
+            "all-owner native money is independent of the selected raw page: {stats}"
+        );
+        assert_eq!(stats["unavailable_sessions"], 0);
+        let rows = stats["sessions"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            if page_number < 3 { 2 } else { 1 },
+            "raw session projection must honor the bounded requested page"
+        );
+        for row in rows {
+            seen.push(row["id"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(stats["session_page"]["has_more"], page_number < 3);
+        if page_number < 3 {
+            after = stats["session_page"]["next_after"].as_str().unwrap().to_owned();
+            assert_eq!(Some(&after), seen.last());
+        } else {
+            assert!(stats["session_page"]["next_after"].is_null());
+        }
+    }
+    server.abort();
+    assert_eq!(seen, ids, "stable keyset pages cover every retained owner once");
+    assert_eq!(
+        history::accounting(&service, 0, "", 100).unwrap()["records"],
+        frozen,
+        "paging cannot mutate frozen paid money or accounting provenance"
+    );
+}
+
+#[tokio::test]
 async fn dashboard_failure_only_describes_the_latest_failed_primary() {
     let directory = tempfile::tempdir().unwrap();
     let service = Arc::new(checkpoint_service(directory.path()));
