@@ -1,3 +1,158 @@
+#[tokio::test]
+async fn dashboard_session_pages_bound_serialized_bytes_and_keep_cursor_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let ids = (0..110).map(|n| format!("{n:064x}")).collect::<Vec<_>>();
+    let mut config_service = checkpoint_service(directory.path());
+    config_service.config.history_max_bytes = 65536;
+    let service = Arc::new(config_service);
+    for (n, id) in ids.iter().enumerate() {
+        let mut session = Session {
+            history_shared: true,
+            history_namespace: Some(format!("byte-bounded-dashboard-{id}")),
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        session
+            .ingest(&[json!({"role":"user","content":format!("retained page owner {n}")})])
+            .unwrap();
+        numeric_primary(&mut session, 0);
+        save(&service, id, &session).unwrap();
+        let restored = history::restore(&service, id).unwrap();
+        assert_eq!(restored.primary.calls, 1);
+        assert_eq!(restored.history.len(), 1);
+        assert!((restored.primary.cost_usd - 0.002).abs() < 1e-12);
+    }
+    let frozen = std::fs::read(directory.path().join("history.index")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/carry/dashboard/stats", get(dashboard_stats))
+        .with_state(service.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/carry/dashboard/stats");
+    // Qualify actual HTTP query limits and cursor rejection before grading the
+    // new byte bound. These already-correct controls are not defect REDs.
+    for query in ["limit=0", "limit=1"] {
+        let report: Value = client
+            .get(format!("{url}?{query}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(report["sessions"][0]["id"], ids[0]);
+        assert_eq!(report["usage"]["primary"]["calls"], 110);
+        assert!((report["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 0.22).abs() < 1e-12);
+    }
+    for query in ["after_id=bad", "limit=invalid", "limit=-1"] {
+        assert_eq!(
+            client
+                .get(format!("{url}?{query}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut first_rows = None;
+    for query in ["", "limit=100", "limit=999999"] {
+        let bytes = client
+            .get(format!("{url}?{query}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["usage"]["primary"]["calls"], 110);
+        assert!((report["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 0.22).abs() < 1e-12);
+        assert_eq!(report["unavailable_sessions"], 0);
+        let rows = report["sessions"].as_array().unwrap();
+        assert!(!rows.is_empty() && rows.len() <= 100);
+        assert_eq!(report["session_page"]["has_more"], true);
+        assert_eq!(
+            report["session_page"]["next_after"],
+            rows.last().unwrap()["id"]
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("history.index")).unwrap(),
+            frozen
+        );
+        assert!(
+            bytes.len() <= 65536,
+            "serialized dashboard page exceeds its working-set bound: {} bytes for {} rows",
+            bytes.len(),
+            rows.len()
+        );
+        if let Some(expected) = &first_rows {
+            assert_eq!(rows, expected);
+        } else {
+            first_rows = Some(rows.clone());
+        }
+    }
+    let mut after = String::new();
+    let mut seen = Vec::new();
+    for _ in 0..ids.len() {
+        let bytes = client
+            .get(&url)
+            .query(&[("after_id", &after)])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(bytes.len() <= 65536);
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["usage"]["primary"]["calls"], 110);
+        assert!((report["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 0.22).abs() < 1e-12);
+        for row in report["sessions"].as_array().unwrap() {
+            seen.push(row["id"].as_str().unwrap().to_owned());
+        }
+        if report["session_page"]["has_more"] == false {
+            assert!(report["session_page"]["next_after"].is_null());
+            break;
+        }
+        let next = report["session_page"]["next_after"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            next > after,
+            "byte-limited pagination must make strict keyset progress"
+        );
+        assert_eq!(Some(&next), seen.last());
+        after = next;
+    }
+    server.abort();
+    assert_eq!(
+        seen, ids,
+        "byte paging must neither lose nor duplicate retained owners"
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("history.index")).unwrap(),
+        frozen
+    );
+}
+
 #[test]
 fn dashboard_observed_money_survives_raw_expiry_without_summing_cumulative_snapshots() {
     let directory = tempfile::tempdir().unwrap();
