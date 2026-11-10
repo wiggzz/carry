@@ -97,7 +97,7 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 :focus-visible { outline:3px solid #2b79ad; outline-offset:4px; }
 [hidden] { display:none !important; }
 @media(max-width:800px) { .shell{padding:24px 18px 40px} .session{grid-template-columns:repeat(2,minmax(0,1fr));padding:18px 16px 0;gap:16px} .session-identity{grid-column:1/-1} .session-costs{padding-left:0;border-left:0} .token-metrics{grid-template-columns:repeat(2,minmax(0,1fr))} .token-metric:nth-child(3){border-left:0;border-top:1px solid #22232a25} .token-metric:nth-child(4){border-top:1px solid #22232a25} .section-head{align-items:start;flex-direction:column;gap:4px} }
-@media(max-width:480px) { header{align-items:start;flex-direction:column;gap:12px} .header-status{text-align:left} .cards{gap:12px} .card{padding:14px 12px;box-shadow:3px 3px 0 var(--ink)} .value{letter-spacing:-.8px;font-size:23px} .session .value{font-size:20px} .memories{margin-left:0} }
+@media(max-width:480px) { header{align-items:start;flex-direction:column;gap:12px} .header-status{text-align:left} .cards{grid-template-columns:minmax(0,1fr);gap:12px} .card{padding:14px 12px;box-shadow:3px 3px 0 var(--ink)} .value{letter-spacing:-.8px;font-size:23px} .session .value{font-size:20px} .memories{margin-left:0} }
 @media(prefers-reduced-motion:no-preference) { button:hover{transform:translate(-1px,-1px)} }
 
 /* Inspector panels keep values and cache meters within their own lane. */
