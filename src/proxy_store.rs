@@ -742,12 +742,14 @@ impl Store {
         // prior comparison coverage cannot override a current unknown window.
         // The SQL owner index selects on disk, not in a process-sized map.
         // Sequence keys break ties when several paid states share a second.
+        // Bound each anti-join to its owner using the existing index: SQLite
+        // otherwise chooses a kind-only primary-key scan of all observations.
         let mut statement = self
             .connection
             .prepare(
                 "SELECT length(r.data),CASE WHEN length(r.data)<=?1 THEN r.data ELSE NULL END,r.owner
              FROM records r WHERE r.kind='accounting' AND r.at>=?2
-             AND NOT EXISTS(SELECT 1 FROM records n WHERE n.kind='accounting' AND n.owner=r.owner
+             AND NOT EXISTS(SELECT 1 FROM records n INDEXED BY records_owner WHERE n.kind='accounting' AND n.owner=r.owner
                 AND (n.at>r.at OR (n.at=r.at AND n.key>r.key)))",
             )
             .map_err(error)?;
