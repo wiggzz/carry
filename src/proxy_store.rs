@@ -785,6 +785,30 @@ impl Store {
         }
         Ok((totals, usage))
     }
+    pub(super) fn accounting_window(&self, start: u64, end: u64) -> std::io::Result<Value> {
+        let cutoff = self.at.saturating_sub(self.accounting_age);
+        // records_owner provides bounded disk-backed owner ordering. Sequence
+        // keys order immutable observations, including same-second revisions.
+        let mut statement = self.connection.prepare(
+            "SELECT owner,key,at,length(data),CASE WHEN length(data)<=?1 THEN data ELSE NULL END
+             FROM records INDEXED BY records_owner WHERE kind='accounting' AND at>=?2 ORDER BY owner,key"
+        ).map_err(error)?;
+        let mut rows = statement
+            .query(params![self.max_record as u64, cutoff])
+            .map_err(error)?;
+        let mut window = accounting::Window::new(start, end, cutoff);
+        while let Some(row) = rows.next().map_err(error)? {
+            if row.get::<_, usize>(3).map_err(error)? > self.max_record {
+                return Err(full());
+            }
+            let owner: String = row.get(0).map_err(error)?;
+            let key: String = row.get(1).map_err(error)?;
+            let at = row.get(2).map_err(error)?;
+            let data: Vec<u8> = row.get(4).map_err(error)?;
+            window.observe(&owner, &key, at, &data)?;
+        }
+        window.finish()
+    }
     pub(super) fn accounting_page(
         &self,
         after_at: u64,

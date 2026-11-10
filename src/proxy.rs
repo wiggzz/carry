@@ -210,6 +210,8 @@ struct Service {
     _directory_lock: Arc<File>,
 }
 
+#[path = "proxy_accounting.rs"]
+mod accounting;
 #[path = "proxy_admission.rs"]
 mod admission;
 #[path = "proxy_history.rs"]
@@ -1432,6 +1434,8 @@ struct AccountingPage {
     #[serde(default)]
     after_key: String,
     limit: Option<usize>,
+    start_at: Option<u64>,
+    end_at: Option<u64>,
 }
 async fn dashboard_accounting(
     State(service): State<Arc<Service>>,
@@ -1450,12 +1454,23 @@ async fn dashboard_accounting(
             "invalid accounting cursor",
         ));
     }
-    let data = history::accounting(
-        &service,
-        page.after_at,
-        &page.after_key,
-        page.limit.unwrap_or(100).clamp(1, 100),
-    )
+    let data = match (page.start_at, page.end_at) {
+        (None, None) => history::accounting(
+            &service,
+            page.after_at,
+            &page.after_key,
+            page.limit.unwrap_or(100).clamp(1, 100),
+        ),
+        (Some(start), Some(end)) if start < end && end <= i64::MAX as u64 => {
+            history::accounting_window(&service, start, end).map(|window| json!({"window":window}))
+        }
+        _ => {
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "invalid accounting interval",
+            ));
+        }
+    }
     .map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -647,6 +647,10 @@ pub(super) fn accounting(
     let _guard = IO.lock().unwrap();
     read(service)?.accounting_page(after_at, after_key, limit)
 }
+pub(super) fn accounting_window(service: &Service, start: u64, end: u64) -> std::io::Result<Value> {
+    let _guard = IO.lock().unwrap();
+    read(service)?.accounting_window(start, end)
+}
 pub(super) fn cache(service: &Service) -> std::io::Result<Vec<CacheEvidence>> {
     let _guard = IO.lock().unwrap();
     let store = read(service)?;
