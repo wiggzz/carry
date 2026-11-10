@@ -669,15 +669,25 @@ impl Store {
             &estimate,
             crate::proxy_savings::accounting_policy(),
         ));
-        if self.contains("accounted", &identity)? {
-            return Ok(());
-        }
         let invalid = || {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid accounting sequence authority",
             )
         };
+        if let Some(marker) = self.get::<Value>("accounted", &identity)? {
+            let sequence = marker["sequence"].as_u64().ok_or_else(invalid)?;
+            // Set membership is not observation identity: A -> B -> A must
+            // retain the final transition, including a cumulative decrease or
+            // recovered coverage. Only suppress this owner's immediate repeat.
+            let latest: Option<String> = self.connection.query_row(
+                "SELECT key FROM records INDEXED BY records_owner WHERE kind='accounting' AND owner=?1 ORDER BY key DESC LIMIT 1",
+                [id], |row| row.get(0),
+            ).optional().map_err(error)?;
+            if latest == Some(format!("{sequence:064x}")) {
+                return Ok(());
+            }
+        }
         let clock = self.get::<Value>("metadata", "accounting_clock")?;
         let (previous, previous_at) = if let Some(clock) = clock {
             (
