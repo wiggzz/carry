@@ -411,6 +411,17 @@ impl ReadView {
     }
     pub(super) fn current_accounting(&self, id: &str) -> std::io::Result<Option<Session>> {
         let store = self.store.lock().unwrap();
+        // Resolve expired shared authority from small owner/age metadata before
+        // scanning its raw checkpoint, even with source fields ignored. Frozen
+        // numeric accounting already owns this expired population; decoding all
+        // raw snapshots here makes a bounded dashboard scale with raw bytes.
+        if !store.live("snapshots", id)?
+            && store
+                .get::<Value>("owners", id)?
+                .is_some_and(|owner| owner["shared"] == true)
+        {
+            return Err(std::io::Error::other("selected history unavailable"));
+        }
         let Some(view) = store.get::<crate::proxy_state::AccountingView>("snapshots", id)? else {
             if store
                 .get::<Value>("owners", id)?
