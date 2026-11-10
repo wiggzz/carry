@@ -753,8 +753,8 @@ class TransparentHistory(unittest.TestCase):
                     return 200, value
                 def review(body, _n):
                     is_b = "R8_B_BOUNDARY" in json.dumps(body)
-                    return 200, advice_response({"protected": [2] if is_b else [1],
-                        "removable": [6] if is_b else [2], "memories": [
+                    return 200, advice_response({"protected": [1],
+                        "removable": [3, 6] if is_b else [2], "memories": [
                             {"source_ids": [6 if is_b else 2], "text": "R8_B_ONLY_FACT" if is_b else "R8_A_FACT"}]})
                 fixture = self.fixture(primary, review)
                 seed_options = ["--review-replayed-history", "--payoff-requests", "1",
@@ -784,7 +784,8 @@ class TransparentHistory(unittest.TestCase):
                                        headers={"Content-Type": "application/json"})
                     self.assertTrue(held.wait(3), "auxiliary must reach actual provider before cancellation")
                     self.assertEqual(proxy.checkpoint(b)[0], owner_a)
-                    self.assertIn(a[1], fixture.primaries[-1]["input"], "B's changed protection must actually restore A")
+                    self.assertNotIn(a[1], fixture.primaries[-1]["input"], "B retains A's applied projection")
+                    self.assertNotIn(a[2], fixture.primaries[-1]["input"], "B's changed shared-prefix advice must actually apply")
                     self.assertIn("R8_B_ONLY_FACT", json.dumps(fixture.primaries[-1]["input"]))
                     self.assertNotIn(b[-2], fixture.primaries[-1]["input"], "B-only projection must really apply")
                     connection.sock.shutdown(socket.SHUT_RDWR)
@@ -818,6 +819,7 @@ class TransparentHistory(unittest.TestCase):
                 self.assertTrue(all(s["primary"]["unavailable_cost_calls"] == 0 for s in states.values()))
                 sent = fixture.primaries[-1]["input"]
                 self.assertIn(a[0], sent)
+                self.assertIn(a[2], sent, "B-only removal of A's separator cannot leak into C")
                 self.assertIn(a[3], sent)
                 self.assertIn(c[-1], sent)
                 self.assertNotIn("R8_B_ONLY_FACT", json.dumps(sent), "never borrow B-only advice")
