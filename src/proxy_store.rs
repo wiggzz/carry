@@ -1167,3 +1167,54 @@ impl Store {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod initialization_admission_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_schema_refuses_before_crossing_physical_capacity() {
+        schema_capacity_control(false);
+    }
+
+    #[test]
+    fn import_staging_schema_refuses_before_crossing_physical_capacity() {
+        schema_capacity_control(true);
+    }
+
+    fn schema_capacity_control(staging: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = Policy::fixture(directory.path());
+        policy.max_record = 8192;
+        policy.disk_limit = 2 * 1024 * 1024;
+        let original = directory.path().join("history.index");
+        let predecessor = b"preserved predecessor bytes; schema-initialization seam only";
+        let path = if staging {
+            std::fs::write(&original, predecessor).unwrap();
+            directory.path().join(".history-import.tmp")
+        } else {
+            original.clone()
+        };
+        let occupied = disk_bytes(directory.path(), 0).unwrap();
+        File::create(directory.path().join("unrelated-retained-evidence"))
+            .unwrap()
+            .set_len(policy.disk_limit - occupied - 4096)
+            .unwrap();
+        let before = disk_bytes(directory.path(), 0).unwrap();
+        assert_eq!(before, policy.disk_limit - 4096);
+        // Keep a successful connection open while observing WAL/SHM, rather
+        // than missing initialization's peak after its final close.
+        let opened = Store::open_path(&policy, HashSet::new(), true, &path);
+        let connected_bytes = disk_bytes(directory.path(), 0).unwrap();
+        if staging {
+            assert_eq!(std::fs::read(&original).unwrap(), predecessor);
+        }
+        assert!(
+            opened.is_err() && connected_bytes <= policy.disk_limit,
+            "schema creation must refuse before physical capacity: staging={staging} before={before} connected={connected_bytes} cap={} opened={}",
+            policy.disk_limit,
+            opened.is_ok()
+        );
+        assert!(!path.exists(), "refused schema must not publish authority");
+    }
+}

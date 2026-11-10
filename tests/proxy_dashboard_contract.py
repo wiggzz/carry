@@ -167,7 +167,10 @@ class DashboardDispatchContract(unittest.TestCase):
             root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
             fixture = Fixture(lambda body, n: (200, completed()), lambda body, n: (200, advice_response({"protected": [], "removable": [], "memories": []})))
             stack.callback(fixture.close)
-            proxy = ImplicitProxy(root, fixture, mode="audit", wait_reviews=False)
+            # This fixture corrupts authority on purpose. Join the legitimate
+            # background publisher first so it cannot repair the injected bytes
+            # between corruption and the read-only fail-closed assertions.
+            proxy = ImplicitProxy(root, fixture, mode="audit", wait_reviews=True)
             stack.callback(proxy.close)
             source = [{"role": "user", "content": "Authoritative owned shared source."}]
             self.assertEqual(proxy.send(source)[0], 200)

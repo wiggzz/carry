@@ -10,6 +10,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -243,6 +244,15 @@ class BrowserRetention(unittest.TestCase):
                         command(session, method='DELETE')
                 finally:
                     stop()
+                    if not report.get('passed'):
+                        # Preserve bounded startup/driver diagnostics before the
+                        # private directory is removed. A timeout is not a UI
+                        # assertion failure or evidence of successful startup.
+                        with (directory / 'chromedriver.log').open('rb') as diagnostic:
+                            diagnostic.seek(0, os.SEEK_END)
+                            diagnostic.seek(max(0, diagnostic.tell() - 16384))
+                            print('browser-driver-failure-tail:' + diagnostic.read().decode('utf-8', 'replace'),
+                                  file=sys.stderr, flush=True)
                     # Keep measurements and bounded synthetic image chunks visible
                     # without workflow edits or a single enormous log line.
                     for request in report.pop('requests'):
