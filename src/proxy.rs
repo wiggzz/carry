@@ -403,6 +403,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         lock_waits: Arc::new(std::sync::Mutex::new(None)),
         _directory_lock: Arc::new(directory_lock),
     });
+    history::initialize(&service)?;
     logging::maintain(&service);
     let listener = tokio::net::TcpListener::bind(service.config.listen).await?;
     let address = listener.local_addr()?;
@@ -450,6 +451,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         .route("/carry/metrics", get(metrics))
         .route("/carry/dashboard", get(dashboard))
         .route("/carry/dashboard/stats", get(dashboard_stats))
+        .route("/carry/dashboard/accounting", get(dashboard_accounting))
         .route(
             "/carry/dashboard/transcript/{id}",
             get(dashboard_transcript),
@@ -1359,6 +1361,49 @@ fn dashboard_current_failure(session: &Session) -> Option<&Value> {
     .then_some(failure)
 }
 
+#[derive(Default, serde::Deserialize)]
+struct AccountingPage {
+    #[serde(default)]
+    after_at: u64,
+    #[serde(default)]
+    after_key: String,
+    limit: Option<usize>,
+}
+async fn dashboard_accounting(
+    State(service): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Query(page): axum::extract::Query<AccountingPage>,
+) -> Result<Response, Failure> {
+    authorize_dashboard(&service, &headers, peer)?;
+    if page.after_at > i64::MAX as u64
+        || (!page.after_key.is_empty()
+            && (page.after_key.len() != 64
+                || !page.after_key.bytes().all(|b| b.is_ascii_hexdigit())))
+    {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "invalid accounting cursor",
+        ));
+    }
+    let data = history::accounting(
+        &service,
+        page.after_at,
+        &page.after_key,
+        page.limit.unwrap_or(100).clamp(1, 100),
+    )
+    .map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "retained accounting unavailable",
+        )
+    })?;
+    let mut response = axum::Json(data).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    Ok(response)
+}
 async fn dashboard_stats(
     State(service): State<Arc<Service>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

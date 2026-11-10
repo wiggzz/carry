@@ -1,6 +1,6 @@
 """Transparent, caller-owned history matching through real loopback review."""
 import http.client
-from history_store import read_index, write_index
+from history_store import read_index, write_index, receipt_fault
 import json
 import time
 import unittest
@@ -267,8 +267,8 @@ class TransparentHistory(unittest.TestCase):
         deadline = time.monotonic()+5
         while proxy.saved().get("primary_pending"):
             self.assertLess(time.monotonic(),deadline); time.sleep(.01)
-        fault = self.state / ".history-index.tmp"
-        fault.mkdir()
+        fault = self.state / "history.index"
+        receipt_fault(fault, True)
         fixture.release.set()
         deadline = time.monotonic()+5
         while not any('"background_review_merged"' in p.read_text() and '"receipt_durable":false' in p.read_text()
@@ -280,7 +280,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertTrue(paid["background_review_pending"])
         self.assertEqual(paid["shadow"]["calls"],0, "uncommitted receipt is explicitly unknown, never silently known-zero")
         proxy.close()
-        fault.rmdir()
+        receipt_fault(fault, False)
         # Preserve the exact settings namespace. A bootstrap retry is a new
         # paid call, separate from the single explicitly censored orphan.
         proxy = self.proxy(fixture,options)
@@ -1221,24 +1221,30 @@ class TransparentHistory(unittest.TestCase):
         # live owner now backpressures instead of deleting its authority.
         self.assertEqual(proxy.send([{"role": "user", "content": "TOO_SMALL_OWNER"}])[0], 507)
         self.assertEqual(fixture.primaries, [])
-        self.assertFalse((self.state / "history.index").exists())
-        self.assertEqual(list(self.state.glob("*.json")), [])
+        rejected = read_index(self.state / "history.index")
+        self.assertFalse(rejected["snapshots"])
+        self.assertFalse(rejected["transcripts"])
+        self.assertEqual(list(self.state.glob("*.json")),[])
         proxy.close()
         # The roomy arm must fit a completed selected snapshot, including its
         # numeric dispatch evidence. Keep the 4 KiB no-dispatch rejection above;
         # every publication below must still obey this declared byte bound.
         env["CARRY_PROXY_HISTORY_MAX_BYTES"] = "32768"
+        env["CARRY_PROXY_HISTORY_MAX_AGE_SECS"] = "604800"
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
         for n in range(8):
             self.assertEqual(proxy.send([{"role": "user", "content": f"UNIQUE_{n}"}])[0], 200)
-            raw = (self.state / "history.index").read_bytes()
-            index = json.loads(raw)
-            self.assertLessEqual(len(raw), int(env["CARRY_PROXY_HISTORY_MAX_BYTES"]))
-            self.assertLessEqual(len(index["nodes"]), 4)
-            self.assertLessEqual(len(index["tips"]) + len(index["transcripts"]), 4)
-        self.assertEqual(proxy.send([], previous_response_id="resp_1")[0], 409)
+            index = read_index(self.state / "history.index")
+            for kind in ("nodes", "tips", "reviews", "transcripts", "snapshots"):
+                for value in index[kind].values():
+                    self.assertLessEqual(len(wire(value)), 32768, "decoded record bound, not global eviction")
+        self.assertGreater(len(index["nodes"]), 4)
+        self.assertGreater(len(index["transcripts"]), 4)
+        self.assertEqual(proxy.send([], previous_response_id="resp_1")[0], 200,
+                         "working-set pressure cannot expire an observed ID")
         proxy.close()
+        env["CARRY_PROXY_HISTORY_MAX_AGE_SECS"] = "1"
         time.sleep(2.05)
         # Orphan publication is never authoritative.
         (self.state / "history.tmp").write_text('{"fake":"uncommitted"}')
@@ -1479,6 +1485,7 @@ class TransparentHistory(unittest.TestCase):
         proxy, fixture, history, _ = self.seed(extra=("--history-max-references", "32"))
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "STORAGE_PARENT"}])[0], 200)
         observations = []
+        retained_owners = set(read_index(self.state / "history.index")["snapshots"])
         for n in range(20):
             child = history + [{"role": "user", "content": f"STORAGE_CHILD_{n}"}]
             self.assertEqual(proxy.send(child)[0], 200)
@@ -1492,9 +1499,11 @@ class TransparentHistory(unittest.TestCase):
                 "snapshot_count": len(index["snapshots"]),
                 "shared_payload_copies": sum(node["value"] == history[1] for node in index["nodes"].values())}
             observations.append(observation)
-            self.assertLessEqual(observation["reference_count"], 32)
-            self.assertLessEqual(observation["index_bytes"], 33554432)
+            self.assertTrue(retained_owners <= set(index["snapshots"]), "unrelated owners cannot disappear under reference pressure")
+            self.assertGreaterEqual(observation["snapshot_count"], len(retained_owners) + n + 1)
+            self.assertLessEqual(observation["index_bytes"] + observation["diagnostic_mirror_bytes"], 1073741824)
             self.assertEqual(observation["shared_payload_copies"], 1)
+        self.assertGreater(observations[-1]["reference_count"], 32, "retain disk references beyond the active-owner working cap")
         summary = {"case": "20_siblings_shared_42k_prefix_reference_pressure", "samples": len(observations),
             "last": observations[-1],
             "maximum_observed_index_plus_mirrors_bytes": max(o["index_bytes"] + o["diagnostic_mirror_bytes"] for o in observations),

@@ -46,6 +46,18 @@ fn pin_owner(
             "history owners busy",
         ));
     }
+    if !pins.contains_key(&key) {
+        storage::admit_owner(
+            service,
+            pins.keys().filter(|(dir, _)| dir == &key.0).count() + 1,
+        )
+        .map_err(|_| {
+            failure(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "durable history disk admission refused",
+            )
+        })?;
+    }
     pins.entry(key.clone())
         .or_insert(Owner {
             count: 0,
@@ -123,6 +135,10 @@ pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
     }
     Ok(())
 }
+pub(super) fn initialize(service: &Service) -> std::io::Result<()> {
+    let _guard = IO.lock().unwrap();
+    storage::initialize(service, pinned(service))
+}
 fn read(service: &Service) -> std::io::Result<Store> {
     Store::open(service, pinned(service), false)
 }
@@ -152,8 +168,7 @@ pub(super) fn namespace(
     }
     let owner = identity(&owner)?;
     let namespace = observed_namespace(&service.config, &owner, body);
-    let _guard = IO.lock().unwrap();
-    read(service).map_err(read_failure)?;
+    initialize(service).map_err(read_failure)?;
     Ok(namespace)
 }
 fn observed_namespace(config: &ProxyCli, owner: &Option<String>, body: &Value) -> String {
@@ -558,6 +573,15 @@ pub(super) fn observe_cache(
     }
     store.commit()?;
     Ok(cache)
+}
+pub(super) fn accounting(
+    service: &Service,
+    after_at: u64,
+    after_key: &str,
+    limit: usize,
+) -> std::io::Result<Value> {
+    let _guard = IO.lock().unwrap();
+    read(service)?.accounting_page(after_at, after_key, limit)
 }
 pub(super) fn cache(service: &Service) -> std::io::Result<Vec<CacheEvidence>> {
     let _guard = IO.lock().unwrap();

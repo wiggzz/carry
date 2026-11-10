@@ -47,6 +47,14 @@ def write_index(path, index):
                    ('upstream_cache', 'current', json.dumps(index.get('upstream_cache', [])).encode(), at, ''))
 
 
+def receipt_fault(path, enabled):
+    with closing(sqlite3.connect(path)) as db, db:
+        if enabled:
+            db.execute("CREATE TRIGGER receipt_fault BEFORE INSERT ON records BEGIN SELECT RAISE(ABORT,'fixture receipt transaction failure'); END")
+        else:
+            db.execute('DROP TRIGGER receipt_fault')
+
+
 def publication_fault(path, enabled):
     with closing(sqlite3.connect(path)) as db, db:
         if enabled:
