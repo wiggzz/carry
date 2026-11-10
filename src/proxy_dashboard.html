@@ -139,6 +139,9 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 <section aria-label="Cost overview"><p class="eyebrow">The big picture</p><div class="cards" id="cards"></div>
 <div class="overview-foot"><span>API-equivalent costs, not subscription bills. Savings are modeled, not measured.</span><span id="estimate-coverage"></span></div>
 <p id="observed-cost-summary" class="warning"></p><div id="usage-strip"></div></section>
+<section aria-labelledby="accounting-heading"><div class="section-head"><h2 id="accounting-heading">Monthly accounting</h2><p class="section-note">UTC observation months · independent of raw session details</p></div>
+<form id="accounting-form"><label for="accounting-month">Month (UTC)</label> <input id="accounting-month" type="month" required> <button id="accounting-load" type="submit">Load month</button></form>
+<p id="accounting-status" role="status" class="section-note">Choose a month to read retained numeric accounting. No opening balances are inferred.</p><div id="accounting-cards" class="cards"></div></section>
 <section aria-labelledby="conversations-heading"><div class="section-head"><h2 id="conversations-heading">By Session</h2><p class="section-note">One row per history · stable ID order · primary tokens below</p></div><div id="sessions" class="session-grid"></div></section>
 <details id="background-traffic" class="inspector"><summary id="background-summary">Client background requests</summary><div id="background-sessions" class="session-grid"></div></details>
 <nav aria-label="Session detail pages"><button type="button" id="first-sessions" disabled>First page</button> <button type="button" id="next-sessions" disabled>Next page</button><p id="session-page-note" class="section-note"></p></nav>
@@ -398,7 +401,7 @@ async function refresh(after=pageAfter){
   $('cost-cards').replaceChildren(card('With Carry',money(headline?.carry_cost)),card('Traditional',money(headline?.traditional_cost)),card('Strict-evidence exclusions (diagnostic)',fmt(estimate.excluded_unpriced_calls||0)));
   $('accounting-detail').textContent=fmt(estimate.matched_primary_responses)+' matched primary responses · completed calls only';
   const scenario=data.cost_scenario;
-  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill. Quantities may be estimated; no calibrated interval. Same outputs and tool sequence assumed. The whole-window point estimate includes omitted historical calls using the continuous trajectory cost ratio; without a reference, neutral primary-expense parity is assumed. Hypothetical summary/cache effects are amortized, not reconstructed. Not measured or causal savings.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
+  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill. Quantities may be estimated; no calibrated interval. Same outputs and tool sequence assumed. Traditional is replayed chronologically from frozen request observations; explicitly inferred quantities are identified separately. Missing successful money or historical evidence leaves the comparison unavailable. Summary/cache effects use the saved scenario; historical money is not repriced. Not measured or causal savings.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
   $('config').textContent='Mode '+(data.mode||'—')+' · '+(data.auth||'—')+' auth · reviewer '+(data.classifier_model||'—')+' / '+(data.classifier_effort||'—')+' · cache '+(data.reviewer_cache_mode||'—');
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const calls=sum(ledgers,'calls'),missing=sum(ledgers,'unavailable_cost_calls');
@@ -418,6 +421,30 @@ async function refresh(after=pageAfter){
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
  finally{busy=false;$('first-sessions').disabled=!pageAfter;$('next-sessions').disabled=!nextPageAfter}
 }
+let accountingBusy=false;
+async function loadAccounting(event){
+ event.preventDefault();if(accountingBusy)return;
+ const month=$('accounting-month').value;
+ $('accounting-cards').replaceChildren();
+ if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)||Number(month.slice(0,4))<1971){$('accounting-status').textContent='Choose a valid UTC month after 1970.';return}
+ const [year,index]=month.split('-').map(Number),start=Date.UTC(year,index-1,1)/1000-1,end=Date.UTC(year,index,1)/1000-1;
+ accountingBusy=true;$('accounting-load').disabled=true;$('accounting-status').textContent='Loading '+month+' UTC observation accounting…';
+ try{
+  const res=await fetch('/carry/dashboard/accounting?start_at='+start+'&end_at='+end,{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
+  if(!res.ok)throw Error('Accounting unavailable (HTTP '+res.status+').');
+  const w=(await res.json()).window;
+  if(!w||w.start_at!==start||w.end_at!==end)throw Error('Accounting response window mismatch.');
+  const coverage=w.coverage,comparison=w.comparison,lanes=[w.usage.primary,w.usage.reviewer];
+  const unpriced=sum(lanes,'unavailable_cost_calls'),partial=unpriced>0||w.usage.unavailable_owners>0;
+  $('accounting-cards').replaceChildren(
+   card(partial?'Native priced subtotal':'Native observed cost',money(coverage.included_owners?pricedSubtotal(lanes):null)),
+   card('Modeled Carry',money(comparison.carry_cost)),card('Modeled traditional',money(comparison.traditional_cost)),card('Modeled savings',savingsText(comparison)));
+  $('accounting-status').textContent=month+' UTC · observation-time closing minus opening per owner, not provider billing dates. Native coverage '+fmt(coverage.included_owners)+' / '+fmt(coverage.observed_owners)+' owners · '+fmt(sum(lanes,'calls'))+' attempts · '+fmt(unpriced)+' unpriced calls · '+fmt(w.completed_requests)+' completed / '+fmt(w.failed_primaries)+' failed primaries. '+fmt(coverage.missing_opening_owners)+' missing openings · '+fmt(coverage.incompatible_owners)+' incompatible · '+fmt(coverage.ambiguous_clock_owners)+' clock-ambiguous. Modeled successful comparison: '+fmt(comparison.included_owners)+' included · '+fmt(comparison.unavailable_owners)+' unavailable owners · '+fmt(comparison.primary_responses)+' responses · '+fmt(comparison.inferred_primary_responses)+' inferred. '+(w.retention_truncated?'Requested start precedes retained accounting; retention-truncated window. ':'')+'Native subtotals and modeled comparisons have independent populations. Savings are estimates, not measured or causal; missing evidence is not zero.';
+ }catch(err){$('accounting-cards').replaceChildren();$('accounting-status').textContent=month+' UTC · '+err.message+' No historical totals displayed.'}
+ finally{accountingBusy=false;$('accounting-load').disabled=false}
+}
+$('accounting-month').value=new Date().toISOString().slice(0,7);
+$('accounting-form').addEventListener('submit',loadAccounting);
 $('first-sessions').addEventListener('click',()=>refresh(''));
 $('next-sessions').addEventListener('click',()=>{if(nextPageAfter)return refresh(nextPageAfter)});
 $('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();refresh()});

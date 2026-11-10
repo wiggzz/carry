@@ -479,6 +479,55 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.equal(firstPage.disabled,true);
   sandbox.fetch=previousFetch;
   delete data.usage;
+  const monthInput=document.getElementById('accounting-month');
+  assert.ok(monthInput,'historical accounting must have a visible month selector');
+  const monthForm=document.getElementById('accounting-form');
+  const monthCards=document.getElementById('accounting-cards');
+  const monthStatus=document.getElementById('accounting-status');
+  monthInput.value='2026-02';
+  const monthRequests=[];
+  sandbox.fetch=async (url,options)=>{
+    monthRequests.push([url,options]);
+    return {ok:true,json:async()=>({window:{start_at:Date.UTC(2026,1,1)/1000-1,end_at:Date.UTC(2026,2,1)/1000-1,
+      retention_truncated:true,coverage:{observed_owners:12,included_owners:8,
+        missing_opening_owners:2,incompatible_owners:1,ambiguous_clock_owners:1},
+      usage:{primary:{calls:41,cost_usd:11,unavailable_cost_calls:3},
+        reviewer:{calls:7,cost_usd:2,unavailable_cost_calls:1},unavailable_owners:4},
+      comparison:{included_owners:5,unavailable_owners:7,primary_responses:19,
+        inferred_primary_responses:4,carry_cost:5,traditional_cost:7,savings:0.123,savings_percent:1.7}
+    }})};
+  };
+  const submitMonth=async()=>{for(const fn of monthForm.listeners.submit||[])await fn({preventDefault(){}})};
+  await submitMonth();
+  assert.equal(monthRequests.length,1);
+  const monthUrl=new URL(monthRequests[0][0],'http://localhost');
+  assert.equal(monthUrl.pathname,'/carry/dashboard/accounting');
+  assert.equal(Number(monthUrl.searchParams.get('start_at')),Date.UTC(2026,1,1)/1000-1);
+  assert.equal(Number(monthUrl.searchParams.get('end_at')),Date.UTC(2026,2,1)/1000-1);
+  assert.equal(monthRequests[0][1].cache,'no-store');
+  const historicalCards=new Map(monthCards.children.map(card=>card.children.slice(0,2).map(n=>n.textContent)));
+  assert.equal(historicalCards.get('Native priced subtotal'),'$13.000000');
+  assert.equal(historicalCards.get('Modeled Carry'),'$5.000000');
+  assert.equal(historicalCards.get('Modeled traditional'),'$7.000000');
+  assert.equal(historicalCards.get('Modeled savings'),'$0.123000 (1.7%)',
+    'month rendering trusts independent backend totals, never sums cumulative observations or current-page rows');
+  const shownMonth=text(monthStatus);
+  for(const expected of ['UTC','observation','8 / 12','5 included','7 unavailable','4 unpriced','retention','2 missing','1 incompatible','1 clock'])
+    assert.ok(shownMonth.toLowerCase().includes(expected.toLowerCase()),expected+': '+shownMonth);
+  sandbox.fetch=async()=>({ok:true,json:async()=>({window:{
+    start_at:Date.UTC(2026,1,1)/1000-1,end_at:Date.UTC(2026,2,1)/1000-1,
+    coverage:{observed_owners:1,included_owners:0,missing_opening_owners:1,incompatible_owners:0,ambiguous_clock_owners:0},
+    usage:{primary:{calls:0,cost_usd:0},reviewer:{calls:0,cost_usd:0},unavailable_owners:1},
+    comparison:{included_owners:0,unavailable_owners:1,primary_responses:0,inferred_primary_responses:0,carry_cost:null,traditional_cost:null,savings:null,savings_percent:null}
+  }})});
+  await submitMonth();
+  assert.ok(monthCards.children.every(card=>card.children[1].textContent==='—'),
+    'missing openings and unavailable modeled comparisons must not become displayed zero money');
+  sandbox.fetch=async()=>({ok:false,status:507});
+  monthInput.value='2026-03';await submitMonth();
+  assert.equal(monthCards.children.length,0,'a failed historical query must not relabel prior month money');
+  assert.ok(text(monthStatus).includes('507'));
+  sandbox.fetch=previousFetch;
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();

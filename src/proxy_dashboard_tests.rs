@@ -1,4 +1,146 @@
 #[test]
+fn dashboard_month_window_exposes_missing_decreasing_and_backward_boundaries() {
+    for case in ["missing", "decreasing", "backward"] {
+        let directory = tempfile::tempdir().unwrap();
+        let start = 20_000_000;
+        let end = start + 30 * 86400;
+        let id = format!("{:064x}", 933);
+        let mut session = Session {
+            history_shared: true,
+            history_namespace: Some(format!("boundary-{case}")),
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        session
+            .ingest(&[json!({"role":"user","content":"private boundary source"})])
+            .unwrap();
+        at_decision_clock(
+            &[if case == "missing" {
+                start + 1
+            } else {
+                start - 1
+            }],
+            || {
+                numeric_primary(&mut session, 0);
+                save(&checkpoint_service(directory.path()), &id, &session).unwrap();
+            },
+        );
+        at_decision_clock(&[start + 100], || {
+            numeric_primary(&mut session, 1);
+            save(&checkpoint_service(directory.path()), &id, &session).unwrap();
+        });
+        at_decision_clock(
+            &[if case == "backward" {
+                start + 50
+            } else {
+                start + 200
+            }],
+            || {
+                numeric_primary(&mut session, 2);
+                if case == "decreasing" {
+                    // A staged incompatible native cumulative ledger, not a provider receipt.
+                    session.primary.cost_usd = 0.001;
+                }
+                save(&checkpoint_service(directory.path()), &id, &session).unwrap();
+            },
+        );
+        at_decision_clock(&[end + 60 * 86400], || {
+            let service = checkpoint_service(directory.path());
+            let frozen = history::accounting(&service, 0, "", 100).unwrap();
+            assert_eq!(frozen["records"].as_array().unwrap().len(), 3);
+            assert!(history::restore(&service, &id).is_err());
+            let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
+            let report = history::accounting_window(&service, start, end).unwrap();
+            assert_eq!(report["coverage"]["observed_owners"], 1, "{case}: {report}");
+            assert_eq!(report["coverage"]["included_owners"], 0, "{case}: {report}");
+            let reason = match case {
+                "missing" => "missing_opening_owners",
+                "decreasing" => "incompatible_owners",
+                _ => "ambiguous_clock_owners",
+            };
+            assert_eq!(report["coverage"][reason], 1, "{case}: {report}");
+            assert_eq!(report["usage"]["unavailable_owners"], 1);
+            assert_eq!(report["comparison"]["unavailable_owners"], 1);
+            assert!(report["comparison"]["carry_cost"].is_null());
+            assert!(report["comparison"]["traditional_cost"].is_null());
+            assert_eq!(
+                history::accounting_window(&checkpoint_service(directory.path()), start, end)
+                    .unwrap(),
+                report
+            );
+            assert_eq!(history::accounting(&service, 0, "", 100).unwrap(), frozen);
+            assert_eq!(
+                std::fs::read(directory.path().join("history.index")).unwrap(),
+                bytes
+            );
+        });
+    }
+}
+
+#[test]
+fn dashboard_month_window_separates_unknown_failed_attempts_from_successful_models() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = 20_000_000;
+    let end = start + 30 * 86400;
+    let id = format!("{:064x}", 934);
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("unknown-month-native".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"private native source"})])
+        .unwrap();
+    at_decision_clock(&[start - 1], || {
+        numeric_primary(&mut session, 0);
+        save(&checkpoint_service(directory.path()), &id, &session).unwrap();
+    });
+    at_decision_clock(&[start + 100], || {
+        // Actual ledger settlement seam: an attempted failed call has no native usage.
+        assert!(
+            session
+                .primary
+                .settle_with_rates("unknown-month-price", &Value::Null, true, None)
+                .is_none()
+        );
+        session.failed_primaries += 1;
+        save(&checkpoint_service(directory.path()), &id, &session).unwrap();
+    });
+    at_decision_clock(&[end], || {
+        numeric_primary(&mut session, 1);
+        save(&checkpoint_service(directory.path()), &id, &session).unwrap();
+    });
+    at_decision_clock(&[end + 60 * 86400], || {
+        let service = checkpoint_service(directory.path());
+        let frozen = history::accounting(&service, 0, "", 100).unwrap();
+        assert_eq!(frozen["records"].as_array().unwrap().len(), 3);
+        assert!(history::restore(&service, &id).is_err());
+        let bytes = std::fs::read(directory.path().join("history.index")).unwrap();
+        let report = history::accounting_window(&service, start, end).unwrap();
+        assert_eq!(report["coverage"]["included_owners"], 1);
+        assert_eq!(report["usage"]["primary"]["calls"], 2);
+        assert_eq!(report["usage"]["primary"]["unavailable_cost_calls"], 1);
+        assert!((report["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 0.002).abs() < 1e-12);
+        assert_eq!(report["completed_requests"], 1);
+        assert_eq!(report["failed_primaries"], 1);
+        assert_eq!(report["comparison"]["included_owners"], 1);
+        assert_eq!(report["comparison"]["primary_responses"], 1);
+        assert!((report["comparison"]["carry_cost"].as_f64().unwrap() - 0.002).abs() < 1e-12);
+        assert!((report["comparison"]["traditional_cost"].as_f64().unwrap() - 0.002).abs() < 1e-12);
+        assert_eq!(
+            history::accounting_window(&checkpoint_service(directory.path()), start, end).unwrap(),
+            report
+        );
+        assert_eq!(history::accounting(&service, 0, "", 100).unwrap(), frozen);
+        assert_eq!(
+            std::fs::read(directory.path().join("history.index")).unwrap(),
+            bytes
+        );
+    });
+}
+
+#[test]
 fn dashboard_month_window_keeps_evidence_corrections_out_of_comparison_spend() {
     let directory = tempfile::tempdir().unwrap();
     let start = 20_000_000;
