@@ -75,6 +75,104 @@ fn archive_actual_over_limit_numeric_frontier_grows_through_session_restart() {
     }
 }
 
+#[test]
+fn archive_optional_conflict_fork_cannot_spend_paid_settlement_promise() {
+    for shared in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.history_max_bytes = 65536;
+        service.config.history_disk_bytes = 8 * 1024 * 1024;
+        let id = pr154_session_id("settlement-fork-capacity");
+        let mut session = Session {
+            history_shared: shared,
+            history_namespace: Some("settlement-fork-capacity".into()),
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        session
+            .ingest(&[json!({"role":"user","content":"paid source"})])
+            .unwrap();
+        session.request_evidence.as_mut().unwrap().bind_archive(
+            &history::FilePolicy::new(&service.config),
+            &id,
+            session.history_namespace.as_deref(),
+        );
+        // Grow a genuine committed numeric prefix larger than an emergency
+        // transaction's startup, without manufacturing a watermark or receipt.
+        let mut n = 0;
+        loop {
+            for _ in 0..8 {
+                numeric_primary(&mut session, n);
+                n += 1;
+            }
+            save(&service, &id, &session).unwrap();
+            session = load(&service, &id).unwrap();
+            let path = numeric_selected_path(directory.path(), &session);
+            if std::fs::metadata(path).unwrap().len() >= 740000 {
+                break;
+            }
+            assert!(n < 2000, "bounded fixture prefix construction");
+        }
+        let archive = numeric_selected_path(directory.path(), &session);
+        let committed = std::fs::read(&archive).unwrap();
+        assert!(
+            committed.len() < 780000,
+            "qualify fork fits only by spending the promise"
+        );
+        session.primary_pending = true;
+        save(&service, &id, &session).unwrap();
+        let _pin = history::pin(&service, &id).unwrap();
+        let mut orphan = committed.clone();
+        orphan.extend_from_slice(b"conflicting abandoned tail\n");
+        std::fs::write(&archive, &orphan).unwrap();
+        // Fill ONLY ordinary headroom, as measured by the real connected
+        // physical owner. Its paid and maintenance promises remain untouched.
+        let publication = history::FilePolicy::new(&service.config).acquire().unwrap();
+        let mut low = 0;
+        let mut high = service.config.history_disk_bytes;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if publication.admit_file(directory.path(), mid).is_ok() {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        File::create(directory.path().join("pressure.bin"))
+            .unwrap()
+            .set_len(low)
+            .unwrap();
+        assert!(publication.admit_file(directory.path(), 1).is_err());
+        drop(publication);
+        let before = session.primary.cost_usd;
+        numeric_primary(&mut session, n);
+        session.primary_pending = false;
+        let result = save_paid_accounting(&service, &id, &session, "paid-fork");
+        assert!(
+            result.is_ok(),
+            "optional archive fork spent protected paid settlement: shared={shared}, result={result:?}"
+        );
+        let restored = load(&service, &id).unwrap();
+        assert_eq!(restored.primary.calls, n + 1);
+        assert!((restored.primary.cost_usd - before - 0.002).abs() < 1e-10);
+        assert!(!restored.primary_pending);
+        assert_eq!(std::fs::read(&archive).unwrap(), orphan);
+        assert_eq!(numeric_selected_path(directory.path(), &restored), archive);
+        assert!(
+            !restored
+                .request_evidence
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .archive_unavailable
+        );
+        let cold = checkpoint_service(directory.path());
+        let restarted = load(&cold, &id).unwrap();
+        assert_eq!(restarted.primary.calls, n + 1);
+        assert_eq!(restarted.primary.cost_usd, restored.primary.cost_usd);
+    }
+}
+
 // REVIEW-02: real synchronous reviewer and primary relay, faulted persistence.
 #[tokio::test]
 async fn archive_sync_reviewer_stale_reservation_and_primary_fault_preserve_committed_receipt() {
