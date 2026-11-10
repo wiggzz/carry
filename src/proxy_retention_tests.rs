@@ -1,5 +1,94 @@
 // Retention promises cannot be overridden by the continuation working-set cap.
 #[test]
+fn a_retention_existing_owner_admission_completes_without_lock_recursion() {
+    let mut failures = Vec::new();
+    for mode in ["prefix-candidate", "external-candidate", "resolve"] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "proxy::tests::retention_existing_owner_admission_child",
+                "--nocapture",
+            ])
+            .env("CARRY_TEST_RETENTION_ADMISSION_MODE", mode)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut timed_out = false;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("retention-admission: durable owner and direct pin ready"),
+            "{mode} failed fixture preconditions: {output:?}"
+        );
+        if timed_out || !output.status.success() {
+            failures.push(format!("{mode}: timed_out={timed_out}, {output:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "existing-owner admission must complete with the original owner: {failures:?}"
+    );
+}
+
+#[test]
+fn retention_existing_owner_admission_child() {
+    let Ok(mode) = std::env::var("CARRY_TEST_RETENTION_ADMISSION_MODE") else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let input = vec![json!({"role":"user","content":"retained continuation"})];
+    let body = json!({"input":input});
+    let (id, pin) = history::resolve(&service, "admission-namespace", &body).unwrap();
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("admission-namespace".into()),
+        ..Session::default()
+    };
+    session.ingest(&input).unwrap();
+    numeric_primary(&mut session, 0);
+    let response = json!({"id":"retained-response","output":[]});
+    history::committed(&service, &id, &session, Some((&input, &response))).unwrap();
+    drop(pin);
+    drop(history::pin(&service, &id).unwrap());
+    let frozen = history::restore(&service, &id).unwrap();
+    assert_eq!(frozen.render_primary(), input);
+    assert_eq!(frozen.primary.calls, 1);
+    assert!((frozen.primary.cost_usd - 0.002).abs() < 1e-12);
+    eprintln!("retention-admission: durable owner and direct pin ready");
+    let (selected, pin) = match mode.as_str() {
+        "prefix-candidate" => history::candidate(&service, "admission-namespace", &body)
+            .unwrap()
+            .expect("existing prefix candidate"),
+        "external-candidate" => history::candidate(
+            &service,
+            "admission-namespace",
+            &json!({"input":[],"previous_response_id":"retained-response"}),
+        )
+        .unwrap()
+        .expect("existing external-ID candidate"),
+        "resolve" => history::resolve(&service, "admission-namespace", &body).unwrap(),
+        _ => panic!("unknown fixture mode"),
+    };
+    assert_eq!(selected, id);
+    drop(pin);
+    assert_eq!(
+        serde_json::to_value(history::restore(&service, &id).unwrap()).unwrap(),
+        serde_json::to_value(frozen).unwrap()
+    );
+}
+
+#[test]
 fn retention_unreadable_newest_advice_never_resurrects_older_permission() {
     unreadable_advice_control(false);
 }
