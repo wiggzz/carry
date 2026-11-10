@@ -2523,6 +2523,9 @@ fn checkpoint_polling_waits_for_schema_without_creating_authority() {
         !path.exists(),
         "readiness polling must not create authority"
     );
+    std::fs::write(&path, []).unwrap();
+    assert!(checkpoint_states(state.path()).is_empty());
+    assert!(std::fs::read(&path).unwrap().is_empty());
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("CREATE TABLE unrelated(value TEXT)")
         .unwrap();
@@ -2558,10 +2561,7 @@ fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
     // Advice becomes authority at the atomic index publication, not at its
     // earlier per-session diagnostic mirror write. Explicit legacy sessions
     // remain mirror-owned; implicit selected snapshots are index-owned.
-    let index = path
-        .join("history.index")
-        .exists()
-        .then(|| history_store::read_index(&path.join("history.index")))
+    let index = history_store::read_ready_index(&path.join("history.index"))
         .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
     std::fs::read_dir(path)
         .unwrap()

@@ -4,11 +4,33 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::path::Path;
 pub fn read_index(path: &Path) -> Vec<u8> {
-    let raw = std::fs::read(path).unwrap();
-    if !raw.starts_with(b"SQLite format 3") {
-        return raw;
+    read_ready_index(path).expect("history schema is not committed")
+}
+pub fn read_ready_index(path: &Path) -> Option<Vec<u8>> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("cannot inspect history: {e}"),
+    };
+    // A first writer can have created the file before committing its header or
+    // schema. Polling must neither initialize that file nor use a mirror.
+    if raw.is_empty() {
+        return None;
     }
-    let db = Connection::open(path).unwrap();
+    if !raw.starts_with(b"SQLite format 3") {
+        return Some(raw);
+    }
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let ready: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='records')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !ready {
+        return None;
+    }
     let mut index = json!({"format":"carry-prefix-history-v4","nodes":{},"tips":{},"reviews":{},"transcripts":{},"snapshots":{},"upstream_cache":[]});
     let mut statement = db.prepare("SELECT kind,key,data FROM records").unwrap();
     let rows = statement
@@ -29,7 +51,7 @@ pub fn read_index(path: &Path) -> Vec<u8> {
             index[&kind][&key] = value;
         }
     }
-    serde_json::to_vec(&index).unwrap()
+    Some(serde_json::to_vec(&index).unwrap())
 }
 pub fn write_index(path: &Path, bytes: &[u8]) {
     let index: Value = serde_json::from_slice(bytes).unwrap();

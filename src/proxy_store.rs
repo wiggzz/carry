@@ -545,14 +545,17 @@ impl Store {
             .request_evidence
             .as_ref()
             .map(|e| e.snapshot().dashboard(false));
-        // New validated evidence is a new immutable observation, even when no
-        // native money changed. These cumulative snapshots are never additive.
+        // Identify frozen numeric coverage, not the mutable dispatch/journal
+        // cursor. Corrected coverage is a new observation even when native
+        // money is unchanged; dispatch alone is not a settled observation.
         let identity = super::hash(&(
             id,
             &session.primary,
             &session.shadow,
+            session.completed_requests,
+            session.failed_primaries,
             &estimate,
-            &provenance,
+            crate::proxy_savings::accounting_policy(),
         ));
         if self.contains("accounted", &identity)? {
             return Ok(());
