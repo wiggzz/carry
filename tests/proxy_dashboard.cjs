@@ -55,9 +55,28 @@ const total = (carry, traditional, savings, percent, included, excluded = 0, fai
 let data = { sessions: [session(1, 2), session(3, 4)], unavailable_sessions: 0,
   cost_estimate: total(4, 6, 2, 100 / 3, 2),
   cost_scenario: {context_window: 272000, reserve: 16384, keep_recent: 20000, summary: 1000} };
+// Existing single-page scenarios supply complete synthetic populations. Keep
+// those fixture facts explicit at the new producer boundary; the independent
+// population scenario below supplies totals that deliberately differ from rows.
+const fixtureLane = ledgers => {
+  const result = {};
+  for (const key of ['calls','input_tokens','output_tokens','cached_tokens',
+    'cache_write_tokens','unavailable_cost_calls','cost_usd']) {
+    if (ledgers.some(l => typeof l[key] === 'number'))
+      result[key] = ledgers.reduce((n,l) => n+(l[key]||0),0);
+  }
+  result.cache_observation = {};
+  for (const key of ['calls','input_tokens','cached_tokens'])
+    result.cache_observation[key] = ledgers.reduce((n,l) => n+(l.cache_observation?.[key]||0),0);
+  return result;
+};
 const sandbox = {
   document, location: {hash: ''}, history: {}, URLSearchParams,
-  fetch: async () => ({ok: true, json: async () => data}), setInterval() {},
+  fetch: async () => ({ok: true, json: async () => ({...data, usage:data.usage||{
+    primary:fixtureLane(data.sessions.map(s=>s.primary||{})),
+    reviewer:fixtureLane(data.sessions.map(s=>s.shadow||{})),
+    unavailable_owners:data.unavailable_sessions||0,
+  }})}), setInterval() {},
 };
 vm.createContext(sandbox);
 const html = fs.readFileSync(process.env.CARRY_DASHBOARD_HTML_FIXTURE || 'src/proxy_dashboard.html', 'utf8');
@@ -397,6 +416,60 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.cost_estimate.whole_window=null;
   await refresh();
   assert.equal(cards().get('Estimated savings'),'—','unknown actual costs must not fall back to a narrower comparison');
+  // Page rows are not the all-attempt population. Use intentionally unequal
+  // sentinels, then an empty raw page with the same retained numeric history.
+  data.usage={
+    primary:{calls:31,input_tokens:12345,output_tokens:67,cost_usd:11,
+      unavailable_cost_calls:0,cache_observation:{calls:31,input_tokens:12345,cached_tokens:2469}},
+    reviewer:{calls:9,input_tokens:321,output_tokens:12,cost_usd:2,
+      unavailable_cost_calls:1,cache_observation:{calls:0,input_tokens:0,cached_tokens:0}},
+  };
+  for(const rows of [[recent],[]]){
+    data.sessions=rows;
+    await refresh();
+    assert.equal(cards().get('Priced subtotal'),'$13.000000',
+      'all-attempt known money cannot be recomputed from the selected raw page');
+    assert.match(elements.get('observed-cost-summary').textContent,/1 unpriced call/);
+    assert.match(text(elements.get('usage-strip')),/31 primary calls/);
+    assert.match(text(elements.get('usage-strip')),/9 reviewer calls/);
+    const lanes=elements.get('usage').children;
+    assert.equal(lanes[0].children[1].textContent,'31');
+    assert.equal(lanes[0].children[2].textContent,'12,345');
+    assert.equal(lanes[0].children[3].textContent,'2,469 (provider-reported)');
+    assert.equal(lanes[0].children[4].textContent,'20.0%');
+    assert.equal(lanes[1].children[1].textContent,'9');
+    assert.equal(lanes[1].children[8].textContent,'1');
+  }
+  const previousFetch=sandbox.fetch, pageRequests=[];
+  const cursor='f'.repeat(64), later={...recent,id:'later-page-owner'};
+  sandbox.fetch=async(url,options)=>{
+    pageRequests.push([url,options]);
+    const after=new URL(url,'http://localhost').searchParams.get('after_id');
+    return {ok:true,json:async()=>({...data,sessions:after?[later]:[recent],
+      session_page:{has_more:!after,next_after:after?null:cursor}})};
+  };
+  await refresh();
+  const nextPage=document.getElementById('next-sessions'), firstPage=document.getElementById('first-sessions');
+  assert.ok(nextPage&&firstPage,'session keyset pages have visible navigation controls');
+  assert.equal(nextPage.disabled,false);
+  assert.equal(firstPage.disabled,true);
+  const click=async button=>{for(const handler of button.listeners.click||[])await handler();};
+  await click(nextPage);
+  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.get('after_id'),cursor);
+  assert.equal(pageRequests.at(-1)[1].cache,'no-store');
+  assert.equal(elements.get('sessions').children[0].id,'history:later-page-owner');
+  assert.equal(nextPage.disabled,true);
+  assert.equal(firstPage.disabled,false);
+  assert.equal(cards().get('Priced subtotal'),'$13.000000','page navigation cannot change population money');
+  await refresh();
+  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.get('after_id'),cursor,
+    'automatic refresh stays on the selected bounded page');
+  await click(firstPage);
+  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.has('after_id'),false);
+  assert.equal(elements.get('sessions').children[0].id,'history:'+recent.id);
+  assert.equal(firstPage.disabled,true);
+  sandbox.fetch=previousFetch;
+  delete data.usage;
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();
@@ -411,9 +484,9 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.equal(cards().get('With Carry'),amount(head?.carry_cost));
     assert.equal(cards().get('Traditional'),amount(head?.traditional_cost));
     if(head) assert.equal(cards().get('Estimated savings'),amount(head.savings)+(head.savings_percent==null?'':` (${Number(head.savings_percent).toFixed(1)}%)`));
-    const native=data.sessions.flatMap(s=>[s.primary,s.shadow]);
+    const native=data.usage?[data.usage.primary,data.usage.reviewer]:data.sessions.flatMap(s=>[s.primary,s.shadow]);
     const cost=native.some(l=>l.cost_usd!=null)?native.reduce((n,l)=>n+(l.cost_usd||0),0):null;
-    const missing=native.some(l=>l.unavailable_cost_calls)||data.unavailable_sessions;
+    const missing=native.some(l=>l.unavailable_cost_calls)||(data.usage?data.usage.unavailable_owners:data.unavailable_sessions);
     assert.equal(cards().get(missing?'Priced subtotal':'Observed cost'),amount(cost));
     assert.equal(walk(elements.get('sessions')).filter(n=>n.className==='session').length+
       walk(elements.get('background-sessions')).filter(n=>n.className==='session').length,data.sessions.length);

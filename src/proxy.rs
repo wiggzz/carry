@@ -1468,6 +1468,72 @@ async fn dashboard_accounting(
         .insert("cache-control", "no-store".parse().unwrap());
     Ok(response)
 }
+// Fixed-size numeric reporting: model-name sets and raw session details are
+// not part of population aggregation. Paid attempts remain separate from the
+// successful-comparison population owned by DashboardTotals.
+#[derive(Default, serde::Serialize)]
+struct DashboardLane {
+    calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    cache_write_tokens: u64,
+    cache_observation: carry::core::CacheObservation,
+    unavailable_cost_calls: u64,
+    cost_usd: f64,
+}
+impl DashboardLane {
+    fn observe(&mut self, ledger: &carry::core::UsageLedger) -> std::io::Result<()> {
+        let invalid = || std::io::Error::other("retained usage totals overflow");
+        for (total, value) in [
+            (&mut self.calls, ledger.calls),
+            (&mut self.input_tokens, ledger.input_tokens),
+            (&mut self.output_tokens, ledger.output_tokens),
+            (&mut self.cached_tokens, ledger.cached_tokens),
+            (&mut self.cache_write_tokens, ledger.cache_write_tokens),
+            (
+                &mut self.unavailable_cost_calls,
+                ledger.unavailable_cost_calls,
+            ),
+            (
+                &mut self.cache_observation.calls,
+                ledger.cache_observation.calls,
+            ),
+            (
+                &mut self.cache_observation.input_tokens,
+                ledger.cache_observation.input_tokens,
+            ),
+            (
+                &mut self.cache_observation.cached_tokens,
+                ledger.cache_observation.cached_tokens,
+            ),
+        ] {
+            *total = total.checked_add(value).ok_or_else(invalid)?;
+        }
+        let cost = self.cost_usd + ledger.cost_usd;
+        if !cost.is_finite() {
+            return Err(invalid());
+        }
+        self.cost_usd = cost;
+        Ok(())
+    }
+}
+#[derive(Default, serde::Serialize)]
+struct DashboardUsage {
+    primary: DashboardLane,
+    reviewer: DashboardLane,
+    unavailable_owners: u64,
+}
+impl DashboardUsage {
+    fn observe(
+        &mut self,
+        primary: &carry::core::UsageLedger,
+        reviewer: &carry::core::UsageLedger,
+    ) -> std::io::Result<()> {
+        self.primary.observe(primary)?;
+        self.reviewer.observe(reviewer)
+    }
+}
 #[derive(Default, serde::Deserialize)]
 struct SessionPage {
     #[serde(default)]
@@ -1530,7 +1596,7 @@ async fn dashboard_stats(
     let mut unavailable_sessions = 0u64;
     let mut unavailable_accounting = 0u64;
     let history = history::ReadView::new(&service);
-    let mut cost_estimate = match &history {
+    let (mut cost_estimate, mut usage) = match &history {
         Ok(view) => view.expired_accounting_totals().map_err(|_| {
             failure(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1539,7 +1605,7 @@ async fn dashboard_stats(
         })?,
         // Preserve the partial dashboard and per-owner unavailable counts when
         // the authority cannot be read; never substitute diagnostic mirrors.
-        Err(_) => crate::proxy_savings::DashboardTotals::default(),
+        Err(_) => Default::default(),
     };
     for entry in entries {
         let Ok(entry) = entry else {
@@ -1586,6 +1652,14 @@ async fn dashboard_stats(
             // frozen independent projection takes over only after raw expiry,
             // never restoring stale comparison coverage over a live owner.
             cost_estimate.observe(&estimate);
+            usage
+                .observe(&accounting.primary, &accounting.shadow)
+                .map_err(|_| {
+                    failure(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "retained usage unavailable",
+                    )
+                })?;
         }
         if !selected.contains(id) {
             continue;
@@ -1685,8 +1759,10 @@ async fn dashboard_stats(
     sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     cost_estimate.excluded_sessions += unavailable_accounting;
     cost_estimate.unavailable_whole_windows(unavailable_accounting);
+    usage.unavailable_owners = unavailable_accounting;
     let mut response = axum::Json(json!({
         "cost_estimate": cost_estimate,
+        "usage": usage,
         "mode": format!("{:?}", service.config.mode).to_lowercase(),
         "auth": if service.config.codex_login { "codex" } else { "api-key" },
         "classifier_model": service.config.classifier_model,

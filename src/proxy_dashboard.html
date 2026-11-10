@@ -141,6 +141,7 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 <p id="observed-cost-summary" class="warning"></p><div id="usage-strip"></div></section>
 <section aria-labelledby="conversations-heading"><div class="section-head"><h2 id="conversations-heading">By Session</h2><p class="section-note">One row per history · stable ID order · primary tokens below</p></div><div id="sessions" class="session-grid"></div></section>
 <details id="background-traffic" class="inspector"><summary id="background-summary">Client background requests</summary><div id="background-sessions" class="session-grid"></div></details>
+<nav aria-label="Session detail pages"><button type="button" id="first-sessions" disabled>First page</button> <button type="button" id="next-sessions" disabled>Next page</button><p id="session-page-note" class="section-note"></p></nav>
 <details id="estimate-details" class="inspector"><summary>Under the hood · costs, usage &amp; configuration</summary>
 <h3>Comparison window</h3><div id="cost-cards"></div><p id="accounting-detail"></p><p id="assumptions"></p>
 <h3>Provider-reported totals · primary + reviewer</h3><div class="scroll" tabindex="0" role="region" aria-label="Recorded usage by lane"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input</th><th>Cached input</th><th>Cache share / coverage</th><th>Cache writes</th><th>Output</th><th>Observed cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
@@ -150,7 +151,7 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 'use strict';
 let token=new URLSearchParams(location.hash.slice(1)).get('token')||'';
 if(location.hash)history.replaceState(null,'',location.pathname+location.search);
-let busy=false;
+let busy=false,pageAfter='',nextPageAfter=null;
 const expandedDiagnostics=new Set();
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?'—':Number(n).toLocaleString();
@@ -368,10 +369,11 @@ function renderSession(s){
  }
  details.append(transcriptView(s));el.append(details);return el;
 }
-async function refresh(){
+async function refresh(after=pageAfter){
  if(busy)return;busy=true;
+ $('first-sessions').disabled=true;$('next-sessions').disabled=true;
  try{
-  const res=await fetch('/carry/dashboard/stats',{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
+  const res=await fetch('/carry/dashboard/stats'+(after?'?after_id='+encodeURIComponent(after):''),{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
   if(!res.ok)throw Error(res.status===401?'Scoped proxy token required.':'Stats unavailable (HTTP '+res.status+').');
   const data=await res.json(),sessions=data.sessions;
   const live=new Set(sessions.map(s=>s.id));
@@ -379,9 +381,9 @@ async function refresh(){
   const focusedElement=document.activeElement,roots=[$('sessions'),$('background-sessions')];
   const histories=new Map(roots.flatMap(descendants).filter(n=>n.className==='session').map(node=>[node.id,{node}]));
   $('status').textContent='Updated '+new Date().toLocaleTimeString()+' · refreshes every 2s';$('status').className=data.unavailable_sessions?'warning':'';$('login').hidden=true;
-  $('activity-summary').textContent=count(sessions.filter(s=>s.processing||s.background_review_pending).length,'active session')+' · '+count(sessions.length,'history','histories');
-  const primary=sessions.map(s=>s.primary||{}),shadow=sessions.map(s=>s.shadow||{}),all=[...primary,...shadow];
-  const unpriced=sum(all,'unavailable_cost_calls'),unreadable=data.unavailable_sessions||0,partial=unpriced>0||unreadable>0;
+  $('activity-summary').textContent=count(sessions.filter(s=>s.processing||s.background_review_pending).length,'active session')+' · '+count(sessions.length,'history','histories')+' on this page';
+  const primary=[data.usage.primary],shadow=[data.usage.reviewer],all=[...primary,...shadow];
+  const unpriced=sum(all,'unavailable_cost_calls'),unreadable=data.usage.unavailable_owners||0,partial=unpriced>0||unreadable>0;
   const estimate=data.cost_estimate||{},headline=headlineEstimate(estimate);
   $('cards').replaceChildren(card(partial?'Priced subtotal':'Observed cost',money(pricedSubtotal(all))),card('Estimated savings',savingsText(estimate)));
   note($('cards').children[0],'Primary + reviewer · all paid attempts','card-note');
@@ -413,9 +415,13 @@ async function refresh(){
   $('background-summary').textContent='Client background · '+count(background.length,'session');$('background-traffic').hidden=!background.length;
   if(focusedElement&&document.activeElement!==focusedElement&&roots.some(root=>root.contains(focusedElement)))focusedElement.focus({preventScroll:true});
   $('raw').textContent=JSON.stringify(data,null,2);
+  pageAfter=after;nextPageAfter=data.session_page?.has_more?data.session_page.next_after:null;
+  $('session-page-note').textContent=(pageAfter?'Later session page':'First session page')+' · details only; cost and usage totals cover retained accounting across all pages.';
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
- finally{busy=false}
+ finally{busy=false;$('first-sessions').disabled=!pageAfter;$('next-sessions').disabled=!nextPageAfter}
 }
+$('first-sessions').addEventListener('click',()=>refresh(''));
+$('next-sessions').addEventListener('click',()=>{if(nextPageAfter)return refresh(nextPageAfter)});
 $('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();refresh()});
 refresh();setInterval(()=>{if(!document.hidden)refresh()},2000);
 </script>

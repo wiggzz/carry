@@ -380,7 +380,7 @@ impl ReadView {
     }
     pub(super) fn expired_accounting_totals(
         &self,
-    ) -> std::io::Result<crate::proxy_savings::DashboardTotals> {
+    ) -> std::io::Result<(crate::proxy_savings::DashboardTotals, DashboardUsage)> {
         self.store.lock().unwrap().expired_accounting_totals()
     }
     pub(super) fn expired_accounting_has_owner(&self, id: &str) -> std::io::Result<bool> {

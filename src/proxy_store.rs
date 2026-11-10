@@ -736,7 +736,7 @@ impl Store {
     }
     pub(super) fn expired_accounting_totals(
         &self,
-    ) -> std::io::Result<crate::proxy_savings::DashboardTotals> {
+    ) -> std::io::Result<(crate::proxy_savings::DashboardTotals, DashboardUsage)> {
         // Stream one frozen cumulative observation per expired raw owner.
         // Live owners are projected through their current authority instead;
         // prior comparison coverage cannot override a current unknown window.
@@ -758,6 +758,7 @@ impl Store {
             ])
             .map_err(error)?;
         let mut totals = crate::proxy_savings::DashboardTotals::default();
+        let mut usage = DashboardUsage::default();
         while let Some(row) = rows.next().map_err(error)? {
             let owner: String = row.get(2).map_err(error)?;
             if self.live("owners", &owner)? {
@@ -769,9 +770,12 @@ impl Store {
             let data: Vec<u8> = row.get(1).map_err(error)?;
             #[derive(serde::Deserialize)]
             struct Observation {
+                primary: carry::core::UsageLedger,
+                reviewer: carry::core::UsageLedger,
                 estimate: Option<crate::proxy_savings::DashboardEstimate>,
             }
             let observation: Observation = serde_json::from_slice(&data)?;
+            usage.observe(&observation.primary, &observation.reviewer)?;
             if let Some(estimate) = observation.estimate {
                 totals.observe(&estimate);
             } else {
@@ -779,7 +783,7 @@ impl Store {
                 totals.unavailable_whole_windows(1);
             }
         }
-        Ok(totals)
+        Ok((totals, usage))
     }
     pub(super) fn accounting_page(
         &self,

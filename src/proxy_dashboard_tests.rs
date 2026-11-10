@@ -389,6 +389,10 @@ fn dashboard_all_attempt_lane_totals_survive_paging_restart_and_raw_expiry() {
         assert_eq!(report["usage"]["reviewer"]["input_tokens"], 2000);
         assert_eq!(report["usage"]["reviewer"]["unavailable_cost_calls"], 1);
         assert!((report["usage"]["reviewer"]["cost_usd"].as_f64().unwrap() - 0.002).abs() < 1e-12);
+        assert_eq!(
+            report["usage"]["unavailable_owners"], 0,
+            "readable independent paid totals must not inherit raw expiry: {phase}: {report}"
+        );
     }
 }
 
