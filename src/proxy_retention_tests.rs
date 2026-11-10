@@ -30,6 +30,15 @@ fn a_retention_existing_owner_admission_completes_without_lock_recursion() {
             stderr.contains("retention-admission: durable owner and direct pin ready"),
             "{mode} failed fixture preconditions: {output:?}"
         );
+        // Bypass libtest capture: other tests may be stalled on the same
+        // production lock, so preserve qualified outcomes before suite exit.
+        use std::io::Write as _;
+        writeln!(
+            std::io::stderr(),
+            "retention-admission: {mode} seed_ready=true timed_out={timed_out} status={:?}",
+            output.status
+        )
+        .unwrap();
         if timed_out || !output.status.success() {
             failures.push(format!("{mode}: timed_out={timed_out}, {output:?}"));
         }
