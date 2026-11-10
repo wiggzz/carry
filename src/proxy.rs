@@ -1628,24 +1628,26 @@ async fn dashboard_stats(
             unavailable_accounting += 1;
             continue;
         }
-        let Ok(accounting) = load_dashboard_accounting(&service, id, &history) else {
-            unavailable_sessions += 1;
-            unavailable_accounting += 1;
-            continue;
-        };
-        let pending = accounting.background_review_pending || accounting.primary_pending;
-        let estimate = dashboard_session_estimate(&accounting).dashboard(pending);
-        if history
-            .as_ref()
-            .unwrap()
-            .expired_accounting_has_owner(id)
-            .map_err(|_| {
+        // Resolve numeric coverage before attempting raw/current authority.
+        // Expired diagnostic mirrors can be unreadable while their independent
+        // frozen accounting has already contributed above.
+        let frozen_accounted = match &history {
+            Ok(view) => view.expired_accounting_has_owner(id).map_err(|_| {
                 failure(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "retained accounting unavailable",
                 )
-            })?
-        {
+            })?,
+            Err(_) => false,
+        };
+        let Ok(accounting) = load_dashboard_accounting(&service, id, &history) else {
+            unavailable_sessions += 1;
+            unavailable_accounting += u64::from(!frozen_accounted);
+            continue;
+        };
+        let pending = accounting.background_review_pending || accounting.primary_pending;
+        let estimate = dashboard_session_estimate(&accounting).dashboard(pending);
+        if frozen_accounted {
             cost_estimate.observe_activity(pending);
         } else {
             // Current authoritative numeric coverage owns a live window. The
