@@ -9,13 +9,13 @@ class BaselineSizing(unittest.TestCase):
     fixture = support.StateRegressions.fixture
     proxy = support.StateRegressions.proxy
 
-    def test_fresh_reasoning_append_prices_baseline_without_native_authority(self):
+    def test_fresh_reasoning_without_increment_is_unknown_until_native_measurement(self):
         reasoning = {"type": "reasoning", "summary": [],
                      "encrypted_content": "synthetic-opaque/" * 1000}
         answer = {"role": "assistant", "content": "synthetic answer"}
         fixture = self.fixture(lambda _b, n: (200, support.completed(
             [reasoning, answer] if n == 1 else [], f"baseline-{n}", input_tokens=10000)))
-        options = ["--review-min-primary-tokens", "1000000",
+        options = ["--review-every-requests", "100", "--review-min-primary-tokens", "1000000",
                    "--primary-context-tokens", "1000000"]
         proxy = self.proxy(fixture, options)
         history = [{"role": "user", "content": "synthetic goal"}]
@@ -47,20 +47,20 @@ class BaselineSizing(unittest.TestCase):
                           'estimated new reasoning is not native receipt prediction')
         self.assertIsNone(appended['last_primary_dispatch']['outgoing_input_tokens'],
                           'forecast cannot mint actual native input authority')
-        self.assertGreater(appended['last_plan']['primary_estimated_tokens'] or 0, 10000,
-                           'fresh opaque output must not erase the forecast baseline')
-        self.assertEqual(appended['last_plan']['primary_input_basis'],
-                         'receipt_anchored_reasoning_forecast')
+        self.assertIsNone(appended['last_plan']['primary_estimated_tokens'],
+                          'ciphertext length alone cannot supply a neutral native increment')
+        self.assertIsNone(appended['last_plan']['primary_input_basis'])
+        self.assertEqual(appended['last_plan']['reason'], 'input_quantity_unknown')
         self.assertFalse(appended['last_plan']['forced'])
         self.assertIsNone(appended['last_plan']['primary_fits'],
                           'a heuristic does not establish context-capacity proof')
         self.assertIsNone(appended['last_plan']['primary_required_tokens'])
-    def test_restart_then_response_id_reasoning_append_has_a_forecast(self):
+    def test_restart_then_response_id_unmeasured_reasoning_remains_unknown(self):
         reasoning = {"type": "reasoning", "summary": [],
                      "encrypted_content": "synthetic-restart/" * 1000}
         fixture = self.fixture(lambda _b, n: (200, support.completed(
             [reasoning] if n == 1 else [], f"restart-{n}", input_tokens=10000)))
-        options = ["--review-min-primary-tokens", "1000000"]
+        options = ["--review-every-requests", "100", "--review-min-primary-tokens", "1000000"]
         proxy = self.proxy(fixture, options)
         first = [{"role": "user", "content": "restart goal"}]
         self.assertEqual(proxy.send(first)[0], 200)
@@ -78,9 +78,39 @@ class BaselineSizing(unittest.TestCase):
         self.assertEqual(saved['primary_input']['anchor']['input'], 10000)
         self.assertEqual(fixture.reviews, [])
         self.assertIsNone(saved['last_plan']['primary_receipt_prediction_tokens'])
-        self.assertEqual(saved['last_plan']['primary_input_basis'],
-                         'receipt_anchored_reasoning_forecast')
-        self.assertGreater(saved['last_plan']['primary_estimated_tokens'], 10000)
+        self.assertIsNone(saved['last_plan']['primary_input_basis'])
+        self.assertIsNone(saved['last_plan']['primary_estimated_tokens'])
+        self.assertEqual(saved['last_plan']['reason'], 'input_quantity_unknown')
+
+    def test_measured_native_increment_forecasts_next_reasoning_without_capacity_authority(self):
+        outputs = [{'type':'reasoning', 'encrypted_content':f'opaque-{n}' * (n + 1)} for n in range(2)]
+        fixture = self.fixture(lambda _b, n: (200, support.completed(
+            [outputs[n-1]] if n <= 2 else [], f'increment-{n}', input_tokens=10000 + (n-1)*100)))
+        options = ['--review-every-requests','100','--review-min-primary-tokens','1000000']
+        proxy = self.proxy(fixture, options)
+        history = [{'role':'user','content':'stable goal'}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        history += [outputs[0], {'role':'user','content':'continue'}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        proxy.close()
+        proxy = self.proxy(fixture, options)
+        history += [outputs[1], {'role':'user','content':'continue'}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        saved = proxy.saved()
+        self.evidence.update(saved=saved, wires=fixture.primaries)
+        self.assertEqual(fixture.primaries[-1]['input'], history)
+        self.assertEqual(fixture.reviews, [])
+        self.assertEqual(saved['last_plan']['primary_input_basis'], 'receipt_anchored_reasoning_forecast')
+        self.assertGreater(saved['last_plan']['primary_estimated_tokens'], 10100)
+        self.assertIsNone(saved['last_plan']['primary_required_tokens'])
+        self.assertIsNone(saved['last_plan']['primary_fits'])
+        dispatch = saved['last_primary_dispatch']
+        for field in ['canonical_input_tokens', 'continuation_input_tokens', 'outgoing_input_tokens']:
+            self.assertEqual(dispatch[field], saved['last_plan']['primary_estimated_tokens'],
+                             'dispatch size estimates must reuse the supported planning quantity')
+        self.assertEqual(dispatch['receipt_input_tokens'], 10200)
+        self.assertEqual(saved['primary']['input_tokens'], 30300)
+        self.assertEqual(saved['primary']['calls'], 3)
 
     def test_unsupported_or_changed_contract_append_remains_unknown(self):
         reasoning = {"type": "reasoning", "summary": [],

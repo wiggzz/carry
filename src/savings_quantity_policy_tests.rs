@@ -40,7 +40,7 @@ fn quantity_policy_real_coordinators_preserve_summary_after_unknown_money() {
             ..Scenario::default()
         };
         let mut local = Trajectory::with_scenario(scenario);
-        let mut native = crate::proxy_savings::Trajectory::default();
+        let mut native = crate::proxy_savings::RequestEvidence::default();
         native.scenario = scenario;
         local.record(&json!({"event":"run_started","data":{
             "model":"gpt-6.1-sol","context_window":40_000,
@@ -82,7 +82,7 @@ fn quantity_policy_real_coordinators_preserve_summary_after_unknown_money() {
             assert_eq!(b.initial_compactions, 0);
             assert_eq!(a.traditional_compactions, u64::from(step >= 2));
             assert_eq!(b.pi_compactions, usize::from(step >= 2), "{ttl}/{step}");
-            assert!((a.observed_primary_cost - b.observed_cost).abs() < 1e-12);
+            assert!((a.observed_primary_cost.unwrap() - b.observed_cost).abs() < 1e-12);
             assert_eq!(
                 a.unavailable_primary_cost_calls,
                 u64::from(ttl == "12h" && step >= 2)
@@ -96,7 +96,7 @@ fn quantity_policy_real_coordinators_preserve_summary_after_unknown_money() {
         }
         // Current-format native restart cannot repeat the successful summary.
         let frozen = serde_json::to_value(&native).unwrap();
-        let reloaded: crate::proxy_savings::Trajectory =
+        let reloaded: crate::proxy_savings::RequestEvidence =
             serde_json::from_value(frozen.clone()).unwrap();
         assert_eq!(serde_json::to_value(reloaded).unwrap(), frozen);
         assert_eq!(local.last_output_proxy, token_units(&json!([])));

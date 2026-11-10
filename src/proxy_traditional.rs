@@ -29,6 +29,26 @@ pub(super) struct HistoryContract {
     initialization_version: u32,
 }
 impl HistoryContract {
+    pub(super) fn for_scenario(&self, scenario: Scenario) -> Self {
+        Self {
+            keep_recent: scenario.keep_recent,
+            summary_tokens: scenario.summary,
+            ..self.clone()
+        }
+    }
+    fn compatible(&self, other: &Self) -> bool {
+        // Off mode omits resolved metadata; that absence is not evidence of a
+        // new canonical history. Exact model/body/source hashes still fence
+        // continuity, and contradictory KNOWN resolution facts still reject.
+        let mut prior = self.clone();
+        let mut next = other.clone();
+        prior.resolved_model = prior.resolved_model.or_else(|| next.resolved_model.clone());
+        next.resolved_model = next.resolved_model.or_else(|| prior.resolved_model.clone());
+        prior.source_class = prior.source_class.or_else(|| next.source_class.clone());
+        next.source_class = next.source_class.or_else(|| prior.source_class.clone());
+        prior == next
+    }
+
     pub(super) fn extract(
         body: &Value,
         route: &str,
@@ -67,22 +87,16 @@ enum InputBasis {
     SemanticV1,
 }
 impl NativeInputCursor {
-    fn prefix(items: &[Value]) -> String {
-        format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&crate::openai::semantic_prompt_input(items)).unwrap()
-            )
-        )
+    fn prefix(items: &[String]) -> String {
+        format!("{:x}", Sha256::digest(serde_json::to_vec(items).unwrap()))
     }
-    fn matches(&self, body: &Value, input: u64, at: u64, projected: bool) -> bool {
+    fn matches(&self, body: &PrimaryFacts, input: u64, at: u64, projected: bool) -> bool {
         at >= self.at
             && (projected
-                || body["input"].as_array().is_some_and(|items| {
-                    items.len() >= self.items
-                        && Self::prefix(&items[..self.items]) == self.prefix
+                || body.input_len().is_some_and(|items| {
+                    body.prompt_digest(true, self.items).as_deref() == Some(self.prefix.as_str())
                         && input >= self.input
-                        && (items.len() > self.items || input == self.input)
+                        && (items > self.items || input == self.input)
                 }))
     }
 }
@@ -93,8 +107,27 @@ pub(super) struct HistoryContinuity {
     cursor: NativeInputCursor,
 }
 
-/// Kept in the existing atomic trajectory. Cache eligibility and monetary
-/// interpretation have no mutable access through this API.
+/// A response whose retained quantity is unknown has not yet decided whether
+/// the alternative summarized. Only the exact next semantic input can isolate
+/// its native retained increment; extra caller appends remain ambiguous.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct PendingRetention {
+    prefix: String,
+    items: usize,
+    restoration: String,
+    pub(super) fixed: u64,
+    visible: Option<u64>,
+    opaque_items: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProjectionRecovery {
+    configuration: String,
+    cursor: NativeInputCursor,
+}
+
+/// Read-time traditional quantities. Physical recognition and provider cache
+/// affinity do not own these retired-history/summary coordinates.
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub(super) struct TraditionalHistoryState {
     // Proof for the entire comparison history, not a last-plan/no-op flag.
@@ -104,10 +137,163 @@ pub(super) struct TraditionalHistoryState {
     pub(super) retired: u64,
     pub(super) summary: u64,
     pub(super) last_traditional_input: u64,
+    // Disposable read-time coordinates, never persisted predictions.
+    #[serde(skip)]
+    canonical_offset: i128,
+    #[serde(skip)]
+    last_canonical: Option<i128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) history_continuity: Option<HistoryContinuity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) pending_retention: Option<PendingRetention>,
+    #[serde(default)]
+    pub(super) unresolved_projection: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection_recovery: Option<ProjectionRecovery>,
 }
 impl TraditionalHistoryState {
+    /// Preserve the untouched alternative when this owner's canonical input
+    /// rebases downward. New growth at that ambiguous boundary is estimated as
+    /// zero; future positive native increments continue in the new coordinates.
+    pub(super) fn bridge_canonical(&mut self, native: u64, restoration: i128) -> (i128, bool) {
+        let canonical = i128::from(native)
+            .saturating_add(restoration)
+            .saturating_add(self.canonical_offset);
+        let rebased = self.last_canonical.is_some_and(|prior| prior > canonical);
+        if let Some(prior) = self.last_canonical.filter(|prior| *prior > canonical) {
+            self.canonical_offset = self
+                .canonical_offset
+                .saturating_add(prior.saturating_sub(canonical));
+        }
+        let restoration = restoration.saturating_add(self.canonical_offset);
+        self.last_canonical = Some(i128::from(native).saturating_add(restoration));
+        (restoration, rebased)
+    }
+
+    #[cfg(test)]
+    pub(super) fn retention_member(&self) -> Option<(usize, usize, u64)> {
+        Some((
+            self.history_continuity.as_ref()?.cursor.items,
+            self.pending_retention.as_ref()?.items,
+            self.pending_retention.as_ref()?.visible?,
+        ))
+    }
+    pub(super) fn defer_projection(
+        &mut self,
+        configuration: String,
+        body: &PrimaryFacts,
+        input: Option<u64>,
+        at: u64,
+    ) {
+        self.projection_recovery = if !self.unresolved_projection
+            && body.semantic_output.as_ref().is_some_and(Vec::is_empty)
+        {
+            input
+                .zip(body.semantic_input.as_ref())
+                .map(|(input, items)| ProjectionRecovery {
+                    configuration,
+                    cursor: NativeInputCursor {
+                        basis: InputBasis::SemanticV1,
+                        prefix: NativeInputCursor::prefix(items),
+                        items: items.len(),
+                        input,
+                        at,
+                    },
+                })
+        } else {
+            None
+        };
+        self.unresolved_projection = true;
+    }
+
+    pub(super) fn recover_projection(
+        &mut self,
+        configuration: &str,
+        body: &PrimaryFacts,
+        input: u64,
+        at: u64,
+    ) -> Option<u64> {
+        let prior = self.projection_recovery.as_ref()?;
+        let items = body.semantic_input.as_ref()?;
+        if prior.configuration != configuration
+            || input != prior.cursor.input
+            || at < prior.cursor.at
+            || items.len() != prior.cursor.items
+            || NativeInputCursor::prefix(items) != prior.cursor.prefix
+        {
+            return None;
+        }
+        let at = prior.cursor.at;
+        self.unresolved_projection = false;
+        self.projection_recovery = None;
+        Some(at)
+    }
+
+    pub(super) fn invalidate_projection_recovery(&mut self) {
+        // This capability represents exactly ONE successful missing transition.
+        // A later excluded success cannot leave it available for a future repeat.
+        self.projection_recovery = None;
+    }
+
+    pub(super) fn defer_retention(&mut self, body: &PrimaryFacts, restoration: i128, fixed: u64) {
+        let mut next = body.semantic_input.as_ref().unwrap().clone();
+        let output = body.semantic_output.as_ref();
+        if let Some(output) = output {
+            next.extend(output.iter().cloned());
+        }
+        self.pending_retention = Some(PendingRetention {
+            prefix: output.map_or_else(String::new, |_| NativeInputCursor::prefix(&next)),
+            items: next.len(),
+            restoration: restoration.to_string(),
+            fixed,
+            visible: body.retained_visible,
+            opaque_items: body.retained_opaque,
+        });
+    }
+
+    pub(super) fn resolve_retention(
+        &self,
+        body: &PrimaryFacts,
+        native: u64,
+        restoration: i128,
+        projected: bool,
+        scenario: Scenario,
+    ) -> Option<(u64, u64)> {
+        let pending = self.pending_retention.as_ref()?;
+        let cursor = &self.history_continuity.as_ref()?.cursor;
+        let items = body.semantic_input.as_ref()?;
+        if projected
+            || restoration.to_string() != pending.restoration
+            || items.len() < pending.items
+            || NativeInputCursor::prefix(&items[..pending.items]) != pending.prefix
+        {
+            return None;
+        }
+        let upper = native.checked_sub(cursor.input)?;
+        let retained = if items.len() == pending.items
+            || scenario
+                .response_compaction(self.last_traditional_input, upper, pending.fixed)
+                .ok()
+                == Some(None)
+        {
+            // Extra appends have nonnegative input quantities. Even without an
+            // allocation, their whole native increment can PROVE no intervening
+            // summary. This bound is never reported as an output measurement.
+            upper
+        } else {
+            // Extra caller input prevents exact attribution. Admit the same
+            // neutral residual estimator only when this output's member slice
+            // has valid attribution; never bypass a rejected native block.
+
+            // Member input allocations include local input framing. Convert
+            // only their hidden remainder to the retained-output adapter, then
+            // add this output's own visible units. Preserve the admitted block's
+            // integer remainder; a pooled forecast is not this member's share.
+            body.retained_member?
+        };
+        Some((retained, pending.fixed))
+    }
+
     pub(super) fn identical() -> Self {
         Self {
             shared_primary_history: crate::savings::PrimaryHistory::identical(),
@@ -134,13 +320,13 @@ impl TraditionalHistoryState {
     pub(super) fn compatible(
         &self,
         contract: &HistoryContract,
-        body: &Value,
+        body: &PrimaryFacts,
         input: u64,
         at: u64,
         projected: bool,
     ) -> Option<bool> {
         self.history_continuity.as_ref().map(|prior| {
-            &prior.contract == contract && prior.cursor.matches(body, input, at, projected)
+            prior.contract.compatible(contract) && prior.cursor.matches(body, input, at, projected)
         })
     }
 
@@ -163,17 +349,27 @@ impl TraditionalHistoryState {
 
     pub(super) fn observe(
         &mut self,
-        contract: HistoryContract,
-        items: &[Value],
+        mut contract: HistoryContract,
+        body: &PrimaryFacts,
         input: u64,
         at: u64,
     ) {
+        if let Some(previous) = &self.history_continuity
+            && previous.contract.compatible(&contract)
+        {
+            contract.resolved_model = contract
+                .resolved_model
+                .or_else(|| previous.contract.resolved_model.clone());
+            contract.source_class = contract
+                .source_class
+                .or_else(|| previous.contract.source_class.clone());
+        }
         self.history_continuity = Some(HistoryContinuity {
             contract,
             cursor: NativeInputCursor {
                 basis: InputBasis::SemanticV1,
-                prefix: NativeInputCursor::prefix(items),
-                items: items.len(),
+                prefix: body.prompt_digest(true, body.input_len().unwrap()).unwrap(),
+                items: body.input_len().unwrap(),
                 input,
                 at,
             },

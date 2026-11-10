@@ -1,6 +1,14 @@
 use super::*;
 use serde_json::json;
 
+fn neutral_tokens(m: &InputMeasurements, target: &Value, source: &Value) -> u64 {
+    let baseline = m.forecast_estimate(source, "route", None).unwrap();
+    let restoration = m
+        .accounting_restoration(target, source, "route", None)
+        .unwrap();
+    u64::try_from(baseline.tokens as i128 + restoration.tokens).unwrap()
+}
+
 fn fixture() -> (InputMeasurements, Value, Value) {
     let source = json!({"model":"gpt-6.1-sol","instructions":"fixed", "input":[
         {"role":"user","content":"visible history ".repeat(100)},
@@ -36,16 +44,19 @@ fn filtered_receipt_restart_and_fresh_append_allow_further_reasoning_removal() {
     let estimate = measured
         .projected_estimate(&next, &appended, "route", None)
         .unwrap();
-    assert!(estimate.tokens > baseline.tokens / 2 && estimate.tokens < baseline.tokens);
+    assert_eq!(estimate.tokens, neutral_tokens(&measured, &next, &appended));
+    assert!(estimate.tokens > 0 && estimate.tokens < baseline.tokens);
     assert_eq!(
         estimate.basis,
         EstimateBasis::ReceiptAnchoredReasoningForecast
     );
-    // Unmeasured previously omitted opaque additions have no current anchor.
-    assert!(
+    // Reintroduced opaque members may be estimated, never promoted to native proof.
+    assert_eq!(
         measured
             .projected_estimate(&source, &target, "route", None)
-            .is_none()
+            .unwrap()
+            .capacity_tokens(),
+        None
     );
     assert!(
         measured
@@ -71,15 +82,14 @@ fn partially_retained_measured_block_recalibrates_after_filtered_receipt() {
     let first = measured
         .projected_estimate(&target, &source, "route", None)
         .unwrap();
-    assert!(first.tokens > 7000 && first.tokens < 10000);
+    assert_eq!(first.tokens, neutral_tokens(&measured, &target, &source));
+    assert!(first.tokens > 1000 && first.tokens < 10000);
     measured.observe(&target, &json!({"input_tokens":6000}), "route", None, 101);
     let restored = measured
         .projected_estimate(&source, &target, "route", None)
         .unwrap();
-    assert!(
-        restored.tokens >= 15000,
-        "partial opaque additions must use the upper allowance: {restored:?}"
-    );
+    assert_eq!(restored.tokens, neutral_tokens(&measured, &source, &target));
+    assert_eq!(restored.capacity_tokens(), None);
     assert!(
         measured
             .restoration(&source, &target, "route", None)
@@ -90,7 +100,11 @@ fn partially_retained_measured_block_recalibrates_after_filtered_receipt() {
     let estimate = measured
         .projected_estimate(&initial, &target, "route", None)
         .expect("incomplete older block must not permanently stall subsequent calibrated removals");
-    assert!(estimate.tokens > 3000 && estimate.tokens < 6000);
+    assert_eq!(
+        estimate.tokens,
+        neutral_tokens(&measured, &initial, &target)
+    );
+    assert!(estimate.tokens > 0 && estimate.tokens < 6000);
 }
 
 #[test]
@@ -176,10 +190,12 @@ fn forecast_requires_current_compatible_evidence_and_consistent_budget() {
             .projected_estimate(&target, &source, "route", None)
             .is_some()
     ); // target's actual receipt wins
-    assert!(
+    assert_eq!(
         measured
             .projected_estimate(&source, &target, "route", None)
-            .is_none()
+            .unwrap()
+            .capacity_tokens(),
+        None
     );
     let (_, source, target) = fixture();
     for input in [json!(0), json!(1), json!(-1), json!(1.5), Value::Null] {
@@ -191,16 +207,10 @@ fn forecast_requires_current_compatible_evidence_and_consistent_budget() {
                 .is_none()
         );
     }
-    assert_eq!(
-        allocated_forecast(u64::MAX, u128::MAX, u128::MAX, false),
-        None
-    );
-    assert_eq!(allocated_forecast(100, 2, 1, true), None);
-    assert_eq!(allocated_forecast(100, 1, 0, false), None);
 }
 
 #[test]
-fn added_visible_replacement_is_charged_at_the_upper_forecast_allowance() {
+fn added_visible_replacement_uses_shared_local_section_quantity() {
     let (measured, source, mut target) = fixture();
     let removed = measured
         .projected_estimate(&target, &source, "route", None)
@@ -213,8 +223,8 @@ fn added_visible_replacement_is_charged_at_the_upper_forecast_allowance() {
         .unwrap();
     assert_eq!(
         replaced.tokens - removed.tokens,
-        local * 2,
-        "a replacement cannot be charged only a point estimate against lower removal credit"
+        local,
+        "the same local section units belong to planner and accounting"
     );
 }
 
@@ -291,11 +301,13 @@ fn reordered_restored_native_block_cannot_borrow_another_reasoning_forecast() {
     let mut reordered = expanded.clone();
     reordered["input"].as_array_mut().unwrap().swap(1, 2);
     assert!(measured.predict(&reordered, "route", None).is_none());
-    assert!(
-        measured
-            .projected_estimate(&reordered, &source, "route", None)
-            .is_none(),
-        "estimated removal cannot promote reordered native block identities into exact additions"
+    let estimated = measured
+        .projected_estimate(&reordered, &source, "route", None)
+        .unwrap();
+    assert_eq!(
+        estimated.capacity_tokens(),
+        None,
+        "reordered members cannot become exact native/capacity proof"
     );
 }
 
@@ -366,10 +378,12 @@ fn repeated_visible_members_cannot_turn_partial_blocks_into_whole_removals() {
         estimate.basis,
         EstimateBasis::ReceiptAnchoredReasoningForecast
     );
+    assert_eq!(estimate.tokens, neutral_tokens(&measured, &target, &source));
     assert!(
-        (6500..=12000).contains(&estimate.tokens),
-        "both native blocks are partial: removal credit must not exceed half of 9000+2000: {estimate:?}"
+        estimate.tokens > 1000 && estimate.tokens < 12000,
+        "retained visible occurrences keep their own quantities"
     );
+    assert_eq!(estimate.capacity_tokens(), None);
 }
 
 #[test]
@@ -382,10 +396,9 @@ fn repeated_visible_occurrences_are_not_reused_across_native_blocks() {
         estimate.basis,
         EstimateBasis::ReceiptAnchoredReasoningForecast
     );
-    assert!(
-        (5500..10000).contains(&estimate.tokens),
-        "only the second native block is wholly removed; first-block credit is at most 4500: {estimate:?}"
-    );
+    assert_eq!(estimate.tokens, neutral_tokens(&measured, &target, &source));
+    assert!(estimate.tokens > 1000 && estimate.tokens < 12000);
+    assert_eq!(estimate.capacity_tokens(), None);
     // The entire second block still has its exact native quantity, even
     // though its visible identity is shared with the retained first block.
     let mut whole = source.clone();
@@ -397,7 +410,7 @@ fn repeated_visible_occurrences_are_not_reused_across_native_blocks() {
 }
 
 #[test]
-fn repeated_visible_partial_additions_keep_the_upper_allowance() {
+fn repeated_visible_partial_additions_share_native_residual_attribution() {
     let (mut measured, target, mut source) = repeated_visible_fixture(false);
     let retained = source.clone();
     source["input"]
@@ -416,10 +429,12 @@ fn repeated_visible_partial_additions_keep_the_upper_allowance() {
         EstimateBasis::ReceiptAnchoredReasoningForecast
     );
     let added = estimate.tokens.checked_sub(removed.tokens).unwrap();
+    assert_eq!(estimate.tokens, neutral_tokens(&measured, &target, &source));
     assert!(
-        (21000..=22000).contains(&added),
-        "both old blocks are partial additions dominated by reasoning: upper charge must not collapse to a whole-block point count: {added}"
+        added > 0 && added < 11000,
+        "retained visible siblings cannot donate their local units to hidden reasoning"
     );
+    assert_eq!(estimate.capacity_tokens(), None);
 }
 
 #[test]
@@ -466,28 +481,24 @@ fn initial_pool_counts_repeated_visible_occurrences_without_reusing_removal_cred
     assert!(baseline.tokens > 10000);
     assert!(measured.predict(&source, "route", None).is_none());
 
-    // Independent occurrence oracle: every visible copy contributes weight,
-    // even though its value/tokenization is safely memoized by identity.
-    let weights = anchor["input"]
+    // Independent neutral residual oracle: local visible occurrences are
+    // counted once each; the remaining native budget is shared equally by
+    // the two opaque members, never weighted by ciphertext bytes.
+    let local = anchor["input"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|value| {
-            let chars = value["encrypted_content"]
-                .as_str()
-                .map_or(0, |s| s.chars().count());
-            (measured.visible_text_tokens(value) as u128) * 9_432_105_075
-                + (chars as u128) * 432_732_920
-        })
+        .map(|value| measured.visible_text_tokens(value))
         .collect::<Vec<_>>();
-    assert_eq!(weights[2], weights[3]);
-    let sum: u128 = weights.iter().sum();
+    assert_eq!(local[2], local[3]);
     let budget = 10000 - measured.visible_text_tokens(&crate::savings::prompt_overhead(&source));
+    let residual = budget - local.iter().sum::<u64>();
+    let reasoning_share = local[1] + residual / 2 + residual % 2;
     let available = anchor["input"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|value| (identity(value), value.clone()))
+        .map(|value| (identity(value), value))
         .collect();
     let (pool, pool_budget) = measured.unmeasured_pool(&available, &source).unwrap();
     assert_eq!(
@@ -512,13 +523,8 @@ fn initial_pool_counts_repeated_visible_occurrences_without_reusing_removal_cred
         let projected = measured
             .projected_estimate(&target, &source, "route", None)
             .expect("unmeasured visible occurrences cannot veto calibrated old reasoning removal");
-        let selected = weights[1] + (removed_copies as u128) * weights[2];
-        let credit = ((budget as u128) * selected / (2 * sum)) as u64;
+        let credit = reasoning_share + removed_copies as u64 * local[2];
         assert_eq!(projected.tokens, baseline.tokens - credit);
-        assert!(
-            credit <= budget / 2,
-            "retained occurrences cannot donate their budget"
-        );
         assert_eq!(
             projected.basis,
             EstimateBasis::ReceiptAnchoredReasoningForecast
@@ -592,9 +598,15 @@ fn filtered_older_block_recalibrates_repeated_visible_pool_without_reusing_old_b
     let forecast = measured
         .projected_estimate(&target, &filtered, "route", None)
         .unwrap();
-    assert!(
-        (3000..6000).contains(&forecast.tokens),
-        "an incomplete old 9000-token block cannot donate its budget: {forecast:?}"
+    assert_eq!(
+        forecast.tokens,
+        neutral_tokens(&measured, &target, &filtered)
+    );
+    assert!(forecast.tokens > 0 && forecast.tokens < 6000);
+    assert_eq!(
+        forecast.capacity_tokens(),
+        None,
+        "an incomplete older block is not measurement authority"
     );
 }
 

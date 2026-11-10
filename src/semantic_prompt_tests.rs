@@ -125,7 +125,7 @@ fn semantic_markers_preserve_summarized_growth(initialized: bool) {
     assert_eq!(before.summary_cost > 0.0, !initialized);
     assert!(before.reviewer_cost > 0.0);
     let mut differences = Vec::new();
-    let mut paid = before.observed_primary_cost;
+    let mut paid = before.observed_primary_cost.unwrap();
     for (step, ttl) in ["30m", "12h"].into_iter().enumerate() {
         t = serde_json::from_value(state(&t)).unwrap();
         mark_semantic_body(&mut request, ttl);
@@ -143,14 +143,17 @@ fn semantic_markers_preserve_summarized_growth(initialized: bool) {
         );
         let after = t.snapshot();
         paid += input as f64 * 4.0 / 1e6;
-        assert!((after.observed_primary_cost - paid).abs() < 1e-12);
+        assert!((after.observed_primary_cost.unwrap() - paid).abs() < 1e-12);
         assert_eq!(after.unavailable_primary_cost_calls, 0);
         assert_eq!(after.coverage.missing_usage, 0);
         assert_eq!(
             after.coverage.primary_responses,
             before.coverage.primary_responses + step as u64 + 1
         );
-        assert_eq!(after.observed_reviewer_cost, before.observed_reviewer_cost);
+        assert_eq!(
+            after.observed_reviewer_cost.unwrap(),
+            before.observed_reviewer_cost.unwrap()
+        );
         assert_eq!(after.reviewer_cost, before.reviewer_cost);
         let quantity = (
             t.history.retired,
@@ -226,10 +229,10 @@ fn semantic_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
         true,
     );
     let seed_snapshot = seed.snapshot();
-    assert!((seed_snapshot.observed_primary_cost - 0.004).abs() < 1e-12);
+    assert!((seed_snapshot.observed_primary_cost.unwrap() - 0.004).abs() < 1e-12);
     assert_eq!(
         seed_snapshot.carry_cost,
-        seed_snapshot.observed_primary_cost
+        seed_snapshot.observed_primary_cost.unwrap()
     );
     assert_eq!(seed_snapshot.traditional_cost, seed_snapshot.carry_cost);
     assert_eq!(state(&seed)["shared_primary_history"], json!(true));
@@ -271,15 +274,15 @@ fn semantic_cursor_preserves_recorded_lifetime_proof(proof: Option<bool>) {
         let actual = if step == 0 { 0.0082 } else { 0.0126 };
         // Every paid/quantity/count guard executes before the new semantic
         // failure, so a changed proof cannot conceal a broken fixture.
-        assert!((after.observed_primary_cost - actual).abs() < 1e-12);
-        assert_eq!(after.carry_cost, after.observed_primary_cost);
+        assert!((after.observed_primary_cost.unwrap() - actual).abs() < 1e-12);
+        assert_eq!(after.carry_cost, after.observed_primary_cost.unwrap());
         assert_eq!(after.coverage.primary_responses, 2 + step as u64);
         assert_eq!(after.matched_primary_responses, 2 + step as u64);
         assert_eq!(after.unavailable_primary_cost_calls, 0);
         assert_eq!(after.excluded_unpriced_calls, 0);
         assert_eq!(after.coverage.missing_usage, 0);
         assert_eq!(after.coverage.unmodeled_calls, 0);
-        assert_eq!(after.observed_reviewer_cost, 0.0);
+        assert_eq!(after.observed_reviewer_cost.unwrap(), 0.0);
         assert_eq!(after.reviewer_cost, 0.0);
         assert_eq!(after.initial_compactions, 0);
         assert_eq!(after.traditional_compactions, 0);

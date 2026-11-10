@@ -60,7 +60,7 @@ const sandbox = {
   fetch: async () => ({ok: true, json: async () => data}), setInterval() {},
 };
 vm.createContext(sandbox);
-const html = fs.readFileSync('src/proxy_dashboard.html', 'utf8');
+const html = fs.readFileSync(process.env.CARRY_DASHBOARD_HTML_FIXTURE || 'src/proxy_dashboard.html', 'utf8');
 // Only delivered IDs exist; absent selectors must not invent fixture nodes.
 for (const match of html.matchAll(/\bid="([^"]+)"/g)) {
   const node = element(); node.id = match[1]; elements.set(node.id, node);
@@ -322,6 +322,81 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await refresh();
   assert.equal(recency.getAttribute('datetime'),'1970-01-01T00:00:00.000Z','known epoch zero is not missing');
   sandbox.Date=RealDate;
+  const visibleText = root => {
+    if(root.hidden)return '';
+    if(root.tagName?.toLowerCase()==='details'&&!root.open)return root.children[0]?.textContent||'';
+    return [root.textContent,...root.children.map(visibleText)].join('\n');
+  };
+  recent.cost_estimate = {...recent.cost_estimate, accounting_basis:'receipt_anchored_v2',
+    matched_primary_responses:3,coverage:{primary_responses:5},
+    quantity_evidence:{version:1,estimated_priced_calls:3,unavailable_quantity_calls:2,
+      historical_policy_scope:'mixed_prospective_only_no_repricing',legacy_priced_calls:2,
+      comparison_scope:'matched_subset_not_whole_session'}};
+  data.cost_estimate={...data.cost_estimate,matched_primary_responses:3,
+    quantity_evidence:{...recent.cost_estimate.quantity_evidence,total_primary_responses:5}};
+  for(const root of elements.values())for(const n of walk(root))if(n.tagName?.toLowerCase()==='details')n.open=false;
+  vm.runInContext('expandedDiagnostics.clear()',sandbox);
+  await refresh();
+  for(const root of [byClass(recentRow,'session-savings'),elements.get('cards').children[1]]) {
+    assert.match(visibleText(root),/Matched subtotal · not whole session/,'scope must be next to the visible percentage, not in closed details');
+    assert.match(visibleText(root),/3 \/ 5 primary responses matched/);
+  }
+  assert.match(text(byClass(recentRow,'session-accounting')),/mixed_prospective_only_no_repricing/);
+  assert.match(text(byClass(recentRow,'session-accounting')),/2 legacy priced calls/);
+  assert.ok(text(recentRow).includes('3 calls use estimated quantities'));
+  assert.ok(text(recentRow).includes('2 calls lack quantity evidence'));
+  assert.ok(text(recentRow).includes('Matched subtotal · not whole session'));
+  assert.ok(text(recentRow).includes('No calibrated interval; same outputs and tool sequence assumed'));
+  assert.ok(!text(recentRow).includes('95%'), 'do not invent a statistical confidence interval');
+  recent.cost_estimate.quantity_evidence.comparison_scope='matched_completed_primary_window';
+  recent.cost_estimate.matched_primary_responses=5;
+  data.cost_estimate.quantity_evidence={...recent.cost_estimate.quantity_evidence,total_primary_responses:5};
+  data.cost_estimate.matched_primary_responses=5;
+  await refresh();
+  for(const root of [byClass(recentRow,'session-savings'),elements.get('cards').children[1]]) {
+    assert.match(visibleText(root),/Matched completed primary window/);
+    assert.match(visibleText(root),/5 \/ 5 primary responses matched/);
+    assert.ok(!visibleText(root).includes('Matched subtotal'));
+  }
+  // Whole-window producer facts deliberately disagree with strict diagnostics.
+  // The renderer must never derive a total from matched rows or local ratios.
+  recent.cost_estimate.whole_window={carry_cost:15,traditional_cost:24,savings:9,savings_percent:37.5,
+    primary_responses:6,inferred_primary_responses:5,assumption:'matched_cost_ratio'};
+  data.cost_estimate.whole_window={carry_cost:150,traditional_cost:240,savings:90,savings_percent:37.5,
+    primary_responses:60,inferred_primary_responses:50,assumption:'matched_cost_ratio'};
+  await refresh();
+  assert.equal(cards().get('Estimated savings'),'$90.000000 (37.5%)');
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/\$9\.000000 \(37\.5%\)/);
+  assert.match(visibleText(elements.get('cards').children[1]),/Whole accounting window/);
+  assert.match(visibleText(elements.get('cards').children[1]),/successful completions only/);
+  assert.match(visibleText(elements.get('cards').children[0]),/all paid attempts/);
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/5 inferred/);
+  // An explicitly scoped complete-window subtotal is not an all-history total.
+  data.cost_estimate.whole_window_scope='available_session_windows_only';
+  data.cost_estimate.whole_window_included_sessions=2;
+  data.cost_estimate.whole_window_unavailable_sessions=1;
+  await refresh();
+  assert.equal(cards().get('Estimated savings'),'$90.000000 (37.5%)');
+  assert.match(visibleText(elements.get('cards').children[1]),/2 histories included · 1 excluded/);
+  assert.match(elements.get('estimate-coverage').textContent,/2 complete histories · 1 excluded/);
+  assert.ok(!visibleText(elements.get('cards').children[1]).includes('Whole accounting window'));
+  // Preserve a real signed loss and disclose the free pre-window initialization.
+  recent.cost_estimate.whole_window={carry_cost:1.3372388,traditional_cost:0.04222,
+    savings:-1.2950188,savings_percent:-3067.311226906679,primary_responses:1,
+    inferred_primary_responses:0,trajectory:{initial_compactions:1}};
+  await refresh();
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/\(-3067\.3%\)/);
+  assert.match(visibleText(byClass(recentRow,'session-savings')),/Traditional starts after a free initial compaction/);
+  recent.rewrites={dispatched:0,forced:0,prior_unknown:true};
+  await refresh();
+  assert.match(visibleText(byClass(recentRow,'request-counts')),/0 recorded rewrites · earlier history unknown/);
+  recent.rewrites.prior_unknown=false;
+  await refresh();
+  assert.match(visibleText(byClass(recentRow,'request-counts')),/0 rewrites/);
+  assert.ok(!visibleText(byClass(recentRow,'request-counts')).includes('earlier history unknown'));
+  data.cost_estimate.whole_window=null;
+  await refresh();
+  assert.equal(cards().get('Estimated savings'),'—','unknown actual costs must not fall back to a narrower comparison');
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();
@@ -332,14 +407,37 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
       assert.equal(elements.get('usage').children[0].children[4].textContent,percent);
     }
     const amount=n=>n==null?'—':'$'+Number(n).toFixed(6);
-    assert.equal(cards().get('With Carry'),amount(data.cost_estimate.carry_cost));
-    assert.equal(cards().get('Traditional'),amount(data.cost_estimate.traditional_cost));
+    const head=Object.prototype.hasOwnProperty.call(data.cost_estimate,'whole_window')?data.cost_estimate.whole_window:data.cost_estimate;
+    assert.equal(cards().get('With Carry'),amount(head?.carry_cost));
+    assert.equal(cards().get('Traditional'),amount(head?.traditional_cost));
+    if(head) assert.equal(cards().get('Estimated savings'),amount(head.savings)+(head.savings_percent==null?'':` (${Number(head.savings_percent).toFixed(1)}%)`));
     const native=data.sessions.flatMap(s=>[s.primary,s.shadow]);
     const cost=native.some(l=>l.cost_usd!=null)?native.reduce((n,l)=>n+(l.cost_usd||0),0):null;
     const missing=native.some(l=>l.unavailable_cost_calls)||data.unavailable_sessions;
     assert.equal(cards().get(missing?'Priced subtotal':'Observed cost'),amount(cost));
     assert.equal(walk(elements.get('sessions')).filter(n=>n.className==='session').length+
       walk(elements.get('background-sessions')).filter(n=>n.className==='session').length,data.sessions.length);
+    const checkVisibleScope=(root,e,total)=>{
+      const shown=visibleText(root);
+      if(Object.prototype.hasOwnProperty.call(e,'whole_window')){
+        if(e.whole_window_scope==='available_session_windows_only'&&e.whole_window){
+          assert.ok(shown.includes('Complete session windows'));
+          assert.ok(shown.includes(`${e.whole_window_included_sessions.toLocaleString()} histories included`));
+          assert.ok(shown.includes(`${e.whole_window_unavailable_sessions.toLocaleString()} excluded`));
+        }else assert.ok(shown.includes(e.whole_window?'Whole accounting window':'Whole-window estimate unavailable'));
+        if(e.whole_window) assert.ok(shown.includes(`${e.whole_window.inferred_primary_responses.toLocaleString()} inferred`));
+        return;
+      }
+      const partial=e.quantity_evidence.comparison_scope==='matched_subset_not_whole_session';
+      assert.ok(shown.includes(partial?'Matched subtotal · not whole session':'Matched completed primary window'));
+      assert.ok(shown.includes(`${e.matched_primary_responses.toLocaleString()} / ${total.toLocaleString()} primary responses matched`));
+    };
+    checkVisibleScope(elements.get('cards').children[1],data.cost_estimate,data.cost_estimate.quantity_evidence.total_primary_responses);
+    for(const s of data.sessions){
+      const row=document.getElementById('history:'+s.id);
+      checkVisibleScope(byClass(row,'session-savings'),s.cost_estimate,s.cost_estimate.coverage.primary_responses);
+      assert.ok(!byClass(row,'session-details').open,'HTTP fixture disclosures remain closed');
+    }
     console.log('private frozen producer smoke: ok (contents not logged)');
   }
   console.log('proxy dashboard scenarios: ok');

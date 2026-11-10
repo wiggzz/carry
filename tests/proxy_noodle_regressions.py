@@ -4,6 +4,7 @@ import time
 import unittest
 from proxy_state_regressions import Proxy, advice_response, completed, wire
 import proxy_transparent_history as history_fixture
+import proxy_traditional_estimation as traditional_fixture
 from proxy_transparent_history import TransparentProxy
 
 
@@ -32,53 +33,127 @@ class NoodleRegressions(unittest.TestCase):
                 "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
         path.write_bytes(wire(index))
 
+    def snapshot(self, proxy, saved=None):
+        # Join immutable request facts to their real HTTP projection, never to a
+        # fixture-reimplemented estimator or a persisted prediction.
+        saved = proxy.saved() if saved is None else saved
+        status, stats = proxy.request("GET", "/carry/dashboard/stats")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(stats["sessions"]), 1)
+        result = stats["sessions"][0]["cost_estimate"]
+        self.assertAlmostEqual(result["observed_primary_cost"], saved["primary"]["cost_usd"], places=12)
+        if saved["shadow"]["calls"]:
+            self.assertAlmostEqual(result["observed_reviewer_cost"], saved["shadow"]["cost_usd"], places=12)
+        else:
+            self.assertIsNone(result["observed_reviewer_cost"])
+            self.assertEqual(saved["shadow"]["cost_usd"], 0)
+        return {**saved, "estimate": result}
+
+    def primary_observation(self, saved):
+        return next(o["Primary"] for o in reversed(saved["request_evidence"]["observations"])
+                    if "Primary" in o)
+
+    # Keep threshold behavior independent of fitting cap continuity. These are
+    # real registered HTTP seed/growth/restart controls, with declared native
+    # quantities and marginal-rate oracles, not the obsolete future-only poke.
+    test_paid_summary_threshold_after_restart = (
+        traditional_fixture.TraditionalEstimation.test_opaque_continuous_summary_progresses_after_http_restart)
+    test_free_initialization_once_after_restart = (
+        traditional_fixture.TraditionalEstimation.test_unknown_retained_output_keeps_known_free_initialization_once)
+
     def test_changed_cap_preserves_current_projection_and_summary_threshold_after_restart(self):
-        # Native fixture quantities stay coherent when the large source is omitted.
-        fixture = self.fixture(lambda b,n: (200, completed(response_id=f"cap_{n}",
-            input_tokens=6000 if "NOODLE_SOURCE" in json.dumps(b) else 100)),
-            lambda _b,_n: (200, advice_response({"protected":[], "removable":[2], "memories":[]})))
-        h = self.history()
-        options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
-        proxy = self.proxy(fixture, [*options,"--review-replayed-history"])
-        self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
-        proxy.close()
-        options += ["--review-every-requests","100"]
-        proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
-        _, before = proxy.checkpoint(h)
-        restored = before["cost_trajectory"]["restored"]
-        self.assertGreater(restored, 0)
-        self.assertNotIn(h[1], fixture.primaries[-1]["input"])
-        proxy.close()
-        # Place the alternative's summary boundary between native and restored
-        # input. A receipt-config change must invalidate old summary assumptions,
-        # not the already measured current canonical-minus-sent quantity.
-        path = self.state / "history.index"
-        index = json.loads(path.read_text())
-        for state in index["snapshots"].values():
-            state["cost_trajectory"]["scenario"] = {
-                "context_window": 200 + restored // 2, "reserve":100,
-                "keep_recent":100, "summary":50}
-        path.write_bytes(wire(index))
-        proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send(h, max_output_tokens=2)[0], 200)
-        _, after = proxy.checkpoint(h)
-        self.evidence.update(before=before, after=after, primary=fixture.primaries, reviews=fixture.reviews)
-        self.assertNotIn(h[1], fixture.primaries[-1]["input"])
-        self.assertEqual(after["primary"]["calls"], 3)
-        self.assertEqual(after["primary"]["input_tokens"], 6200)
-        self.assertEqual(after["shadow"]["calls"], 1)
-        self.assertEqual(after["cost_trajectory"]["restored"], restored,
-                         "receipt epoch reset must preserve this request's projection")
-        # Changed receipt settings genuinely lose trajectory recognition: the
-        # current projection still survives, but initialization is pre-window.
-        self.assertEqual(after["cost_trajectory"]["result"]["traditional_compactions"], 0)
-        self.assertEqual(after["cost_trajectory"]["result"]["summary_cost"], 0)
-        self.assertEqual(after["cost_trajectory"]["result"]["initial_compactions"], 1)
-        self.assertGreater(after["cost_trajectory"]["retired"], 0)
-        self.assertEqual(after["cost_trajectory"]["last_traditional_input"], 150)
-        self.assertGreater(after["cost_trajectory"]["result"]["observed_primary_cost"],
-                           before["cost_trajectory"]["result"]["observed_primary_cost"])
+        root = self.state
+        controls = {}
+        for label, cap in (("unchanged", 1), ("changed", 2)):
+            with self.subTest(cap=label):
+                self.state = root / label
+                self.state.mkdir()
+                fixture = self.fixture(lambda b,n: (200, completed(response_id=f"cap_{n}",
+                    input_tokens=6000 if "NOODLE_SOURCE" in json.dumps(b) else 100)),
+                    lambda _b,_n: (200, advice_response({"protected":[], "removable":[2], "memories":[]})))
+                h = self.history()
+                options = ["--payoff-requests","1","--classifier-cache-policy","disabled"]
+                proxy = self.proxy(fixture, [*options,"--review-replayed-history"])
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+                proxy.close()
+                options += ["--review-every-requests","100"]
+                proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
+                before = self.snapshot(proxy, proxy.checkpoint(h)[1])
+                prior = self.primary_observation(before)
+                restored = prior["restoration"]["tokens"]
+                self.assertGreater(restored, 0)
+                self.assertNotIn(h[1], fixture.primaries[-1]["input"])
+                proxy.close()
+                # This seam replays the ENTIRE immutable request history. Its
+                # first 6000-token input exceeds the declared boundary, so one
+                # pre-window initialization is due in BOTH arms before the cap
+                # decision. A fitting allowance is not a new HistoryContract.
+                path = self.state / "history.index"
+                index = json.loads(path.read_text())
+                for state in index["snapshots"].values():
+                    state["request_evidence"]["scenario"] = {
+                        "context_window": 200 + restored // 2, "reserve":100,
+                        "keep_recent":100, "summary":50}
+                path.write_bytes(wire(index))
+                proxy = self.proxy(fixture, options)
+                baseline = self.snapshot(proxy, proxy.checkpoint(h)[1])
+                self.assertEqual(baseline["request_evidence"]["observations"],
+                                 before["request_evidence"]["observations"])
+                self.assertEqual(baseline["primary"], before["primary"])
+                self.assertEqual(baseline["shadow"], before["shadow"])
+                self.assertEqual(baseline["estimate"]["initial_compactions"], 1)
+                self.assertEqual(baseline["estimate"]["matched_primary_responses"], 2)
+                self.assertEqual(proxy.send(h, max_output_tokens=cap)[0], 200)
+                after = self.snapshot(proxy, proxy.checkpoint(h)[1])
+                self.evidence[label] = {"before":before, "baseline":baseline, "after":after,
+                                        "primaries":fixture.primaries, "reviews":fixture.reviews}
+                self.assertNotIn(h[1], fixture.primaries[-1]["input"])
+                self.assertEqual(len(fixture.primaries), 3)
+                self.assertEqual(len(fixture.reviews), 1)
+                self.assertEqual(after["primary"]["calls"], 3)
+                self.assertEqual(after["primary"]["input_tokens"], 6200)
+                self.assertEqual(after["primary"]["output_tokens"], 3)
+                self.assertEqual(after["shadow"], before["shadow"])
+                current = self.primary_observation(after)
+                self.assertEqual(current["restoration"], prior["restoration"])
+                self.assertEqual(current["facts"]["contract"], prior["facts"]["contract"])
+                self.assertEqual(prior["facts"]["allowance"], 1)
+                self.assertEqual(current["facts"]["allowance"], cap)
+                self.assertEqual(current["facts"]["configuration"] == prior["facts"]["configuration"], cap == 1)
+                original = baseline["request_evidence"]["observations"]
+                observations = after["request_evidence"]["observations"]
+                self.assertEqual(observations[:len(original)], original)
+                appended = observations[len(original):]
+                self.assertEqual(len(appended), 2, 'one dispatch followed by one successful terminal')
+                self.assertEqual(set(appended[0]), {'Dispatch'})
+                dispatch = appended[0]['Dispatch']
+                self.assertTrue(dispatch['request_id'])
+                self.assertEqual(dispatch['selection'], dispatch['continuation'])
+                self.assertEqual(dispatch['omitted_members'], 1)
+                self.assertEqual(dispatch['newly_omitted_members'], 0,
+                                 'repeating the authorized projection is not a new omission')
+                self.assertIs(dispatch['forced'], False)
+                self.assertEqual(dispatch['input_reduction_estimate'], 0)
+                self.assertEqual(appended[1], {'Primary': current})
+                result, staged = after["estimate"], baseline["estimate"]
+                self.assertEqual(result["matched_primary_responses"], 3)
+                self.assertEqual(result["coverage"]["unmodeled_calls"], 0)
+                self.assertEqual(result["excluded_unpriced_calls"], 0)
+                self.assertEqual(result["initial_compactions"], 1, "no duplicate free initialization")
+                self.assertEqual(result["traditional_compactions"], 0)
+                self.assertEqual(result["summary_cost"], 0)
+                rates = after["model_resolution"]["primary"]["rates"]
+                self.assertAlmostEqual(result["observed_primary_cost"] - staged["observed_primary_cost"],
+                                       (100 * rates["input"] + rates["output"]) / 1e6, places=12)
+                controls[label] = {key: result[key] - staged[key] for key in
+                                   ("traditional_cost", "observed_primary_cost", "initial_compactions",
+                                    "traditional_compactions", "summary_cost", "matched_primary_responses")}
+                self.assertEqual(controls[label]["matched_primary_responses"], 1)
+                proxy.close()
+        self.assertEqual(controls["changed"], controls["unchanged"],
+                         "fitting output allowance must preserve the same continuous history")
+        self.state = root
 
     def test_off_tracking_fallback_has_zero_projection_after_repeat_and_restart(self):
         root = self.state
@@ -101,35 +176,51 @@ class NoodleRegressions(unittest.TestCase):
                 for _ in range(2):
                     self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
                     self.assertEqual(fixture.primaries[-1]["input"], h)
-                    snapshots.append(proxy.saved())
+                    snapshots.append(self.snapshot(proxy))
                 proxy.close()
                 proxy = start()
                 self.assertEqual(proxy.send(h, max_output_tokens=1)[0], 200)
                 self.assertEqual(fixture.primaries[-1]["input"], h)
-                snapshots.append(proxy.saved())
+                snapshots.append(self.snapshot(proxy))
                 proxy.close()
                 self.evidence[label] = {"snapshots":snapshots, "primaries":fixture.primaries,
                                         "reviews":fixture.reviews}
                 self.assertFalse(fixture.reviews)
                 for n, saved in enumerate(snapshots, 1):
-                    trajectory = saved["cost_trajectory"]
+                    result = saved["estimate"]
                     self.assertEqual(len(saved["history"]), count if label == "tracked" else 0)
                     self.assertEqual(saved["primary"]["calls"], n)
                     self.assertEqual(saved["primary"]["input_tokens"], 200000*n)
                     self.assertEqual(saved["primary"]["output_tokens"], n)
                     self.assertEqual(saved["shadow"]["calls"], 0)
-                    self.assertEqual(trajectory["priced_primary_responses"], n)
-                    self.assertEqual(trajectory["result"]["coverage"]["unmodeled_calls"], 0)
-                    self.assertEqual(trajectory["result"]["excluded_unpriced_calls"], 0)
-                    self.assertAlmostEqual(trajectory["result"]["observed_primary_cost"],
+                    self.assertEqual(result["matched_primary_responses"], n)
+                    self.assertEqual(result["coverage"]["unmodeled_calls"], 0)
+                    self.assertEqual(result["excluded_unpriced_calls"], 0)
+                    self.assertAlmostEqual(result["observed_primary_cost"],
                                            saved["primary"]["cost_usd"], places=12)
                 # Grade after collecting every request so RED retains repeat,
                 # restart, complete forwarded input and paid receipt evidence.
                 for label_request, saved in zip(("first", "repeat", "restart"), snapshots):
                     with self.subTest(case=label, request=label_request):
-                        self.assertEqual(saved["cost_trajectory"]["restored"], 0,
+                        current = self.primary_observation(saved)
+                        self.assertEqual(current["restoration"]["tokens"], 0,
                                          "pass-through does not edit input when tracking fails")
-                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"], 200000)
+                        self.assertEqual(current["facts"]["native"]["input_tokens"], 200000)
+                        # The unresolved off route keeps identical tracked
+                        # execution on its native paid contribution. Tracker
+                        # failure lacks ancestry: one ideal inherited prefix,
+                        # then independent cold writes. Declare the fixture's
+                        # gpt-6-luna API-equivalent rates, not observed prices.
+                        n = ("first", "repeat", "restart").index(label_request) + 1
+                        self.assertIsNone(current["facts"]["resolved"])
+                        self.assertAlmostEqual(saved["primary"]["cost_usd"],
+                                               n * (200000 * 0.1 + 0.5) / 1e6, places=12)
+                        expected = (n * (200000 * 0.1 + 0.5) if label == "tracked" else
+                                    200000 * (0.01 + (n-1) * 0.125) + n * 0.5) / 1e6
+                        self.assertAlmostEqual(saved["estimate"]["traditional_cost"], expected, places=12)
+                        if n > 1:
+                            old = snapshots[n-2]["request_evidence"]["observations"]
+                            self.assertEqual(saved["request_evidence"]["observations"][:len(old)], old)
         self.state = root
 
     def test_compact_to_passthrough_measures_current_projection_on_repeat_and_restart(self):
@@ -154,8 +245,8 @@ class NoodleRegressions(unittest.TestCase):
                 options += ["--review-every-requests","100"]
                 proxy = start("compact")
                 self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
-                compact = proxy.saved()
-                self.assertGreater(compact["cost_trajectory"]["restored"],0)
+                compact = self.snapshot(proxy)
+                self.assertGreater(self.primary_observation(compact)["restoration"]["tokens"],0)
                 self.assertNotIn(h[1],fixture.primaries[-1]["input"])
                 proxy.close()
                 # Execute every repeat/restart before grading restoration, so
@@ -164,19 +255,19 @@ class NoodleRegressions(unittest.TestCase):
                 snapshots = []
                 for _ in range(2):
                     self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
-                    snapshots.append(proxy.saved())
+                    snapshots.append(self.snapshot(proxy))
                     self.assertEqual(fixture.primaries[-1]["input"],h)
                 proxy.close()
                 proxy = start(mode)
                 self.assertEqual(proxy.send(h, max_output_tokens=1)[0],200)
-                snapshots.append(proxy.saved())
+                snapshots.append(self.snapshot(proxy))
                 self.assertEqual(fixture.primaries[-1]["input"],h)
                 proxy.close()
                 # Returning to compact must measure a real current omission;
                 # globally clearing restoration would fail this positive arm.
                 proxy = start("compact")
                 self.assertEqual(proxy.send(h, max_output_tokens=2)[0],200)
-                resumed = proxy.saved()
+                resumed = self.snapshot(proxy)
                 self.assertNotIn(h[1],fixture.primaries[-1]["input"])
                 self.evidence[mode] = {"compact":compact,"passthrough":snapshots,"resumed":resumed,
                                        "primaries":fixture.primaries,"reviews":fixture.reviews}
@@ -186,9 +277,12 @@ class NoodleRegressions(unittest.TestCase):
                     self.assertEqual(saved["primary"]["input_tokens"],6000*(n-1)+100)
                     self.assertEqual(saved["primary"]["output_tokens"],n)
                     self.assertEqual(saved["shadow"],compact["shadow"])
-                    result = saved["cost_trajectory"]["result"]
+                    result = saved["estimate"]
+                    self.assertEqual(result["matched_primary_responses"], n)
+                    self.assertEqual(result["coverage"]["unmodeled_calls"], 0)
+                    self.assertEqual(result["excluded_unpriced_calls"], 0)
                     self.assertAlmostEqual(result["observed_primary_cost"],
-                        compact["cost_trajectory"]["result"]["observed_primary_cost"] + (n-2) *
+                        compact["estimate"]["observed_primary_cost"] + (n-2) *
                         (6000 * saved["model_resolution"]["primary"]["rates"]["input"] +
                          saved["model_resolution"]["primary"]["rates"]["output"]) / 1_000_000,places=12)
                     self.assertEqual(result["traditional_compactions"],0)
@@ -196,10 +290,34 @@ class NoodleRegressions(unittest.TestCase):
                 # and paid evidence even on the intentionally failing baseline.
                 for label, saved in zip(("first","repeat","restart"),snapshots):
                     with self.subTest(mode=mode,request=label):
-                        self.assertEqual(saved["cost_trajectory"]["restored"],0,
+                        current = self.primary_observation(saved)
+                        self.assertEqual(current["restoration"]["tokens"],0,
                                          "full current wire must replace prior compact restoration")
-                        self.assertEqual(saved["cost_trajectory"]["last_traditional_input"],6000)
-                self.assertEqual(resumed["cost_trajectory"]["restored"],compact["cost_trajectory"]["restored"])
+                        self.assertEqual(current["facts"]["native"]["input_tokens"],6000)
+                        self.assertFalse(current["edited"])
+                # The initial full 6000-token wire was already modeled warm.
+                # Audit retains that scope; off changes it and must write cold.
+                # Subsequent identical full wires reuse all 6000 in both modes.
+                rates = compact["model_resolution"]["primary"]["rates"]
+                restored = self.primary_observation(compact)["restoration"]["tokens"]
+                canonical = 100 + restored
+                self.assertLess(canonical, 6000)
+                compact_facts = self.primary_observation(compact)["facts"]
+                full_facts = self.primary_observation(snapshots[0])["facts"]
+                self.assertEqual(compact_facts["cache_scope"] == full_facts["cache_scope"], mode == "audit")
+                expected = (6000 * rates["write" if mode == "off" else "cached"] + rates["output"]) / 1e6
+                self.assertAlmostEqual(snapshots[0]["estimate"]["traditional_cost"] -
+                                       compact["estimate"]["traditional_cost"], expected, places=12)
+                for previous, current in zip(snapshots, snapshots[1:]):
+                    self.assertAlmostEqual(current["estimate"]["traditional_cost"] -
+                                           previous["estimate"]["traditional_cost"],
+                                           (6000*rates["cached"] + rates["output"]) / 1e6, places=12)
+                for previous, current in zip([compact, *snapshots], [*snapshots, resumed]):
+                    old = previous["request_evidence"]["observations"]
+                    self.assertEqual(current["request_evidence"]["observations"][:len(old)], old)
+                self.assertEqual(self.primary_observation(resumed)["restoration"],
+                                 self.primary_observation(compact)["restoration"])
+                self.assertEqual(resumed["estimate"]["matched_primary_responses"],6)
                 self.assertEqual(resumed["primary"]["calls"],6)
                 self.assertEqual(resumed["primary"]["input_tokens"],24200)
                 self.assertEqual(resumed["shadow"],compact["shadow"])

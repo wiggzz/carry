@@ -26,7 +26,7 @@ fn no_op_receipt_parity_uses_observation_not_implicit_forecast() {
         assert_eq!(result.traditional_compactions, 0);
         assert_eq!(result.matched_primary_responses, index as u64 + 1);
         assert_eq!(result.excluded_unpriced_calls, 0);
-        assert!((result.observed_primary_cost - expected).abs() < 1e-12);
+        assert!((result.observed_primary_cost.unwrap() - expected).abs() < 1e-12);
         assert!((result.carry_cost - expected).abs() < 1e-12);
         assert!(
             (result.traditional_cost - expected).abs() < 1e-12,
@@ -54,8 +54,8 @@ fn cache_write188_reviewer_overhead_remains_a_loss_on_identical_no_write_input()
     assert_eq!(estimate.traditional_compactions, 0);
     let primary = 43_298.0 * 2.0 / 1e6 + 100.0 * 10.0 / 1e6;
     let reviewer = 1000.0 * 2.0 / 1e6 + 100.0 * 10.0 / 1e6;
-    assert!((estimate.observed_primary_cost - primary).abs() < 1e-12);
-    assert!((estimate.observed_reviewer_cost - reviewer).abs() < 1e-12);
+    assert!((estimate.observed_primary_cost.unwrap() - primary).abs() < 1e-12);
+    assert!((estimate.observed_reviewer_cost.unwrap() - reviewer).abs() < 1e-12);
     assert!((estimate.reviewer_cost - reviewer).abs() < 1e-12);
     assert!((estimate.carry_cost - primary - reviewer).abs() < 1e-12);
     assert!(
@@ -95,7 +95,7 @@ fn cache_write188_paid_implicit_receipts_and_append_reads_survive_restart() {
         assert_eq!(snapshot.traditional_compactions, 0);
         assert_eq!(snapshot.summary_cost, 0.0);
         assert_eq!(snapshot.reviewer_cost, 0.0);
-        assert!((snapshot.observed_primary_cost - expected).abs() < 1e-12);
+        assert!((snapshot.observed_primary_cost.unwrap() - expected).abs() < 1e-12);
         assert!((snapshot.carry_cost - expected).abs() < 1e-12);
         assert!((snapshot.traditional_cost - expected).abs() < 1e-12);
         assert!(snapshot.savings.abs() < 1e-12);
@@ -229,13 +229,13 @@ fn cache_policy188_present_version_boundaries_preserve_primary_and_reviewer_mone
         assert!(snapshot.priced);
         assert_eq!(snapshot.matched_primary_responses, index as u64 + 1);
         assert_eq!(snapshot.coverage.reviewer_responses, 1);
-        assert!((snapshot.observed_reviewer_cost - 0.003).abs() < 1e-12);
+        assert!((snapshot.observed_reviewer_cost.unwrap() - 0.003).abs() < 1e-12);
         let actual = 0.004
             + index as f64 * 0.0002
             + (0..index)
                 .map(|n| (2000 + n * 100) as f64 * 0.1 / 1e6)
                 .sum::<f64>();
-        assert!((snapshot.observed_primary_cost - actual).abs() < 1e-12);
+        assert!((snapshot.observed_primary_cost.unwrap() - actual).abs() < 1e-12);
         assert!((snapshot.carry_cost - actual - 0.003).abs() < 1e-12);
         snapshots.push(serde_json::to_value(snapshot).unwrap());
         // Exercise the production checkpoint codec between every observation.
@@ -308,7 +308,7 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
         Some(&old),
     );
     let before = t.snapshot();
-    assert!((before.observed_primary_cost - 0.004).abs() < 1e-12);
+    assert!((before.observed_primary_cost.unwrap() - 0.004).abs() < 1e-12);
     assert!((before.traditional_cost - 0.0002).abs() < 1e-12);
     let upgraded = old.clone().with_scenario_cache_policy();
     assert_eq!(upgraded.scenario_cache_policy.as_ref().unwrap().version, 2);
@@ -346,7 +346,10 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
         let prospective = if index == 0 { 0.0042 } else { 0.0086 };
         assert!((after.traditional_cost - before.traditional_cost - prospective).abs() < 1e-12);
         assert!(
-            (after.observed_primary_cost - before.observed_primary_cost - prospective).abs()
+            (after.observed_primary_cost.unwrap()
+                - before.observed_primary_cost.unwrap()
+                - prospective)
+                .abs()
                 < 1e-12
         );
         assert_eq!(after.cache_policy_boundaries.len(), 1);
@@ -434,7 +437,7 @@ fn cache_write191_divergent_history_uses_frozen_branch_tiers_and_independent_cac
             assert!(estimate.priced);
             assert_eq!(estimate.matched_primary_responses, index + 1);
             assert_eq!(estimate.traditional_compactions, 0);
-            assert!((estimate.observed_primary_cost - actual).abs() < 1e-12);
+            assert!((estimate.observed_primary_cost.unwrap() - actual).abs() < 1e-12);
             assert!((estimate.carry_cost - actual).abs() < 1e-12);
             assert!(
                 (estimate.traditional_cost - traditional).abs() < 1e-12,
@@ -541,12 +544,12 @@ fn cache_write191_unsupported_lifetime_preserves_known_money_in_both_receipt_lan
             let snapshot = t.snapshot();
             let (known, unavailable) = if reviewer {
                 (
-                    snapshot.observed_reviewer_cost,
+                    snapshot.observed_reviewer_cost.unwrap(),
                     snapshot.unavailable_reviewer_cost_calls,
                 )
             } else {
                 (
-                    snapshot.observed_primary_cost,
+                    snapshot.observed_primary_cost.unwrap(),
                     snapshot.unavailable_primary_cost_calls,
                 )
             };
@@ -593,12 +596,12 @@ fn cache_write191_breakpoint_lifetimes_preserve_known_money_and_zero_write_cost(
             let snapshot = t.snapshot();
             let (known, unavailable) = if reviewer {
                 (
-                    snapshot.observed_reviewer_cost,
+                    snapshot.observed_reviewer_cost.unwrap(),
                     snapshot.unavailable_reviewer_cost_calls,
                 )
             } else {
                 (
-                    snapshot.observed_primary_cost,
+                    snapshot.observed_primary_cost.unwrap(),
                     snapshot.unavailable_primary_cost_calls,
                 )
             };
@@ -682,12 +685,12 @@ fn cache_write191_typed_tool_output_lifetimes_preserve_both_roles_and_restart() 
             let snapshot = t.snapshot();
             let (known, unavailable) = if reviewer {
                 (
-                    snapshot.observed_reviewer_cost,
+                    snapshot.observed_reviewer_cost.unwrap(),
                     snapshot.unavailable_reviewer_cost_calls,
                 )
             } else {
                 (
-                    snapshot.observed_primary_cost,
+                    snapshot.observed_primary_cost.unwrap(),
                     snapshot.unavailable_primary_cost_calls,
                 )
             };
@@ -756,7 +759,7 @@ fn cache_write188_unknown_mode_ttl_or_explicit_extent_keeps_actual_money() {
         t.projected(0, 0, true);
         t.primary(&request, &terminal(2000, 0, 0, 0), "fixture", 100, true);
         let snapshot = t.snapshot();
-        assert!((snapshot.observed_primary_cost - 0.004).abs() < 1e-12);
+        assert!((snapshot.observed_primary_cost.unwrap() - 0.004).abs() < 1e-12);
         assert_eq!(snapshot.unavailable_primary_cost_calls, 0);
         assert_eq!(snapshot.coverage.unknown_cache_requests, 1);
         assert_eq!(snapshot.excluded_unpriced_calls, 1);
