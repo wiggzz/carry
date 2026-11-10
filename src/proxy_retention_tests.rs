@@ -468,6 +468,224 @@ fn retention_predecessor_import_preserves_money_bindings_and_rejects_capacity_at
 }
 
 #[tokio::test]
+async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store_pressure() {
+    let (sent, mut captures) = mpsc::unbounded_channel();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider_calls = calls.clone();
+    let router = Router::new().route("/responses", post(move |body: Bytes| {
+        let sent = sent.clone();
+        let calls = provider_calls.clone();
+        async move {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // A genuine complete receipt, but an output node above the unchanged
+            // per-record bound. Normal semantic publication must fail; only the
+            // bounded numeric settlement may use the admitted owner's promise.
+            let response = json!({"id":format!("paid-fallback-{n}"),"status":"completed",
+                "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"o".repeat(70000)}]}],
+                "usage":{"input_tokens":10000,"output_tokens":7,"input_tokens_details":{"cached_tokens":9000}}});
+            let (release, wait) = tokio::sync::oneshot::channel();
+            sent.send((body, release, response.clone())).unwrap();
+            wait.await.unwrap();
+            axum::Json(response)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/responses", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.mode = Mode::Off;
+    service.config.upstream_url = url;
+    service.config.history_max_bytes = 65536;
+    service.config.history_max_nodes = 512;
+    service.config.history_disk_bytes = 24 * 1024 * 1024;
+    let service = Arc::new(service);
+    let pressure_pin = history::pin(&service, "primary-pressure").unwrap();
+    let mut owners = Vec::new();
+    let mut releases = Vec::new();
+    let mut requests = Vec::new();
+    for label in ["primary-a", "primary-b"] {
+        let input = (0..128)
+            .map(|n| {
+                json!({
+                    "role":if n % 2 == 0 {"user"} else {"assistant"},
+                    "content":format!("{label} retained source {n}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = json!({"model":"gpt-6-luna","input":input,"stream":false});
+        let namespace = history::namespace(&service, &HeaderMap::new(), &body).unwrap();
+        let (id, pin) = history::resolve(&service, &namespace, &body).unwrap();
+        let mut seed = Session {
+            history_shared: true,
+            history_namespace: Some(namespace.clone()),
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        seed.ingest(&input).unwrap();
+        save(&service, &id, &seed).unwrap();
+        drop(pin);
+        let wire = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let request_service = service.clone();
+        let request_wire = wire.clone();
+        requests.push(tokio::spawn(async move {
+            let response = forward_request(
+                request_service,
+                HeaderMap::new(),
+                request_wire,
+                false,
+                label.into(),
+            )
+            .await?;
+            let status = response.status();
+            let delivered = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+            Ok::<_, Failure>((
+                status,
+                delivered
+                    .map(|bytes| bytes.len())
+                    .map_err(|error| error.to_string()),
+            ))
+        }));
+        let (captured, release, response) =
+            tokio::time::timeout(Duration::from_secs(10), captures.recv())
+                .await
+                .expect("real primary must pass admission before capacity pressure")
+                .unwrap();
+        assert_eq!(
+            captured, wire,
+            "whole real primary wire, not a staged receipt"
+        );
+        let pending = history::restore(&service, &id).unwrap();
+        assert_eq!(pending.render_primary(), input);
+        assert!(pending.primary_pending);
+        assert_eq!(pending.primary.calls, 0);
+        assert_eq!(pending.shadow.calls, 0);
+        assert_eq!(pending.primary.cost_usd, 0.0);
+        owners.push((id, namespace, input, response, label));
+        releases.push(release);
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(captures.try_recv().is_err());
+    let mut accepted = 0;
+    let mut refused = false;
+    for n in 0..1024 {
+        let mut pressure = Session {
+            history_shared: true,
+            history_namespace: Some("primary-pressure".into()),
+            ..Session::default()
+        };
+        pressure
+            .ingest(&[json!({"role":"user","content":format!("{n} {}", "x".repeat(48000))})])
+            .unwrap();
+        match history::committed(&service, "primary-pressure", &pressure, None) {
+            Ok(()) => accepted += 1,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        accepted > 0 && refused,
+        "real unchanged-cap publication pressure"
+    );
+    for (id, _, input, _, _) in &owners {
+        let held = history::restore(&service, id).unwrap();
+        assert_eq!(held.render_primary(), *input);
+        assert!(held.primary_pending);
+        assert_eq!(held.primary.calls, 0);
+    }
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    let mut delivery = Vec::new();
+    for request in requests {
+        delivery.push(
+            tokio::time::timeout(Duration::from_secs(20), request)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(captures.try_recv().is_err());
+    let mut restarted = checkpoint_service(directory.path());
+    restarted.config = service.config.clone();
+    let mut outcomes = Vec::new();
+    for (id, namespace, input, response, label) in &owners {
+        let durable = history::restore(&restarted, id).unwrap();
+        assert_eq!(
+            durable.render_primary(),
+            *input,
+            "failed publication cannot replace old ancestry"
+        );
+        assert_eq!(
+            durable.shadow.calls, 0,
+            "off mode must not dispatch reviewers"
+        );
+        let mut resume = json!({"input":[],"previous_response_id":response["id"]});
+        assert!(
+            history::expand(&restarted, namespace, &mut resume).is_err(),
+            "failed publication must not leak response bindings"
+        );
+        let events = timing_journal(directory.path(), id, label);
+        let failures = events
+            .iter()
+            .filter(|event| event["event"] == "primary_checkpoint_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            1,
+            "qualify actual production fallback, not only direct settlement"
+        );
+        assert_eq!(failures[0]["data"]["candidate_committed"], false);
+        outcomes.push(
+            json!({"id":id,"primary":durable.primary,"pending":durable.primary_pending,
+            "completed":durable.completed_requests,"failed":durable.failed_primaries,
+            "fallback":failures[0]["data"]["accounting_committed"]}),
+        );
+    }
+    let accounting = history::accounting(&restarted, 0, "", 100).unwrap();
+    let bytes: u64 = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    provider.abort();
+    drop(pressure_pin);
+    assert!(bytes <= service.config.history_disk_bytes);
+    // Finish both owners' wire, ancestry and fallback controls before grading
+    // exact known money; an early money failure must not hide the sibling.
+    eprintln!(
+        "real-primary-fallback: delivery={delivery:?}, outcomes={outcomes:?}, accounting={accounting}"
+    );
+    for outcome in &outcomes {
+        assert_eq!(outcome["fallback"], true);
+        assert_eq!(outcome["pending"], false);
+        assert_eq!(outcome["primary"]["calls"], 1);
+        assert_eq!(outcome["primary"]["input_tokens"], 10000);
+        assert_eq!(outcome["primary"]["output_tokens"], 7);
+        assert_eq!(outcome["primary"]["cached_tokens"], 9000);
+        assert_eq!(outcome["primary"]["unavailable_cost_calls"], 0);
+        assert!((outcome["primary"]["cost_usd"].as_f64().unwrap() - 0.0001935).abs() < 1e-12);
+        assert_eq!(outcome["completed"], 1);
+        assert_eq!(outcome["failed"], 0);
+        let records = accounting["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| record["owner"] == outcome["id"])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records.len(),
+            1,
+            "one immutable paid observation per real owner"
+        );
+        assert_eq!(records[0]["primary"], outcome["primary"]);
+    }
+}
+
+#[tokio::test]
 async fn retention_concurrent_paid_reviews_keep_reserved_headroom_under_long_path_pressure() {
     let (url, mut captures, provider) = review_capture_provider().await;
     let directory = tempfile::tempdir().unwrap();
@@ -685,7 +903,10 @@ fn retention_unchanged_long_path_remains_writable_under_other_owner_pressure() {
         serde_json::to_value(history::restore(&service, "long-path-retained").unwrap()).unwrap(),
         serde_json::to_value(frozen).unwrap()
     );
-    assert_eq!(history::accounting(&service, 0, "", 100).unwrap(), accounting);
+    assert_eq!(
+        history::accounting(&service, 0, "", 100).unwrap(),
+        accounting
+    );
     let bytes: u64 = std::fs::read_dir(directory.path())
         .unwrap()
         .map(|entry| entry.unwrap().metadata().unwrap().len())
