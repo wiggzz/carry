@@ -1,3 +1,100 @@
+#[test]
+fn dashboard_observed_money_survives_raw_expiry_without_summing_cumulative_snapshots() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = 10_000_000;
+    let ids = [format!("{:064x}", 901), format!("{:064x}", 902)];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let poll = |service: Arc<Service>| {
+        runtime.block_on(async {
+            let response = dashboard_stats(
+                State(service),
+                ConnectInfo("127.0.0.1:1".parse().unwrap()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        })
+    };
+    let mut frozen = Value::Null;
+    at_decision_clock(&[start], || {
+        let service = Arc::new(checkpoint_service(directory.path()));
+        for (id, calls) in ids.iter().zip([2, 1]) {
+            let mut session = Session {
+                history_shared: true,
+                history_namespace: Some(format!("dashboard-accounting-{id}")),
+                request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+                ..Session::default()
+            };
+            session
+                .ingest(&[json!({"role":"user","content":"raw historical dashboard source"})])
+                .unwrap();
+            for n in 0..calls {
+                numeric_primary(&mut session, n);
+                save(&service, id, &session).unwrap();
+            }
+            let restored = history::restore(&service, id).unwrap();
+            assert_eq!(restored.primary.calls, calls);
+            assert!((restored.primary.cost_usd - 0.002 * calls as f64).abs() < 1e-12);
+        }
+        frozen = history::accounting(&service, 0, "", 100).unwrap()["records"].clone();
+        assert_eq!(frozen.as_array().unwrap().len(), 3);
+        let stats = poll(service);
+        assert_eq!(stats["sessions"].as_array().unwrap().len(), 2);
+        assert!(
+            (stats["cost_estimate"]["observed_primary_cost"]
+                .as_f64()
+                .unwrap()
+                - 0.006)
+                .abs()
+                < 1e-12,
+            "qualify dashboard native-money totals before raw expiry: {stats}"
+        );
+    });
+    at_decision_clock(&[start + 120 * 86400], || {
+        let service = checkpoint_service(directory.path());
+        let mut housekeeping = Session {
+            history_shared: true,
+            history_namespace: Some("dashboard-housekeeping".into()),
+            ..Session::default()
+        };
+        housekeeping
+            .ingest(&[json!({"role":"user","content":"unpaid maintenance"})])
+            .unwrap();
+        history::committed(&service, "housekeeping", &housekeeping, None).unwrap();
+        for id in &ids {
+            assert!(history::restore(&service, id).is_err());
+            assert!(!directory.path().join(format!("{id}.json")).exists());
+        }
+        assert_eq!(
+            history::accounting(&service, 0, "", 100).unwrap()["records"],
+            frozen,
+            "raw expiry must preserve every frozen numeric observation"
+        );
+        drop(service);
+        let restarted = Arc::new(checkpoint_service(directory.path()));
+        let stats = poll(restarted.clone());
+        assert!(stats["sessions"].as_array().unwrap().is_empty());
+        assert_eq!(
+            history::accounting(&restarted, 0, "", 100).unwrap()["records"],
+            frozen,
+            "a dashboard poll cannot rewrite or reprice historical evidence"
+        );
+        assert!(
+            stats["cost_estimate"]["observed_primary_cost"]
+                .as_f64()
+                .is_some_and(|money| (money - 0.006).abs() < 1e-12),
+            "visible retained native money must use each owner's latest observation, not disappear with raw sessions or sum cumulative snapshots: {stats}"
+        );
+    });
+}
+
 #[tokio::test]
 async fn dashboard_failure_only_describes_the_latest_failed_primary() {
     let directory = tempfile::tempdir().unwrap();
