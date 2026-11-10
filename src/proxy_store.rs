@@ -344,6 +344,13 @@ impl Store {
         let next = self.projected_bytes.get().saturating_add(charge);
         let reserved = self.reserved_bytes.get();
         if next.saturating_add(reserved) > self.disk_limit {
+            #[cfg(test)]
+            eprintln!(
+                "retention-capacity: bytes={bytes} projected={} next={next} reserved={reserved} limit={} physical={:?}",
+                self.projected_bytes.get(),
+                self.disk_limit,
+                disk_bytes(&self.directory, 0)
+            );
             return Err(full());
         }
         #[cfg(unix)]

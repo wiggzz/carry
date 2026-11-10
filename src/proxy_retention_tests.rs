@@ -632,6 +632,74 @@ async fn retention_concurrent_paid_reviews_keep_reserved_headroom_under_long_pat
 }
 
 #[test]
+fn retention_unchanged_long_path_remains_writable_under_other_owner_pressure() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.history_max_bytes = 65536;
+    service.config.history_max_nodes = 512;
+    service.config.history_disk_bytes = 8 * 1024 * 1024;
+    let mut retained = Session {
+        history_shared: true,
+        history_namespace: Some("long-path-retained".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    let input = (0..128)
+        .map(|n| json!({"role":"user","content":format!("{n} {}", "x".repeat(96))}))
+        .collect::<Vec<_>>();
+    retained.ingest(&input).unwrap();
+    numeric_primary(&mut retained, 0);
+    let retained_pin = history::pin(&service, "long-path-retained").unwrap();
+    history::committed(&service, "long-path-retained", &retained, None).unwrap();
+    let pressure_pin = history::pin(&service, "long-path-pressure").unwrap();
+    let mut accepted = 0;
+    let mut refused = false;
+    for n in 0..256 {
+        let mut pressure = Session {
+            history_shared: true,
+            history_namespace: Some("long-path-pressure".into()),
+            ..Session::default()
+        };
+        pressure
+            .ingest(&[json!({"role":"user","content":format!("{n} {}", "p".repeat(48000))})])
+            .unwrap();
+        match history::committed(&service, "long-path-pressure", &pressure, None) {
+            Ok(()) => accepted += 1,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(accepted > 0 && refused, "qualify real publication pressure");
+    let frozen = history::restore(&service, "long-path-retained").unwrap();
+    assert_eq!(frozen.render_primary(), input);
+    assert_eq!(frozen.primary.calls, 1);
+    assert!((frozen.primary.cost_usd - 0.002).abs() < 1e-12);
+    let accounting = history::accounting(&service, 0, "", 100).unwrap();
+    let publication = history::committed(&service, "long-path-retained", &retained, None);
+    // Complete the frozen money, source and independent-accounting controls
+    // before grading whether unchanged ancestry was charged again.
+    assert_eq!(
+        serde_json::to_value(history::restore(&service, "long-path-retained").unwrap()).unwrap(),
+        serde_json::to_value(frozen).unwrap()
+    );
+    assert_eq!(history::accounting(&service, 0, "", 100).unwrap(), accounting);
+    let bytes: u64 = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(bytes <= service.config.history_disk_bytes);
+    assert!(
+        publication.is_ok(),
+        "unchanged retained ancestry must not consume a path-sized write reservation: {publication:?}"
+    );
+    drop(pressure_pin);
+    drop(retained_pin);
+}
+
+#[test]
 fn retention_expired_full_store_recovers_admission_and_reclaims_disk_without_losing_pinned_ancestry()
  {
     let directory = tempfile::tempdir().unwrap();
