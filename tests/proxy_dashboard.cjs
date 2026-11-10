@@ -354,7 +354,6 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.cost_estimate={...data.cost_estimate,matched_primary_responses:3,
     quantity_evidence:{...recent.cost_estimate.quantity_evidence,total_primary_responses:5}};
   for(const root of elements.values())for(const n of walk(root))if(n.tagName?.toLowerCase()==='details')n.open=false;
-  vm.runInContext('expandedDiagnostics.clear()',sandbox);
   await refresh();
   for(const root of [byClass(recentRow,'session-savings'),elements.get('cards').children[1]]) {
     assert.match(visibleText(root),/Matched subtotal · not whole session/,'scope must be next to the visible percentage, not in closed details');
@@ -453,6 +452,12 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.ok(nextPage&&firstPage,'session keyset pages have visible navigation controls');
   assert.equal(nextPage.disabled,false);
   assert.equal(firstPage.disabled,true);
+  const firstDetail=document.getElementById('disclosure:session:'+recent.id);
+  firstDetail.open=true;
+  for(const handler of firstDetail.listeners.toggle||[])await handler();
+  await refresh();
+  assert.equal(document.getElementById('disclosure:session:'+recent.id),firstDetail);
+  assert.equal(firstDetail.open,true,'same-page polling retains the live disclosure node and state');
   const click=async button=>{for(const handler of button.listeners.click||[])await handler();};
   await click(nextPage);
   assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.get('after_id'),cursor);
@@ -467,6 +472,10 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   await click(firstPage);
   assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.has('after_id'),false);
   assert.equal(elements.get('sessions').children[0].id,'history:'+recent.id);
+  const revisitedDetail=document.getElementById('disclosure:session:'+recent.id);
+  assert.notEqual(revisitedDetail,firstDetail,'navigation releases off-page detail nodes');
+  assert.equal(revisitedDetail.open,false,
+    'off-page disclosure state must not accumulate in a population-sized cache');
   assert.equal(firstPage.disabled,true);
   sandbox.fetch=previousFetch;
   delete data.usage;

@@ -152,7 +152,6 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 let token=new URLSearchParams(location.hash.slice(1)).get('token')||'';
 if(location.hash)history.replaceState(null,'',location.pathname+location.search);
 let busy=false,pageAfter='',nextPageAfter=null;
-const expandedDiagnostics=new Set();
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?'—':Number(n).toLocaleString();
 const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x?.[key])||0),0);
@@ -241,8 +240,7 @@ function transcriptView(s){
  });return detail;
 }
 function disclosure(key,label,className){
- const detail=document.createElement('details');detail.id='disclosure:'+key;detail.className=className;detail.open=expandedDiagnostics.has(key);
- detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add(key);else expandedDiagnostics.delete(key)}});
+ const detail=document.createElement('details');detail.id='disclosure:'+key;detail.className=className;detail.open=false;
  const summary=document.createElement('summary');summary.textContent=label;detail.append(summary);return detail;
 }
 // Retain keyed rows and native disclosures instead of remounting the live tree.
