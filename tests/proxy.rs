@@ -66,6 +66,25 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn durable_retention_accounting_http() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_retention.py"
+        ))
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python must exercise the actual retention HTTP boundary");
+    assert!(
+        output.status.success(),
+        "retention HTTP fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn dashboard_dispatch_contract() {
     let output = Command::new("python3")
         .arg("-B")

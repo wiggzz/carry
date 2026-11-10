@@ -1,5 +1,127 @@
 // Retention promises cannot be overridden by the continuation working-set cap.
 #[test]
+fn retention_predecessor_import_preserves_money_bindings_and_rejects_capacity_atomically() {
+    at_decision_clock(&[5_000_000], || {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        let input =
+            vec![json!({"role":"user","content":"predecessor observed source ".repeat(8192)})];
+        let body = json!({"model":"gpt-6.1-sol","input":input});
+        let namespace = history::namespace(&service, &HeaderMap::new(), &body).unwrap();
+        let mut session = Session {
+            history_shared: true,
+            history_namespace: Some(namespace.clone()),
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        session.ingest(&input).unwrap();
+        numeric_primary(&mut session, 0);
+        save(&service, "predecessor-owner", &session).unwrap();
+        let response = json!({"id":"predecessor-response","output":[{"role":"assistant","content":"original output"}]});
+        let loaded = history::restore(&service, "predecessor-owner").unwrap();
+        history::committed(
+            &service,
+            "predecessor-owner",
+            &loaded,
+            Some((&input, &response)),
+        )
+        .unwrap();
+        let frozen =
+            serde_json::to_value(history::restore(&service, "predecessor-owner").unwrap()).unwrap();
+        let path = directory.path().join("history.index");
+        // Frozen v4 wire shape: shared compact snapshots, exact-prefix nodes,
+        // external-ID bindings and original reference timestamps, no new tables.
+        let predecessor = history::fixture::read_index(&path);
+        std::fs::write(&path, &predecessor).unwrap();
+        service.config.history_disk_bytes = 65536;
+        let rejected = history::namespace(&service, &HeaderMap::new(), &body).unwrap_err();
+        assert_eq!(
+            rejected.0,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "supported predecessor must reach atomic disk admission, not be discarded as unknown state"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), predecessor);
+        service.config.history_disk_bytes = 8 * 1024 * 1024;
+        for _ in 0..2 {
+            assert_eq!(
+                history::namespace(&service, &HeaderMap::new(), &body).unwrap(),
+                namespace
+            );
+            assert_eq!(
+                serde_json::to_value(history::restore(&service, "predecessor-owner").unwrap())
+                    .unwrap(),
+                frozen
+            );
+            let mut resume = json!({"input":[],"previous_response_id":"predecessor-response"});
+            history::expand(&service, &namespace, &mut resume).unwrap();
+            let mut expected = input.clone();
+            expected.extend(response["output"].as_array().unwrap().clone());
+            assert_eq!(resume["input"], json!(expected));
+        }
+    });
+}
+
+#[test]
+fn retention_disk_admission_bounds_wal_and_preserves_prior_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.history_disk_bytes = 1024 * 1024;
+    let mut protected = Session {
+        history_shared: true,
+        history_namespace: Some("admission-protected".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    protected
+        .ingest(&[json!({"role":"user","content":"paid protected source"})])
+        .unwrap();
+    numeric_primary(&mut protected, 0);
+    save(&service, "protected", &protected).unwrap();
+    let before = serde_json::to_value(history::restore(&service, "protected").unwrap()).unwrap();
+    let old_generation = history::ReadView::new(&service).unwrap();
+    let mut rejected = false;
+    for n in 0..100 {
+        let mut next = Session {
+            history_shared: true,
+            history_namespace: Some("disk-pressure".into()),
+            ..Session::default()
+        };
+        next.ingest(&[
+            json!({"role":"user","content":format!("{n} {}","numeric pressure ".repeat(256))}),
+        ])
+        .unwrap();
+        let result = history::committed(&service, "pressure", &next, None);
+        let bytes: u64 = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(
+            bytes <= service.config.history_disk_bytes,
+            "admission must include a retained reader's WAL/sidecars, not just database pages: {bytes}"
+        );
+        if let Err(error) = result {
+            assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+            rejected = true;
+            break;
+        }
+    }
+    assert!(
+        rejected,
+        "disk pressure must reject explicitly, not evict promised history"
+    );
+    assert_eq!(
+        serde_json::to_value(old_generation.restore("protected").unwrap()).unwrap(),
+        before
+    );
+    drop(old_generation);
+    drop(service);
+    let service = checkpoint_service(directory.path());
+    assert_eq!(
+        serde_json::to_value(history::restore(&service, "protected").unwrap()).unwrap(),
+        before
+    );
+}
+#[test]
 fn retention_numeric_accounting_is_independent_of_raw_history_expiry() {
     let directory = tempfile::tempdir().unwrap();
     let start = 10_000_000;
