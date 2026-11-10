@@ -227,6 +227,84 @@ fn retention_invalid_predecessor_record_types_preserve_original_authority() {
 }
 
 #[test]
+fn retention_predecessor_defaulted_maps_import_in_isolated_processes() {
+    let mut failures = Vec::new();
+    for mode in ["explicit", "no-transcripts", "no-snapshots", "neither"] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "proxy::tests::retention_predecessor_defaulted_maps_child",
+                "--nocapture",
+            ])
+            .env("CARRY_TEST_PREDECESSOR_DEFAULTS", mode)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut timed_out = false;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("predecessor-defaults: fixture ready"),
+            "{mode} fixture setup failed: {output:?}"
+        );
+        if timed_out || !output.status.success() {
+            failures.push(format!("{mode}: timed_out={timed_out}, {output:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "valid predecessor optional-map defaults must import without panic: {failures:?}"
+    );
+}
+
+#[test]
+fn retention_predecessor_defaulted_maps_child() {
+    let Ok(mode) = std::env::var("CARRY_TEST_PREDECESSOR_DEFAULTS") else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.index");
+    let mut index = json!({"format":"carry-prefix-history-v4", "nodes":{}, "tips":{}, "reviews":{}, "transcripts":{}, "snapshots":{}, "upstream_cache":[]});
+    if mode == "no-transcripts" || mode == "neither" {
+        index.as_object_mut().unwrap().remove("transcripts");
+    }
+    if mode == "no-snapshots" || mode == "neither" {
+        index.as_object_mut().unwrap().remove("snapshots");
+    }
+    std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let service = checkpoint_service(directory.path());
+    eprintln!("predecessor-defaults: fixture ready");
+    history::initialize(&service).unwrap();
+    history::initialize(&service).unwrap();
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("defaulted-predecessor".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"after migration"})])
+        .unwrap();
+    numeric_primary(&mut session, 0);
+    history::committed(&service, "defaulted-owner", &session, None).unwrap();
+    let restored = history::restore(&service, "defaulted-owner").unwrap();
+    assert_eq!(restored.render_primary(), session.render_primary());
+    assert_eq!(
+        serde_json::to_value(&restored.primary).unwrap(),
+        serde_json::to_value(&session.primary).unwrap()
+    );
+}
+
+#[test]
 fn retention_dangling_predecessor_frontier_preserves_original_authority() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("history.index");
