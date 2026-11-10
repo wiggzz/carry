@@ -160,7 +160,7 @@ fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     if index["format"] != "carry-prefix-history-v4" {
         return Err(invalid());
     }
-    validate_predecessor(&index).map_err(|_| invalid())?;
+    let index = validate_predecessor(&index).map_err(|_| invalid())?;
     let temporary = service.config.state_dir.join(".history-import.tmp");
     if std::fs::symlink_metadata(&temporary).is_ok_and(|m| !m.is_file()) {
         return Err(invalid());
@@ -243,14 +243,14 @@ fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
 // The bounded predecessor generation is validated as a graph before any staging
 // database is created. A successful rename must never replace readable JSON by
 // rows that the new reader cannot decode or whose ancestry is incomplete.
-fn validate_predecessor(value: &Value) -> Result<(), ()> {
-    #[derive(serde::Deserialize)]
+fn validate_predecessor(value: &Value) -> Result<Value, ()> {
+    #[derive(serde::Deserialize, serde::Serialize)]
     #[serde(deny_unknown_fields)]
     struct Node {
         parent: String,
         value: Value,
     }
-    #[derive(serde::Deserialize)]
+    #[derive(serde::Deserialize, serde::Serialize)]
     #[serde(deny_unknown_fields)]
     struct Predecessor {
         #[serde(rename = "format")]
@@ -352,7 +352,10 @@ fn validate_predecessor(value: &Value) -> Result<(), ()> {
             return Err(());
         }
     }
-    Ok(())
+    // Import exactly the validated typed representation, including its serde
+    // defaults. Reading the original Value after accepting omitted maps gives
+    // validation and publication different schemas and can panic mid-import.
+    serde_json::to_value(index).map_err(|_| ())
 }
 
 impl Store {
