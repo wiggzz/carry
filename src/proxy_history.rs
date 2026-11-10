@@ -131,7 +131,14 @@ fn read_failure(error: std::io::Error) -> Failure {
         std::io::ErrorKind::InvalidData => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    failure(status, "history authority unavailable")
+    failure(
+        status,
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            "unsupported or invalid history index format"
+        } else {
+            "history authority unavailable"
+        },
+    )
 }
 pub(super) fn namespace(
     service: &Service,
