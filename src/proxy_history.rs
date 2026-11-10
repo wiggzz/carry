@@ -1,22 +1,18 @@
-//! Server-owned exact-prefix index. Immutable nodes share canonical wire values;
-//! Completed advice is prefix-bound; owners hold transport and paid accounting only.
+//! Server-owned, disk-backed exact-prefix authority. Reference bounds limit live
+//! work, not retention. Publication is one SQLite transaction; no capacity GC.
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-
+#[path = "proxy_store.rs"]
+mod storage;
+use storage::Store;
 static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static PINS: std::sync::Mutex<BTreeMap<(PathBuf, String), Owner>> =
     std::sync::Mutex::new(BTreeMap::new());
-
 struct Owner {
     count: usize,
-    // Only a fresh resolution grants coalescing authority. An arbitrary pin on
-    // a historical owner must not turn a lookup miss into restored authority.
     reservation: Option<String>,
 }
-
-/// Selected authority stays live across lock waits, primary transport and paid
-/// reviewer settlement. Restart censors pending work, rather than reviving workers.
 pub(super) struct Pin((PathBuf, String));
 impl Drop for Pin {
     fn drop(&mut self) {
@@ -54,29 +50,28 @@ fn pin_owner(
         .count += 1;
     Ok(Pin(key))
 }
-
-// Called under IO: reserve a genuinely cold owner without promoting an expired
-// snapshot or mirror. Keep the pin lock through lookup/acquire so the last live
-// fresh request cannot disappear between coalescing and pinning its successor.
-fn reserve(
-    service: &Service,
-    key: String,
-    occupied: &HashSet<String>,
-) -> Result<(String, Pin), Failure> {
+fn pinned(service: &Service) -> HashSet<String> {
+    PINS.lock()
+        .unwrap()
+        .keys()
+        .filter(|(dir, _)| dir == &service.config.state_dir)
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+fn reserve(service: &Service, key: String, store: &Store) -> Result<(String, Pin), Failure> {
     let mut pins = PINS.lock().unwrap();
-    let existing = pins.iter().find_map(|((dir, id), owner)| {
-        (dir == &service.config.state_dir
-            && !occupied.contains(id)
-            && owner.reservation.as_ref() == Some(&key))
-        .then(|| id.clone())
-    });
-    if let Some(id) = existing {
-        let pin = pin_owner(service, &id, &mut pins)?;
-        return Ok((id, pin));
+    for ((dir, id), owner) in pins.iter() {
+        if dir == &service.config.state_dir
+            && owner.reservation.as_ref() == Some(&key)
+            && !store.contains("snapshots", id).map_err(read_failure)?
+        {
+            let id = id.clone();
+            return pin_owner(service, &id, &mut pins).map(|pin| (id, pin));
+        }
     }
     let mut id = key.clone();
-    let mut generation = 0_u64;
-    while occupied.contains(&id)
+    let mut generation = 0u64;
+    while store.contains("snapshots", &id).map_err(read_failure)?
         || pins.contains_key(&(service.config.state_dir.clone(), id.clone()))
         || service.config.state_dir.join(format!("{id}.json")).exists()
     {
@@ -87,46 +82,13 @@ fn reserve(
     pins.get_mut(&pin.0).unwrap().reservation = Some(key);
     Ok((id, pin))
 }
-fn pinned(service: &Service) -> HashSet<String> {
-    PINS.lock()
-        .unwrap()
-        .keys()
-        .filter(|(dir, _)| dir == &service.config.state_dir)
-        .map(|(_, id)| id.clone())
-        .collect()
-}
-
-#[derive(Default, Serialize, Deserialize)]
-enum Format {
-    #[default]
-    #[serde(rename = "carry-prefix-history-v4")]
-    Current,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct Index {
-    format: Format,
-    nodes: BTreeMap<String, Node>,
-    upstream_cache: Vec<CacheEvidence>,
-    tips: BTreeMap<String, Reference>,
-    reviews: BTreeMap<String, semantic::Record>,
-    #[serde(default)]
-    transcripts: BTreeMap<String, Transcript>,
-    #[serde(default)]
-    snapshots: BTreeMap<String, Session>,
-}
-#[derive(PartialEq, Serialize, Deserialize)]
-struct Node {
-    parent: String,
-    value: Value,
-}
-#[derive(PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Reference {
     session: String,
     namespace: String,
     at: u64,
 }
-#[derive(PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Transcript {
     namespace: String,
     external_id: String,
@@ -147,163 +109,26 @@ fn path(namespace: &str, input: &[Value]) -> Vec<String> {
         })
         .collect()
 }
-fn minimum_bytes() -> std::io::Result<usize> {
-    Ok(serde_json::to_vec(&Index::default())?.len())
-}
-
 pub(super) fn validate_capacity(config: &ProxyCli) -> std::io::Result<()> {
-    let minimum = minimum_bytes()?;
-    if (config.history_max_bytes as usize) < minimum {
+    if config.history_max_bytes < 256 || config.history_disk_bytes < 65536 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("history-max-bytes must fit the serialized empty index ({minimum} bytes)"),
+            "history capacity below minimum working set",
         ));
     }
     Ok(())
 }
-
-fn read(service: &Service) -> std::io::Result<Index> {
-    match std::fs::read(service.config.state_dir.join("history.index")) {
-        Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
-            serde_json::from_slice(&bytes).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "unsupported or invalid history index format",
-                )
-            })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
-        _ => Err(std::io::Error::other("history index unavailable")),
-    }
+fn read(service: &Service) -> std::io::Result<Store> {
+    Store::open(service, pinned(service))
 }
-fn insert(index: &mut Index, namespace: &str, input: &[Value]) -> Vec<String> {
-    let keys = path(namespace, input);
-    let mut parent = namespace.to_owned();
-    for (key, value) in keys.iter().zip(input) {
-        index.nodes.entry(key.clone()).or_insert_with(|| Node {
-            parent: parent.clone(),
-            value: value.clone(),
-        });
-        parent = key.clone();
-    }
-    keys
-}
-fn gc(index: &mut Index, pins: &HashSet<String>) {
-    let live = index
-        .tips
-        .values()
-        .map(|r| r.session.as_str())
-        .collect::<HashSet<_>>();
-    index
-        .snapshots
-        .retain(|id, _| live.contains(id.as_str()) || pins.contains(id));
-    let mut reachable = HashSet::new();
-    for root in index
-        .tips
-        .keys()
-        .chain(index.reviews.keys())
-        .chain(index.transcripts.values().map(|r| &r.frontier))
-        .chain(
-            index
-                .snapshots
-                .values()
-                .filter_map(|s| s.history_frontier.as_ref()),
-        )
-    {
-        let mut key = root.as_str();
-        while reachable.insert(key.to_owned()) {
-            let Some(node) = index.nodes.get(key) else {
-                break;
-            };
-            key = &node.parent;
-        }
-    }
-    index.nodes.retain(|key, _| reachable.contains(key));
-}
-fn within_capacity(service: &Service, index: &Index, bytes: usize) -> bool {
-    index.nodes.len() <= service.config.history_max_nodes as usize
-        && index.tips.len() + index.reviews.len() + index.transcripts.len()
-            <= service.config.history_max_references as usize
-        && bytes <= service.config.history_max_bytes as usize
-}
-
-fn prune(service: &Service, index: &mut Index) -> bool {
-    let at = now();
-    crate::proxy_cache::trim(&mut index.upstream_cache, at);
-    let pins = pinned(service);
-    index.tips.retain(|_, r| {
-        pins.contains(&r.session) || (r.at <= at && at - r.at < service.config.history_max_age_secs)
-    });
-    index
-        .reviews
-        .retain(|_, r| r.at <= at && at - r.at < service.config.history_max_age_secs);
-    index
-        .transcripts
-        .retain(|_, r| r.at <= at && at - r.at < service.config.history_max_age_secs);
-    loop {
-        gc(index, &pins);
-        if within_capacity(service, index, serde_json::to_vec(index).unwrap().len()) {
-            return true;
-        }
-        let review = index
-            .reviews
-            .iter()
-            .map(|(key, r)| (r.at, key.clone()))
-            .min();
-        let tip = index
-            .tips
-            .iter()
-            .filter(|(_, r)| !pins.contains(&r.session))
-            .map(|(k, r)| (r.at, k.clone()))
-            .min();
-        let transcript = index
-            .transcripts
-            .iter()
-            .map(|(k, r)| (r.at, k.clone()))
-            .min();
-        let oldest = review
-            .as_ref()
-            .map(|r| r.0)
-            .into_iter()
-            .chain(tip.as_ref().map(|r| r.0))
-            .min();
-        if let Some((at, key)) = transcript
-            && oldest.is_none_or(|t| at <= t)
-        {
-            index.transcripts.remove(&key);
-            continue;
-        }
-        match (review, tip) {
-            (Some((at, key)), Some((t, _))) if at <= t => {
-                index.reviews.remove(&key);
-            }
-            (_, Some((_, key))) => {
-                index.tips.remove(&key);
-            }
-            (Some((_, key)), None) => {
-                index.reviews.remove(&key);
-            }
-            _ => return false,
-        }
-    }
-}
-
 fn read_failure(error: std::io::Error) -> Failure {
-    if error.kind() == std::io::ErrorKind::InvalidData {
-        failure(
-            StatusCode::CONFLICT,
-            "unsupported or invalid history index format",
-        )
-    } else {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    }
+    let status = match error.kind() {
+        std::io::ErrorKind::StorageFull => StatusCode::INSUFFICIENT_STORAGE,
+        std::io::ErrorKind::InvalidData => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    failure(status, "history authority unavailable")
 }
-
-/// Observed ancestry owns model, fixed prompt, source and client/tenant fences.
-/// Reviewer validity and cache/pricing policy cannot rename paid quantity owners.
 pub(super) fn namespace(
     service: &Service,
     headers: &HeaderMap,
@@ -316,23 +141,17 @@ pub(super) fn namespace(
     let owner = identity(&owner)?;
     let namespace = observed_namespace(&service.config, &owner, body);
     let _guard = IO.lock().unwrap();
-    // Decode only the supported generation before any lookup or publication.
-    // Unsupported saved state is never migrated, reset or treated as empty.
     read(service).map_err(read_failure)?;
     Ok(namespace)
 }
-
 fn observed_namespace(config: &ProxyCli, owner: &Option<String>, body: &Value) -> String {
     format!(
         "observed-v1:{}",
-        hash(&json!({"owner":owner,
-        "model":body.get("model"), "prompt":crate::savings::prompt_overhead(body),
-        "upstream":config.upstream_url, "subscription":config.codex_login,
-        "client_scope":stable_client_scope(body)}))
+        hash(
+            &json!({"owner":owner,"model":body.get("model"),"prompt":crate::savings::prompt_overhead(body),"upstream":config.upstream_url,"subscription":config.codex_login,"client_scope":stable_client_scope(body)})
+        )
     )
 }
-
-/// A genuine scope change cannot borrow a conversation from the old checkpoint.
 pub(super) fn bind_namespace(session: &mut Session, namespace: Option<String>) {
     if session.history_namespace != namespace {
         session.history_conversation = None;
@@ -341,15 +160,11 @@ pub(super) fn bind_namespace(session: &mut Session, namespace: Option<String>) {
         session.history_namespace = namespace;
     }
 }
-
 pub(super) fn conversation(body: &Value) -> Option<&str> {
     body["conversation"]
         .as_str()
         .or_else(|| body["conversation"]["id"].as_str())
 }
-
-/// Expand only immutable, successfully observed frontiers; never ask the provider
-/// to reconstruct an unknown ancestor or silently send a delta as fresh history.
 pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Result<(), Failure> {
     let previous = body.get("previous_response_id").filter(|v| !v.is_null());
     let conv = body.get("conversation").filter(|v| !v.is_null());
@@ -359,7 +174,7 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
             "conversation and previous_response_id are mutually exclusive",
         ));
     }
-    let reference = if let Some(v) = previous {
+    let external = if let Some(v) = previous {
         Some((
             "response",
             v.as_str()
@@ -376,36 +191,25 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
     } else {
         None
     };
-    let Some((kind, external)) = reference else {
+    let Some((kind, external)) = external else {
         return Ok(());
     };
     let _guard = IO.lock().unwrap();
-    let mut index = read(service).map_err(read_failure)?;
-    prune(service, &mut index);
-    let reference = index
-        .transcripts
-        .get(&hash(&(namespace, kind, external)))
-        .ok_or_else(|| {
-            failure(
-                StatusCode::CONFLICT,
-                "unknown, expired or unobserved transcript identifier",
-            )
-        })?;
-    let mut key = reference.frontier.as_str();
-    let mut input = Vec::new();
-    let mut visited = HashSet::new();
-    while key != namespace {
-        if !visited.insert(key) {
-            return Err(failure(StatusCode::CONFLICT, "invalid transcript ancestry"));
-        }
-        let node = index
-            .nodes
-            .get(key)
-            .ok_or_else(|| failure(StatusCode::CONFLICT, "transcript ancestry unavailable"))?;
-        input.push(node.value.clone());
-        key = &node.parent;
+    let store = read(service).map_err(read_failure)?;
+    let key = hash(&(namespace, kind, external));
+    if !store.live("transcripts", &key).map_err(read_failure)? {
+        return Err(failure(
+            StatusCode::CONFLICT,
+            "unknown, expired or unobserved transcript identifier",
+        ));
     }
-    input.reverse();
+    let reference: Transcript = store
+        .get("transcripts", &key)
+        .map_err(read_failure)?
+        .ok_or_else(|| failure(StatusCode::CONFLICT, "transcript unavailable"))?;
+    let mut input = store
+        .ancestry(namespace, &reference.frontier)
+        .map_err(read_failure)?;
     input.extend(
         body["input"]
             .as_array()
@@ -418,81 +222,83 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
     body.as_object_mut().unwrap().remove("conversation");
     Ok(())
 }
-
-// A metadata hint, not history admission: absent/invalid ancestry or an unavailable
-// index must not block a request that may turn out to be forwarding-only. Pin a
-// live candidate so its frozen contracts can be read under its owner lock. The
-// normal resolver still selects/revalidates the owner for reviewable requests.
 pub(super) fn candidate(
     service: &Service,
     namespace: &str,
     body: &Value,
 ) -> Result<Option<(String, Pin)>, Failure> {
     let _guard = IO.lock().unwrap();
-    let Ok(mut index) = read(service) else {
+    let Ok(store) = read(service) else {
         return Ok(None);
     };
-    prune(service, &mut index);
     let external = body["previous_response_id"]
         .as_str()
         .map(|id| ("response", id))
         .or_else(|| conversation(body).map(|id| ("conversation", id)));
-    let owner = external
-        .and_then(|(kind, id)| index.transcripts.get(&hash(&(namespace, kind, id))))
-        .filter(|reference| index.snapshots.contains_key(&reference.session))
-        .map(|reference| reference.session.clone())
-        .or_else(|| {
-            body["input"]
-                .as_array()
-                .and_then(|input| prefix_owner(&index, namespace, input))
-        });
+    let mut owner = None;
+    if let Some((kind, id)) = external {
+        let key = hash(&(namespace, kind, id));
+        if store.live("transcripts", &key).map_err(read_failure)?
+            && let Some(reference) = store
+                .get::<Transcript>("transcripts", &key)
+                .map_err(read_failure)?
+            && store
+                .live("snapshots", &reference.session)
+                .map_err(read_failure)?
+        {
+            owner = Some(reference.session);
+        }
+    }
+    if owner.is_none()
+        && let Some(input) = body["input"].as_array()
+    {
+        owner = prefix_owner(&store, namespace, input).map_err(read_failure)?;
+    }
     owner
         .map(|id| pin(service, &id).map(|pin| (id, pin)))
         .transpose()
 }
-
-fn prefix_owner(index: &Index, namespace: &str, input: &[Value]) -> Option<String> {
-    path(namespace, input)
+fn prefix_owner(
+    store: &Store,
+    namespace: &str,
+    input: &[Value],
+) -> std::io::Result<Option<String>> {
+    for key in path(namespace, input)
         .iter()
         .rev()
         .map(String::as_str)
         .chain(std::iter::once(namespace))
-        .find_map(|key| {
-            let reference = index.tips.get(key)?;
-            let snapshot = index.snapshots.get(&reference.session)?;
-            (snapshot.history.len() <= input.len()).then(|| reference.session.clone())
-        })
+    {
+        if store.live("tips", key)?
+            && let Some(reference) = store.get::<Reference>("tips", key)?
+            && store.live("snapshots", &reference.session)?
+            && let Some(snapshot) = store.get::<Session>("snapshots", &reference.session)?
+            && snapshot.history.len() <= input.len()
+        {
+            return Ok(Some(reference.session));
+        }
+    }
+    Ok(None)
 }
-
 pub(super) fn resolve(
     service: &Service,
     namespace: &str,
     body: &Value,
 ) -> Result<(String, Pin), Failure> {
     let _guard = IO.lock().unwrap();
-    let mut index = read(service).map_err(read_failure)?;
-    // Pruning is a read-time projection. Those historical IDs remain occupied
-    // in the on-disk generation until publication; pinning one would otherwise
-    // make restore protect and resurrect exactly the snapshot just retired.
-    let occupied = index.snapshots.keys().cloned().collect::<HashSet<_>>();
-    prune(service, &mut index);
+    let store = read(service).map_err(read_failure)?;
     let input = body["input"]
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
-    // Routing has no semantic authority. Reuse only a compatible live owner;
-    // every request independently looks up completed advice below.
-    if let Some(id) = prefix_owner(&index, namespace, input) {
+    if let Some(id) = prefix_owner(&store, namespace, input).map_err(read_failure)? {
         return Ok((id.clone(), pin(service, &id)?));
     }
     reserve(
         service,
         hash(&(namespace, path(namespace, input).last())),
-        &occupied,
+        &store,
     )
 }
-
-/// Selected checkpoints reference canonical nodes; the atomic index is their
-/// authority. The per-session JSON is a diagnostic mirror, never new authority.
 pub(super) fn compact(session: &Session) -> Session {
     let mut snapshot = session.clone();
     if snapshot.history_shared {
@@ -509,93 +315,83 @@ pub(super) fn compact(session: &Session) -> Session {
     }
     snapshot
 }
-
 pub(super) fn restore(service: &Service, id: &str) -> std::io::Result<Session> {
     ReadView::new(service)?.restore(id)
 }
-
-/// One bounded, read-only authority generation for a dashboard poll. Never keep
-/// this across requests: expiry, revocation and owner pins are resolved afresh.
+/// A read transaction, not an in-memory copy of the entire retained population.
+/// Mutex makes the connection safe to hold across dashboard await boundaries.
 pub(super) struct ReadView {
-    index: Index,
-    shared_owners: HashSet<String>,
+    store: std::sync::Mutex<Store>,
     policy: String,
 }
-
 impl ReadView {
     pub(super) fn new(service: &Service) -> std::io::Result<Self> {
         let _guard = IO.lock().unwrap();
-        let mut index = read(service)?;
-        // Expiry/capacity remove readable snapshots, not their identity as
-        // diagnostic-mirror owners in this generation.
-        let shared_owners = index
-            .snapshots
-            .iter()
-            .filter(|(_, session)| session.history_shared)
-            .map(|(id, _)| id.clone())
-            .collect();
-        prune(service, &mut index);
+        let store = read(service)?;
+        store
+            .connection
+            .execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;")
+            .map_err(storage::error)?;
         Ok(Self {
-            index,
-            shared_owners,
+            store: std::sync::Mutex::new(store),
             policy: semantic::scope(&service.config),
         })
     }
-
     pub(super) fn restore(&self, id: &str) -> std::io::Result<Session> {
-        let session = self
-            .index
-            .snapshots
-            .get(id)
-            .cloned()
+        let store = self.store.lock().unwrap();
+        if !store.live("snapshots", id)? {
+            return Err(std::io::Error::other("selected history unavailable"));
+        }
+        let mut session: Session = store
+            .get("snapshots", id)?
             .ok_or_else(|| std::io::Error::other("selected history unavailable"))?;
-        canonical(&self.index, session)
-    }
-
-    pub(super) fn shared(&self, id: &str) -> std::io::Result<Option<Session>> {
-        let Some(session) = self.index.snapshots.get(id).filter(|s| s.history_shared) else {
-            if self.shared_owners.contains(id) {
-                return Err(std::io::Error::other("selected history unavailable"));
+        if session.history_shared && !session.history.is_empty() {
+            let values = store.ancestry(
+                session.history_namespace.as_deref().unwrap_or_default(),
+                session.history_frontier.as_deref().unwrap_or_default(),
+            )?;
+            if values.len() != session.history.len() {
+                return Err(std::io::Error::other("invalid canonical ancestry"));
             }
-            return Ok(None);
-        };
-        if !matches!(session.version, 0 | 3) {
-            return Err(std::io::Error::other(
-                "unsupported shared checkpoint format",
-            ));
+            for (item, value) in session.history.iter_mut().zip(values) {
+                item.value = value;
+            }
+        }
+        session.history_frontier = None;
+        Ok(session)
+    }
+    pub(super) fn shared(&self, id: &str) -> std::io::Result<Option<Session>> {
+        {
+            let store = self.store.lock().unwrap();
+            let Some(session) = store.get::<Session>("snapshots", id)? else {
+                return Ok(None);
+            };
+            if !session.history_shared {
+                return Ok(None);
+            }
+            if !matches!(session.version, 0 | 3) {
+                return Err(std::io::Error::other(
+                    "unsupported shared checkpoint format",
+                ));
+            }
         }
         self.restore(id).map(Some)
     }
-
     pub(super) fn advice(&self, namespace: &str, input: &[Value]) -> Option<semantic::Record> {
-        // Newest record at the longest cut wins, even if its individual actions
-        // are invalid. Never fall back to an older record or a diagnostic mirror.
+        let store = self.store.lock().unwrap();
         path(namespace, input)
             .iter()
             .rev()
-            .find_map(|key| self.index.reviews.get(key).cloned())
-            .filter(|record| record.policy.as_deref() == Some(self.policy.as_str()))
+            .find_map(|key| {
+                store
+                    .live("reviews", key)
+                    .ok()?
+                    .then(|| store.get::<semantic::Record>("reviews", key).ok().flatten())
+                    .flatten()
+            })
+            .filter(|r| r.policy.as_deref() == Some(self.policy.as_str()))
     }
 }
-
-fn canonical(index: &Index, mut session: Session) -> std::io::Result<Session> {
-    let mut key = session.history_frontier.as_deref();
-    for item in session.history.iter_mut().rev() {
-        let node = key
-            .and_then(|k| index.nodes.get(k))
-            .ok_or_else(|| std::io::Error::other("canonical history unavailable"))?;
-        item.value = node.value.clone();
-        key = Some(&node.parent);
-    }
-    if key != session.history_namespace.as_deref() && !session.history.is_empty() {
-        return Err(std::io::Error::other("invalid canonical ancestry"));
-    }
-    session.history_frontier = None;
-    Ok(session)
-}
-
-/// Publish nodes, reviewed versions and selected metadata in ONE atomic index.
-/// A mirror written before this transaction cannot publish uncommitted advice.
 pub(super) fn committed(
     service: &Service,
     id: &str,
@@ -606,68 +402,77 @@ pub(super) fn committed(
         return Ok(());
     };
     let _guard = IO.lock().unwrap();
-    let mut index = read(service)?;
+    let store = read(service)?;
+    store.begin()?;
     let input = session
         .history
         .iter()
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
-    let prior = index.snapshots.keys().cloned().collect::<HashSet<_>>();
-    let keys = insert(&mut index, namespace, &input);
-    let observed_keys = observation
-        .map(|(input, _)| insert(&mut index, namespace, input))
-        .unwrap_or_else(|| keys.clone());
-    // Only an actual successful observation creates external authority. Pending,
-    // reviewer and failed-primary saves preserve existing immutable bindings;
-    // mutable session frontiers must never be re-scoped under current settings.
-    let completed = observation.map(|(input, response)| {
-        (
-            response["id"].as_str(),
-            conversation(response).or(session.history_conversation.as_deref()),
-            input
-                .iter()
-                .cloned()
-                .chain(response["output"].as_array().into_iter().flatten().cloned())
-                .collect::<Vec<_>>(),
-        )
-    });
-    if let Some((Some(response), conversation, transcript)) = completed {
-        let full_keys = insert(&mut index, namespace, &transcript);
-        let key = full_keys.last().unwrap_or(namespace);
-        for (kind, external) in [("response", Some(response)), ("conversation", conversation)] {
+    let keys = store.insert(namespace, &input)?;
+    let observed_keys = if let Some((input, _)) = observation {
+        store.insert(namespace, input)?
+    } else {
+        keys
+    };
+    if let Some((input, response)) = observation
+        && let Some(response_id) = response["id"].as_str()
+    {
+        let transcript = input
+            .iter()
+            .cloned()
+            .chain(response["output"].as_array().into_iter().flatten().cloned())
+            .collect::<Vec<_>>();
+        let full_keys = store.insert(namespace, &transcript)?;
+        let frontier = full_keys.last().unwrap_or(namespace);
+        for (kind, external) in [
+            ("response", Some(response_id)),
+            (
+                "conversation",
+                conversation(response).or(session.history_conversation.as_deref()),
+            ),
+        ] {
             if let Some(external) = external {
-                let reference_key = hash(&(namespace, kind, external));
-                let reference = Transcript {
-                    namespace: namespace.clone(),
-                    external_id: external.to_owned(),
-                    frontier: key.clone(),
-                    session: id.into(),
-                    at: now(),
-                };
-                if kind == "response" {
-                    index.transcripts.entry(reference_key).or_insert(reference);
-                } else {
-                    index.transcripts.insert(reference_key, reference);
+                let key = hash(&(namespace, kind, external));
+                if kind != "response" || !store.contains("transcripts", &key)? {
+                    store.put(
+                        "transcripts",
+                        &key,
+                        &Transcript {
+                            namespace: namespace.clone(),
+                            external_id: external.into(),
+                            frontier: frontier.clone(),
+                            session: id.into(),
+                            at: now(),
+                        },
+                        now(),
+                        id,
+                    )?;
                 }
             }
         }
     }
-    index.tips.retain(|_, r| r.session != id);
+    store
+        .connection
+        .execute("DELETE FROM records WHERE kind='tips' AND owner=?1", [id])
+        .map_err(storage::error)?;
     let key = observed_keys.last().unwrap_or(namespace);
-    index.tips.insert(
-        key.clone(),
-        Reference {
+    store.put(
+        "tips",
+        key,
+        &Reference {
             session: id.into(),
             namespace: namespace.clone(),
             at: now(),
         },
-    );
+        now(),
+        id,
+    )?;
     if session.history_shared {
-        index.snapshots.insert(id.into(), compact(session));
+        store.put("snapshots", id, &compact(session), now(), id)?;
     }
-    persist(service, index, prior, session.history_shared.then_some(id))
+    store.commit()
 }
-
 pub(super) fn advice(
     service: &Service,
     namespace: &str,
@@ -675,7 +480,6 @@ pub(super) fn advice(
 ) -> std::io::Result<Option<semantic::Record>> {
     Ok(ReadView::new(service)?.advice(namespace, input))
 }
-
 pub(super) fn publish(
     service: &Service,
     subject: &Session,
@@ -686,73 +490,25 @@ pub(super) fn publish(
         .as_deref()
         .ok_or_else(|| std::io::Error::other("review namespace missing"))?;
     let _guard = IO.lock().unwrap();
-    let mut index = read(service)?;
+    let store = read(service)?;
+    store.begin()?;
     let input = subject
         .history
         .iter()
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
-    let keys = insert(&mut index, namespace, &input);
-    let key = keys
-        .last()
-        .unwrap_or(&subject.history_namespace.clone().unwrap())
-        .clone();
+    let keys = store.insert(namespace, &input)?;
+    let key = keys.last().map(String::as_str).unwrap_or(namespace);
     let mut record = semantic::Record::capture(reviewed);
     record.policy = Some(semantic::scope(&service.config));
-    if index
-        .reviews
-        .get(&key)
+    if store
+        .get::<semantic::Record>("reviews", key)?
         .is_none_or(|old| old.policy != record.policy || old.generation < record.generation)
     {
-        index.reviews.insert(key, record);
+        store.put("reviews", key, &record, now(), "")?;
     }
-    let prior = index.snapshots.keys().cloned().collect();
-    persist(service, index, prior, None)
+    store.commit()
 }
-
-fn persist(
-    service: &Service,
-    mut index: Index,
-    prior: HashSet<String>,
-    owner: Option<&str>,
-) -> std::io::Result<()> {
-    if !prune(service, &mut index) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            "history capacity held by active owners",
-        ));
-    }
-    write_index(service, &index)?;
-    for stale in prior.into_iter().chain(owner.map(str::to_owned)) {
-        if !index.snapshots.contains_key(&stale) {
-            let _ = std::fs::remove_file(service.config.state_dir.join(format!("{stale}.json")));
-        }
-    }
-    Ok(())
-}
-
-// Admit exact bounded bytes before atomic publication. Retention belongs to prune.
-fn write_index(service: &Service, index: &Index) -> std::io::Result<()> {
-    // Validate the exact bytes that will become authority before opening the
-    // temporary file. No failed admission may replace a readable generation.
-    let bytes = serde_json::to_vec(index)?;
-    if !within_capacity(service, index, bytes.len()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            "history index exceeds configured capacity",
-        ));
-    }
-    let temporary = service.config.state_dir.join(".history-index.tmp");
-    let mut file = private_file(&temporary, false)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::rename(temporary, service.config.state_dir.join("history.index"))?;
-    File::open(&service.config.state_dir)?.sync_all()
-}
-
-/// Only actual terminal observations mutate cache evidence. Session/reviewer
-/// snapshots are disposable read views, never sources to merge back. The IO
-/// transaction orders receipts even when TTL timestamps have the same second.
 pub(super) fn observe_cache(
     service: &Service,
     body: &Value,
@@ -762,27 +518,19 @@ pub(super) fn observe_cache(
     time: crate::proxy_cache::ObservationTime,
 ) -> std::io::Result<Vec<CacheEvidence>> {
     let _guard = IO.lock().unwrap();
-    let mut index = read(service)?;
-    if crate::proxy_cache::observe(
-        &mut index.upstream_cache,
-        body,
-        usage,
-        resolved,
-        credential,
-        time,
-    ) {
-        let cache = index.upstream_cache.clone();
-        let prior = index.snapshots.keys().cloned().collect();
-        persist(service, index, prior, None)?;
-        Ok(cache)
-    } else {
-        Ok(index.upstream_cache)
+    let store = read(service)?;
+    store.begin()?;
+    let mut cache = store.get("upstream_cache", "current")?.unwrap_or_default();
+    if crate::proxy_cache::observe(&mut cache, body, usage, resolved, credential, time) {
+        store.put("upstream_cache", "current", &cache, now(), "")?;
     }
+    store.commit()?;
+    Ok(cache)
 }
-
 pub(super) fn cache(service: &Service) -> std::io::Result<Vec<CacheEvidence>> {
     let _guard = IO.lock().unwrap();
-    let mut index = read(service)?;
-    crate::proxy_cache::trim(&mut index.upstream_cache, now());
-    Ok(index.upstream_cache)
+    let store = read(service)?;
+    let mut cache = store.get("upstream_cache", "current")?.unwrap_or_default();
+    crate::proxy_cache::trim(&mut cache, now());
+    Ok(cache)
 }

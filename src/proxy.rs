@@ -160,17 +160,20 @@ pub struct ProxyCli {
     classifier_reasoning_effort: String,
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
     classifier_max_output_tokens: u32,
-    /// Global transparent canonical-node bound; shared prefixes count once.
+    /// Maximum nodes decoded for one history path (not a retention cap).
     #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_NODES", default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..=65536))]
     history_max_nodes: u32,
-    /// Global tip/review-frontier/transcript index reference bound.
+    /// Maximum concurrently pinned owners; never evicts retained evidence.
     #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_REFERENCES", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
     history_max_references: u32,
-    /// Global canonical index, selected metadata and transcript byte bound.
+    /// Maximum decoded record/history working set.
     #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_BYTES", default_value_t = 33554432, value_parser = clap::value_parser!(u32).range(2..=67108864))]
     history_max_bytes: u32,
-    /// History/advice age target; node/reference/byte capacity may evict earlier.
-    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_AGE_SECS", default_value_t = 604800, value_parser = clap::value_parser!(u64).range(0..=604800))]
+    /// Hard disk admission ceiling. Capacity rejects writes, never evicts history.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_DISK_BYTES", default_value_t = 1073741824)]
+    history_disk_bytes: u64,
+    /// Detailed history age. Disk/reference pressure cannot shorten this window.
+    #[arg(long, env = "CARRY_PROXY_HISTORY_MAX_AGE_SECS", default_value_t = 604800, value_parser = clap::value_parser!(u64).range(0..=31536000))]
     history_max_age_secs: u64,
 }
 
