@@ -364,6 +364,170 @@ fn retention_predecessor_import_preserves_money_bindings_and_rejects_capacity_at
     });
 }
 
+#[tokio::test]
+async fn retention_concurrent_paid_reviews_keep_reserved_headroom_under_long_path_pressure() {
+    let (url, mut captures, provider) = review_capture_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.classifier_url = Some(url);
+    service.config.history_max_bytes = 65536;
+    service.config.history_max_nodes = 512;
+    service.config.history_disk_bytes = 24 * 1024 * 1024;
+    let service = Arc::new(service);
+    // This third writer is admitted before either paid request. It may consume
+    // its own capacity, never the headroom already promised to paid owners.
+    let pressure_pin = history::pin(&service, "pressure-owner").unwrap();
+    let (waiter, mut waits) = tokio::sync::mpsc::unbounded_channel();
+    *service.lock_waits.lock().unwrap() = Some(waiter);
+    let ids = ["paid-long-path-a", "paid-long-path-b"];
+    let mut locks = Vec::new();
+    let mut originals = Vec::new();
+    for id in ids {
+        let input = (0..128)
+            .map(|n| {
+                json!({"role":if n % 2 == 0 {"user"} else {"assistant"},
+                "content":format!("{id} source {n}")})
+            })
+            .collect::<Vec<_>>();
+        let mut session = Session {
+            history_shared: true,
+            history_namespace: Some(id.into()),
+            review_context: json!({"model":"gpt-6-luna"}),
+            bootstrap_review_pending: true,
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        session.ingest(&input).unwrap();
+        for item in &mut session.history {
+            item.exposed = true;
+        }
+        numeric_primary(&mut session, 0);
+        locks.push(session_lock(&service, id).await);
+        let projection = planning::Projection::canonical(&session);
+        let expected = review_body_projected(&service.config, &session, &projection);
+        dispatch_review_for(
+            service.clone(),
+            id.into(),
+            &mut session,
+            projection,
+            format!("{id}-review"),
+        )
+        .await;
+        let captured = tokio::time::timeout(Duration::from_secs(10), captures.recv())
+            .await
+            .expect("admitted long-path reviewer must reach loopback provider")
+            .unwrap();
+        assert_eq!(
+            captured, expected,
+            "pressure fixture must preserve the whole paid wire"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waits.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            id,
+            "hold a completed real paid receipt at the existing settlement lock"
+        );
+        let durable = history::restore(&service, id).unwrap();
+        assert!(durable.background_review_pending);
+        assert_eq!(durable.shadow.calls, 0);
+        assert_eq!(durable.primary.calls, 1);
+        assert!((durable.primary.cost_usd - 0.002).abs() < 1e-12);
+        assert_eq!(durable.render_primary(), input);
+        originals.push(durable);
+    }
+    assert!(
+        captures.try_recv().is_err(),
+        "exactly two upstream calls before pressure"
+    );
+    let mut rejected = false;
+    let mut accepted = 0;
+    for n in 0..1024 {
+        let mut pressure = Session {
+            history_shared: true,
+            history_namespace: Some("pressure-writer".into()),
+            ..Session::default()
+        };
+        pressure
+            .ingest(&[json!({"role":"user", "content":format!("{n} {}", "x".repeat(48000))})])
+            .unwrap();
+        match history::committed(&service, "pressure-owner", &pressure, None) {
+            Ok(()) => accepted += 1,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+                rejected = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        accepted > 0 && rejected,
+        "reach genuine bounded disk pressure without changing caps"
+    );
+    let bytes: u64 = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(
+        bytes <= service.config.history_disk_bytes,
+        "physical store exceeded disk bound: {bytes}"
+    );
+    for (id, original) in ids.iter().zip(&originals) {
+        let held = history::restore(&service, id).unwrap();
+        assert_eq!(held.render_primary(), original.render_primary());
+        assert_eq!(
+            serde_json::to_value(&held.primary).unwrap(),
+            serde_json::to_value(&original.primary).unwrap()
+        );
+    }
+    drop(locks);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !service.background_reviews.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("paid settlements must terminate under bounded capacity");
+    assert!(
+        captures.try_recv().is_err(),
+        "pressure/settlement cannot invent more model calls"
+    );
+    drop(pressure_pin);
+    let mut restarted = checkpoint_service(directory.path());
+    restarted.config.history_max_bytes = service.config.history_max_bytes;
+    restarted.config.history_max_nodes = service.config.history_max_nodes;
+    restarted.config.history_disk_bytes = service.config.history_disk_bytes;
+    let mut lost = Vec::new();
+    for (id, original) in ids.iter().zip(&originals) {
+        let durable = history::restore(&restarted, id).unwrap();
+        assert_eq!(
+            durable.render_primary(),
+            original.render_primary(),
+            "pressure cannot evict paid ancestry"
+        );
+        assert_eq!(
+            serde_json::to_value(&durable.primary).unwrap(),
+            serde_json::to_value(&original.primary).unwrap()
+        );
+        if durable.shadow.calls != 1
+            || durable.shadow.input_tokens != 10000
+            || durable.shadow.output_tokens != 7
+            || durable.shadow.cached_tokens != 9000
+            || durable.shadow.unavailable_cost_calls != 0
+            || (durable.shadow.cost_usd - 0.0001935).abs() > 1e-12
+            || durable.background_review_pending
+        {
+            lost.push(json!({"owner":id,"reviewer":durable.shadow,"pending":durable.background_review_pending}));
+        }
+    }
+    provider.abort();
+    assert!(
+        lost.is_empty(),
+        "admitted concurrent paid receipts lost their reserved settlement headroom: {lost:?}"
+    );
+}
+
 #[test]
 fn retention_disk_admission_bounds_wal_and_preserves_prior_generation() {
     let directory = tempfile::tempdir().unwrap();
