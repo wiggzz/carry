@@ -32,6 +32,8 @@ def write_index(path, index):
         path.unlink()
     with closing(sqlite3.connect(path)) as db, db:
         db.execute('CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL,key TEXT NOT NULL,data BLOB NOT NULL,at INTEGER NOT NULL,owner TEXT NOT NULL,PRIMARY KEY(kind,key)) WITHOUT ROWID')
+        db.execute('CREATE INDEX IF NOT EXISTS records_age ON records(kind,at)')
+        db.execute('CREATE INDEX IF NOT EXISTS records_owner ON records(kind,owner)')
         db.execute('PRAGMA user_version=1')
         db.execute("DELETE FROM records WHERE kind IN ('nodes','tips','reviews','transcripts','snapshots','upstream_cache')")
         at = max((r.get('at', 0) for k in ('tips', 'transcripts', 'reviews')
