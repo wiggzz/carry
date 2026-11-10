@@ -27,6 +27,20 @@ pub(super) struct Store {
     retired: std::cell::RefCell<Vec<String>>,
     disk_limit: u64,
     projected_bytes: std::cell::Cell<u64>,
+    reserved_bytes: std::cell::Cell<u64>,
+}
+// A paid-only transaction writes at most a bounded checkpoint and accounting
+// observation, two small sequence rows, and a staged checkpoint file. Ordinary
+// publications cannot spend this headroom, including their own owner's promise.
+fn write_charge(bytes: u64) -> u64 {
+    bytes.saturating_mul(4).saturating_add(16384)
+}
+fn settlement_reserve(max_record: u64) -> u64 {
+    write_charge(max_record)
+        .saturating_mul(2)
+        .saturating_add(write_charge(128).saturating_mul(2))
+        .saturating_add(max_record.saturating_mul(2))
+        .saturating_add(65536)
 }
 fn full() -> std::io::Error {
     std::io::Error::new(
@@ -66,10 +80,8 @@ fn free_bytes(directory: &Path) -> std::io::Result<u64> {
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<()> {
-    let reserve = (service.config.history_max_bytes as u64)
-        .saturating_mul(6)
-        .saturating_add(4 * 1024 * 1024)
-        .saturating_mul(owners as u64);
+    let reserve =
+        settlement_reserve(service.config.history_max_bytes as u64).saturating_mul(owners as u64);
     if disk_bytes(&service.config.state_dir, 0)?.saturating_add(reserve)
         > service.config.history_disk_bytes
     {
@@ -311,13 +323,18 @@ impl Store {
     fn charge(&self, bytes: u64) -> std::io::Result<()> {
         // Reserve index/overflow pages and WAL copies before SQLite can spill.
         // Refusal rolls back the transaction; it never deletes a younger row.
-        let charge = bytes.saturating_mul(4).saturating_add(16384);
+        let charge = write_charge(bytes);
         let next = self.projected_bytes.get().saturating_add(charge);
-        if next > self.disk_limit {
+        let reserved = self.reserved_bytes.get();
+        if next.saturating_add(reserved) > self.disk_limit {
             return Err(full());
         }
         #[cfg(unix)]
-        if free_bytes(&self.directory)? < charge.saturating_add(16 * 1024 * 1024) {
+        if free_bytes(&self.directory)?
+            < charge
+                .saturating_add(reserved)
+                .saturating_add(16 * 1024 * 1024)
+        {
             return Err(full());
         }
         self.projected_bytes.set(next);
@@ -393,6 +410,10 @@ impl Store {
             max_nodes: service.config.history_max_nodes as usize,
             at: now(),
             age: service.config.history_max_age_secs,
+            reserved_bytes: std::cell::Cell::new(
+                settlement_reserve(service.config.history_max_bytes as u64)
+                    .saturating_mul(pins.len() as u64),
+            ),
             pins,
             accounting_age: service.config.accounting_max_age_secs,
             directory: service.config.state_dir.clone(),
@@ -713,13 +734,28 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn begin(&self) -> std::io::Result<()> {
+    pub(super) fn begin_settlement(&self, owner: &str) -> std::io::Result<()> {
+        // Only a bounded paid-only publication may use its owner's promise.
+        // Do not run ancestry maintenance inside this emergency transaction.
+        if self.pins.contains(owner) {
+            self.reserved_bytes.set(
+                self.reserved_bytes
+                    .get()
+                    .saturating_sub(settlement_reserve(self.max_record as u64)),
+            );
+        }
+        self.start()
+    }
+    fn start(&self) -> std::io::Result<()> {
         self.projected_bytes
             .set(disk_bytes(&self.directory, 0)?.saturating_add(65536));
         self.charge(0)?;
         self.connection
             .execute_batch("BEGIN IMMEDIATE")
-            .map_err(error)?;
+            .map_err(error)
+    }
+    pub(super) fn begin(&self) -> std::io::Result<()> {
+        self.start()?;
         self.collect()
     }
     pub(super) fn commit(&self) -> std::io::Result<()> {

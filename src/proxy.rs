@@ -728,7 +728,9 @@ fn save_paid_accounting(
         // successful event or granting removal authority to its numeric journal.
         trajectory.reset_epoch();
     }
-    save(service, id, &durable)
+    save_published(service, id, &durable, |session| {
+        history::settled(service, id, session)
+    })
 }
 
 fn save_observed(
@@ -736,6 +738,17 @@ fn save_observed(
     id: &str,
     session: &Session,
     observation: Option<(&[Value], &Value)>,
+) -> std::io::Result<()> {
+    save_published(service, id, session, |session| {
+        history::committed(service, id, session, observation)
+    })
+}
+
+fn save_published(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    publish: impl FnOnce(&Session) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let mut persisted = session.clone();
     if let Some(evidence) = &mut persisted.request_evidence
@@ -753,7 +766,7 @@ fn save_observed(
         // its exact bounded bytes first, then admit history before replacing it.
         // A rejected reservation must never become an abandoned paid attempt.
         return save_checkpoint(service, id, session, CHECKPOINT_MAX_BYTES, || {
-            history::committed(service, id, session, observation)
+            publish(session)
         });
     }
     let mirror = service.config.state_dir.join(format!("{id}.json"));
@@ -764,7 +777,7 @@ fn save_observed(
         &history::compact(session),
         CHECKPOINT_MAX_BYTES,
     )?;
-    let published = history::committed(service, id, session, observation);
+    let published = publish(session);
     if published.is_err() && new_shared_mirror {
         // A rejected fresh admission owns no authoritative state. Repeated
         // capacity backpressure must not accumulate unindexed diagnostics.

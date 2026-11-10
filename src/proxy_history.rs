@@ -29,6 +29,9 @@ impl Drop for Pin {
     }
 }
 pub(super) fn pin(service: &Service, id: &str) -> Result<Pin, Failure> {
+    // Serialize admission with durable writes, always IO before PINS. Otherwise
+    // a new promise could race a transaction's already-frozen capacity budget.
+    let _guard = IO.lock().unwrap();
     pin_owner(service, id, &mut PINS.lock().unwrap())
 }
 fn pin_owner(
@@ -431,6 +434,23 @@ impl ReadView {
         None
     }
 }
+/// Publish captured paid facts against existing authority without replaying its
+/// ancestry, transcript bindings or advice. The caller constructs this Session
+/// by merging only numeric settlement into the durable predecessor.
+pub(super) fn settled(service: &Service, id: &str, session: &Session) -> std::io::Result<()> {
+    let _guard = IO.lock().unwrap();
+    let store = Store::open(service, pinned(service), true)?;
+    store.begin_settlement(id)?;
+    if session.history_shared && !store.contains("snapshots", id)? {
+        return Err(std::io::Error::other("paid settlement owner unavailable"));
+    }
+    store.account(id, session)?;
+    if session.history_shared {
+        store.put("snapshots", id, &compact(session), now(), id)?;
+    }
+    store.commit()
+}
+
 pub(super) fn committed(
     service: &Service,
     id: &str,
