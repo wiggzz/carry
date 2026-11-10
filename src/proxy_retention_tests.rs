@@ -1342,6 +1342,88 @@ fn external_checkpoint_admission_control(shared: bool) {
 }
 
 #[test]
+fn retention_numeric_queue_saturation_cannot_write_outside_physical_admission() {
+    numeric_file_admission_control(false);
+}
+
+#[test]
+fn retention_numeric_conflict_fork_cannot_write_outside_physical_admission() {
+    numeric_file_admission_control(true);
+}
+
+fn numeric_file_admission_control(fork: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.history_max_bytes = 65536;
+    service.config.history_disk_bytes = 2 * 1024 * 1024;
+    let id = "numeric-physical-admission";
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some(id.into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Session::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"frozen numeric source"})])
+        .unwrap();
+    numeric_primary(&mut session, 0);
+    let pin = history::pin(&service, id).unwrap();
+    save(&service, id, &session).unwrap();
+    let frozen = load_existing(&service, id).unwrap();
+    let accounting = history::accounting(&service, 0, "", 100).unwrap();
+    session = frozen.clone();
+    let path = numeric_selected_path(directory.path(), &session);
+    let mut original = std::fs::read(&path).unwrap();
+    if fork {
+        // A valid committed prefix followed by a conflicting abandoned tail
+        // must be preserved, not overwritten when another branch is admitted.
+        original.extend_from_slice(b"conflicting orphan\n");
+        std::fs::write(&path, &original).unwrap();
+    }
+    let bytes = || -> u64 {
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    };
+    let pressure = private_file(&directory.path().join("pressure.fixture"), false).unwrap();
+    pressure
+        .set_len(service.config.history_disk_bytes - bytes() - 64)
+        .unwrap();
+    drop(pressure);
+    let mut peak = bytes();
+    assert!(peak < service.config.history_disk_bytes);
+    let events = if fork { 1 } else { 4097 };
+    for n in 1..=events {
+        // Exercise the real receipt/queue producer, including its saturation
+        // flush without invoking save, rather than calling an archive helper.
+        numeric_primary(&mut session, n);
+        peak = peak.max(bytes());
+    }
+    assert_eq!(session.primary.calls, events + 1);
+    assert!((session.primary.cost_usd - (events + 1) as f64 * 0.004).abs() < 1e-9);
+    let publication = save(&service, id, &session);
+    peak = peak.max(bytes());
+    let restored = load_existing(&service, id).unwrap();
+    assert_eq!(restored.render_primary(), frozen.render_primary());
+    assert_eq!(
+        serde_json::to_value(&restored.primary).unwrap(),
+        serde_json::to_value(&frozen.primary).unwrap()
+    );
+    assert_eq!(
+        history::accounting(&service, 0, "", 100).unwrap(),
+        accounting
+    );
+    assert!(std::fs::read(&path).unwrap().starts_with(&original));
+    assert!(
+        publication.is_err() && peak <= service.config.history_disk_bytes,
+        "numeric files must be admitted before append/fork/queue flush: fork={fork} peak={peak} cap={} publication={publication:?}",
+        service.config.history_disk_bytes
+    );
+    drop(pin);
+}
+
+#[test]
 fn retention_disk_admission_bounds_wal_and_preserves_prior_generation() {
     let directory = tempfile::tempdir().unwrap();
     let mut service = checkpoint_service(directory.path());
