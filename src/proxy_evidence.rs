@@ -772,7 +772,7 @@ impl RequestEvidence {
                 initial_compactions: estimate.initial_compactions,
                 traditional_compactions: estimate.traditional_compactions,
                 summary_cost: estimate.summary_cost,
-                quantity_assumptions: "native_total_input;known_retention_else_max_visible_and_billed_output_proxy_for_reasoning_or_native_summary;missing_restoration_uses_last_known_or_zero_at_tracking_start;downward_canonical_rebase_holds_prior_quantity_with_zero_unknown_append;recognition_and_settings_changes_cool_cache_not_retired_history;same_outputs_and_tool_sequence;not_native_quantity_or_removal_authority",
+                quantity_assumptions: "native_total_input;known_retention_else_max_visible_and_billed_output_proxy_for_reasoning_or_native_summary;missing_restoration_uses_last_known_or_zero_at_tracking_start;downward_canonical_rebase_holds_prior_quantity_with_zero_unknown_append;recognition_and_settings_changes_cool_cache_not_retired_history;same_outputs_and_tool_sequence;not_native_quantity_or_removal_authority".into(),
             });
         }
         if let Some(prefix) = prefix {

@@ -378,6 +378,14 @@ impl ReadView {
             policy: semantic::scope(&service.config),
         })
     }
+    pub(super) fn accounting_totals(
+        &self,
+    ) -> std::io::Result<crate::proxy_savings::DashboardTotals> {
+        self.store.lock().unwrap().accounting_totals()
+    }
+    pub(super) fn accounting_has_owner(&self, id: &str) -> std::io::Result<bool> {
+        self.store.lock().unwrap().accounting_has_owner(id)
+    }
     pub(super) fn restore(&self, id: &str) -> std::io::Result<Session> {
         let store = self.store.lock().unwrap();
         if !store.live("snapshots", id)? {

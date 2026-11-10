@@ -1275,16 +1275,8 @@ fn dashboard_plan(session: &Session) -> Value {
 fn load_dashboard_session(
     service: &Service,
     id: &str,
-    history: &std::io::Result<history::ReadView>,
+    view: &history::ReadView,
 ) -> Result<Session, Failure> {
-    // Without a readable generation, a mirror cannot establish that it is an
-    // explicit checkpoint rather than a shared owner's diagnostic copy.
-    let view = history.as_ref().map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    })?;
     match view.shared(id) {
         Ok(Some(session)) => return recover_success_prefix(service, id, session),
         Err(_) => {
@@ -1333,7 +1325,13 @@ async fn dashboard_transcript(
     if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(failure(StatusCode::BAD_REQUEST, "invalid session id"));
     }
-    let history = history::ReadView::new(&service);
+    // A diagnostic mirror never replaces an unreadable authority generation.
+    let history = history::ReadView::new(&service).map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history index unavailable",
+        )
+    })?;
     let mut session = load_dashboard_session(&service, &id, &history)?;
     let canonical = session
         .history
@@ -1341,10 +1339,7 @@ async fn dashboard_transcript(
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
     if let Some(namespace) = &session.history_namespace
-        && let Some(record) = history
-            .as_ref()
-            .ok()
-            .and_then(|view| view.advice(namespace, &canonical))
+        && let Some(record) = history.advice(namespace, &canonical)
     {
         record.apply(&mut session);
     }
@@ -1431,8 +1426,18 @@ async fn dashboard_stats(
     })?;
     let mut sessions = Vec::new();
     let mut unavailable_sessions = 0u64;
-    let mut cost_estimate = crate::proxy_savings::DashboardTotals::default();
-    let history = history::ReadView::new(&service);
+    let history = history::ReadView::new(&service).map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "retained history unavailable",
+        )
+    })?;
+    let mut cost_estimate = history.accounting_totals().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "retained accounting unavailable",
+        )
+    })?;
     for entry in entries {
         let Ok(entry) = entry else {
             unavailable_sessions += 1;
@@ -1462,11 +1467,7 @@ async fn dashboard_stats(
                 .iter()
                 .map(|i| i.value.clone())
                 .collect::<Vec<_>>();
-            if let Some(record) = history
-                .as_ref()
-                .ok()
-                .and_then(|view| view.advice(namespace, &input))
-            {
+            if let Some(record) = history.advice(namespace, &input) {
                 record.apply(&mut session);
             }
         }
@@ -1522,7 +1523,19 @@ async fn dashboard_stats(
             && (session.primary.calls > 0 || session.completed_requests > 0);
         let estimate =
             estimate.dashboard(session.background_review_pending || session.primary_pending);
-        cost_estimate.observe(&estimate);
+        if history.accounting_has_owner(id).map_err(|_| {
+            failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "retained accounting unavailable",
+            )
+        })? {
+            cost_estimate
+                .observe_activity(session.background_review_pending || session.primary_pending);
+        } else {
+            // Explicit file-only checkpoints can predate an indexed numeric
+            // observation. Once published, frozen accounting owns their totals.
+            cost_estimate.observe(&estimate);
+        }
         let updated_at = entry
             .metadata()
             .ok()
@@ -1592,7 +1605,7 @@ async fn dashboard_stats(
         "cost_scenario": crate::proxy_savings::Scenario::default(),
         "cost_estimate_basis": crate::proxy_savings::accounting_basis_label(),
         "cost_estimate_policy": crate::proxy_savings::accounting_policy(),
-        "scope": "checkpoints in this proxy state directory; completed/observed usage only"
+        "scope": "retained latest per-owner cumulative accounting; raw session details have an independent shorter lifetime; completed/observed usage only"
     }))
     .into_response();
     response

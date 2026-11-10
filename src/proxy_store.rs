@@ -669,6 +669,54 @@ impl Store {
             "last_reviewer_dispatch":session.last_reviewer_dispatch
         }), order_at, id)
     }
+    pub(super) fn accounting_has_owner(&self, id: &str) -> std::io::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE kind='accounting' AND owner=?1 AND at>=?2)",
+            params![id, self.at.saturating_sub(self.accounting_age)],
+            |row| row.get(0),
+        ).map_err(error)
+    }
+    pub(super) fn accounting_totals(
+        &self,
+    ) -> std::io::Result<crate::proxy_savings::DashboardTotals> {
+        // Stream one frozen cumulative observation per owner. The SQL owner
+        // index does the population selection on disk, not a process-sized map.
+        // Sequence keys break ties when several paid states share a second.
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT length(r.data),CASE WHEN length(r.data)<=?1 THEN r.data ELSE NULL END
+             FROM records r WHERE r.kind='accounting' AND r.at>=?2
+             AND NOT EXISTS(SELECT 1 FROM records n WHERE n.kind='accounting' AND n.owner=r.owner
+                AND (n.at>r.at OR (n.at=r.at AND n.key>r.key)))",
+            )
+            .map_err(error)?;
+        let mut rows = statement
+            .query(params![
+                self.max_record as u64,
+                self.at.saturating_sub(self.accounting_age)
+            ])
+            .map_err(error)?;
+        let mut totals = crate::proxy_savings::DashboardTotals::default();
+        while let Some(row) = rows.next().map_err(error)? {
+            if row.get::<_, usize>(0).map_err(error)? > self.max_record {
+                return Err(full());
+            }
+            let data: Vec<u8> = row.get(1).map_err(error)?;
+            #[derive(serde::Deserialize)]
+            struct Observation {
+                estimate: Option<crate::proxy_savings::DashboardEstimate>,
+            }
+            let observation: Observation = serde_json::from_slice(&data)?;
+            if let Some(estimate) = observation.estimate {
+                totals.observe(&estimate);
+            } else {
+                totals.excluded_sessions += 1;
+                totals.unavailable_whole_windows(1);
+            }
+        }
+        Ok(totals)
+    }
     pub(super) fn accounting_page(
         &self,
         after_at: u64,
