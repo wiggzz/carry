@@ -388,7 +388,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
     }
     let service = Arc::new(Service {
         catalog: Arc::new(tokio::sync::OnceCell::new()),
-        phase_sink: logging::PhaseSink::new(config.state_dir.clone()),
+        phase_sink: logging::PhaseSink::new(),
         upstream_key,
         classifier_key,
         auth_token,
@@ -4707,7 +4707,7 @@ mod tests {
         config.state_dir = directory.to_path_buf();
         Service {
             catalog: Arc::new(tokio::sync::OnceCell::new()),
-            phase_sink: logging::PhaseSink::new(config.state_dir.clone()),
+            phase_sink: logging::PhaseSink::new(),
             _directory_lock: Arc::new(private_file(&directory.join(".lock"), true).unwrap()),
             config,
             client: reqwest::Client::new(),

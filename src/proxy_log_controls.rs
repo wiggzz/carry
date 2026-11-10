@@ -346,3 +346,117 @@ fn diagnostic_writers_cannot_race_a_held_physical_publication() {
         "writers bypassed held physical owner: {raced:?}"
     );
 }
+
+#[test]
+fn queued_phase_writer_uses_dispatch_policy_without_spending_physical_promises() {
+    let _serial = logging::phase_sink_fault::SERIAL.blocking_lock();
+    for pressured in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.history_max_bytes = 65536;
+        service.config.history_disk_bytes = 8 * 1024 * 1024;
+        let id = pr154_session_id("phase-promise");
+        let mut session = Session {
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Session::default()
+        };
+        numeric_primary(&mut session, 0);
+        session.primary_pending = true;
+        save(&service, &id, &session).unwrap();
+        let pin = history::pin(&service, &id).unwrap();
+        let policy = history::FilePolicy::new(&service.config);
+        if pressured {
+            let publication = policy.acquire().unwrap();
+            let mut low = 0;
+            let mut high = service.config.history_disk_bytes;
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if publication.admit_file(directory.path(), mid).is_ok() {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            File::create(directory.path().join("pressure.bin"))
+                .unwrap()
+                .set_len(low)
+                .unwrap();
+            assert!(publication.admit_file(directory.path(), 0).is_ok());
+        }
+        let (fault, entered) = logging::phase_sink_fault::hold(directory.path());
+        logging::phase_summary(&service, &id, "queued", None, &json!({"count":1}));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        // A queued observation owns its original policy, not whichever service
+        // config would happen to be current when its filesystem writer runs.
+        service.config.history_disk_bytes = if pressured { 16 * 1024 * 1024 } else { 65536 };
+        fault.release();
+        assert!(fault.wait_appended(Duration::from_secs(5)));
+        drop(fault);
+        service.config.history_disk_bytes = 8 * 1024 * 1024;
+        let path = directory
+            .path()
+            .join("diagnostics")
+            .join(format!("{id}.jsonl"));
+        assert_eq!(path.is_file(), !pressured);
+        assert_eq!(
+            directory.path().join("diagnostics").exists(),
+            !pressured,
+            "refused phase must not create an unadmitted directory"
+        );
+        if !pressured {
+            assert_eq!(
+                pr154_journal(directory.path(), &id)[0]["event"],
+                "phase_timing"
+            );
+        }
+        assert!(
+            policy
+                .acquire()
+                .unwrap()
+                .admit_file(directory.path(), 0)
+                .is_ok()
+        );
+        numeric_primary(&mut session, 1);
+        session.primary_pending = false;
+        save_paid_accounting(&service, &id, &session, "phase-promise").unwrap();
+        drop(pin);
+        let restored = load(&checkpoint_service(directory.path()), &id).unwrap();
+        assert_eq!(restored.primary.calls, 2);
+        assert!((restored.primary.cost_usd - 0.004).abs() < 1e-12);
+        assert!(!restored.primary_pending);
+    }
+}
+
+#[test]
+fn queued_phase_writer_waits_for_physical_owner_but_enqueue_does_not() {
+    let _serial = logging::phase_sink_fault::SERIAL.blocking_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    let id = pr154_session_id("phase-publication-race");
+    let (fault, entered) = logging::phase_sink_fault::hold(directory.path());
+    let publication = history::FilePolicy::new(&service.config).acquire().unwrap();
+    logging::phase_summary(&service, &id, "queued", None, &json!({"count":1}));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    fault.release();
+    let raced = fault.wait_appended(Duration::from_millis(500));
+    let wrote_while_held = directory.path().join("diagnostics").exists();
+    drop(publication);
+    assert!(fault.wait_appended(Duration::from_secs(5)));
+    drop(fault);
+    assert!(
+        !raced && !wrote_while_held,
+        "phase worker bypassed held physical owner"
+    );
+    assert_eq!(
+        pr154_journal(directory.path(), &id)[0]["event"],
+        "phase_timing"
+    );
+}
+
+#[test]
+fn diagnostic_maintenance_does_not_create_missing_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = checkpoint_service(directory.path());
+    logging::maintain(&service);
+    assert!(!directory.path().join("diagnostics").exists());
+}

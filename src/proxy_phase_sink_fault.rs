@@ -9,9 +9,21 @@ struct Stall {
     entered: channel::Sender<()>,
     released: StdMutex<bool>,
     wake: Condvar,
+    appended: StdMutex<bool>,
+    finished: Condvar,
 }
 pub(in crate::proxy) struct HeldSink(Arc<Stall>);
 impl HeldSink {
+    pub(in crate::proxy) fn wait_appended(&self, timeout: Duration) -> bool {
+        *self
+            .0
+            .finished
+            .wait_timeout_while(self.0.appended.lock().unwrap(), timeout, |appended| {
+                !*appended
+            })
+            .unwrap()
+            .0
+    }
     pub(in crate::proxy) fn release(&self) {
         *self.0.released.lock().unwrap() = true;
         self.0.wake.notify_all();
@@ -45,6 +57,8 @@ pub(in crate::proxy) fn hold(directory: &Path) -> (HeldSink, channel::Receiver<(
         entered,
         released: StdMutex::new(false),
         wake: Condvar::new(),
+        appended: StdMutex::new(false),
+        finished: Condvar::new(),
     });
     let mut fault = FAULT.lock().unwrap();
     assert!(fault.is_none());
@@ -77,5 +91,13 @@ pub(in crate::proxy) fn before_append(directory: &Path) {
         while !*released {
             released = stall.wake.wait(released).unwrap();
         }
+    }
+}
+
+pub(in crate::proxy) fn after_append(directory: &Path) {
+    let fault = FAULT.lock().unwrap();
+    if let Some(stall) = fault.as_ref().filter(|s| s.directory == directory) {
+        *stall.appended.lock().unwrap() = true;
+        stall.finished.notify_all();
     }
 }

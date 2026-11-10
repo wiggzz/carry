@@ -76,15 +76,7 @@ fn directory_at(state_dir: &Path, raw: bool) -> std::io::Result<PathBuf> {
                 return Err(std::io::Error::other("invalid journal directory"));
             }
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = std::fs::DirBuilder::new();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    builder.mode(0o700);
-                }
-                builder.create(&path)?;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
     }
@@ -155,6 +147,9 @@ pub(super) fn maintain(service: &Service) {
     let Ok(_guard) = LOG_LOCK.lock() else {
         return;
     };
+    let Ok(_publication) = history::FilePolicy::new(&service.config).acquire() else {
+        return;
+    };
     for raw in [false, true] {
         // A default restart leaves old opt-in raw evidence untouched.
         if raw && !service.config.verbose {
@@ -172,6 +167,9 @@ pub(super) fn maintain(service: &Service) {
         };
         let result = (|| -> std::io::Result<()> {
             let directory = directory(service, raw)?;
+            if !directory.try_exists()? {
+                return Ok(());
+            }
             retain(&directory, None, 0, lane, total, dropped)?;
             // Recover legacy/partial files without reading an unbounded line.
             for (path, _, _) in files(&directory)? {
@@ -263,14 +261,33 @@ fn encode(record: &Record<'_>, record_max: usize) -> std::io::Result<Vec<u8>> {
     Ok(bytes.0)
 }
 
-// Caller owns LOG_LOCK. No request owner may call this for a phase summary.
-fn write_record(state_dir: &Path, id: &str, bytes: &[u8], raw: bool) -> std::io::Result<()> {
+// Caller owns LOG_LOCK. Take physical ownership only after that lock, so a
+// stalled log reader cannot stall history publication by proxy. No history IO
+// owner calls logging; request phase summaries only enqueue for this worker.
+fn write_record(
+    policy: &history::FilePolicy,
+    id: &str,
+    bytes: &[u8],
+    raw: bool,
+) -> std::io::Result<()> {
+    let publication = policy.acquire()?;
+    let state_dir = policy.directory();
     let (lane, total, dropped) = if raw {
         (RAW_LANE, RAW_TOTAL, &RAW_DROPPED)
     } else {
         (JOURNAL_LANE, JOURNAL_TOTAL, &JOURNAL_DROPPED)
     };
     let directory = directory_at(state_dir, raw)?;
+    if !directory.try_exists()? {
+        publication.admit_file(state_dir, 4096)?;
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&directory)?;
+    }
     let path = directory.join(format!("{id}.jsonl"));
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if !meta.file_type().is_file() => {
@@ -287,6 +304,10 @@ fn write_record(state_dir: &Path, id: &str, bytes: &[u8], raw: bool) -> std::io:
         total,
         dropped,
     )?;
+    // Also leave room for a new directory entry after lane rotation. The
+    // connected physical footprint and every promise stay locked until append.
+    let entry = if path.try_exists()? { 0 } else { 4096 };
+    publication.admit_file(state_dir, (bytes.len() as u64).saturating_add(entry))?;
     let mut file = private_file(&path, true)?;
     let before = file.metadata()?.len();
     if let Err(error) = file.write_all(bytes) {
@@ -326,7 +347,7 @@ fn append(
             data,
         };
         let bytes = encode(&record, record_max)?;
-        write_record(&service.config.state_dir, id, &bytes, raw)
+        write_record(&history::FilePolicy::new(&service.config), id, &bytes, raw)
     })();
     if result.is_err() {
         dropped.fetch_add(1, Ordering::Relaxed);
@@ -335,34 +356,38 @@ fn append(
 
 // One worker per live Service/directory; clones share its fixed-capacity queue.
 // Start before accepting requests, never lazily in Drop. No teardown join/flush.
-// Queued items retain bounded bytes/opaque IDs only, not Service, keys or locks.
+// Queued items retain bounded bytes/opaque IDs and physical policy only, not
+// Service, provider/auth configuration, or locks.
 const PHASE_QUEUE: usize = 16;
 struct PhaseRecord {
     id: String,
     bytes: Vec<u8>,
+    policy: history::FilePolicy,
 }
 #[derive(Clone)]
 pub(super) struct PhaseSink {
     sender: Option<std::sync::mpsc::SyncSender<PhaseRecord>>,
 }
 impl PhaseSink {
-    pub(super) fn new(state_dir: PathBuf) -> Self {
+    pub(super) fn new() -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<PhaseRecord>(PHASE_QUEUE);
         let worker = std::thread::Builder::new()
             .name("carry-phase-log".into())
             .spawn(move || {
                 while let Ok(record) = receiver.recv() {
                     #[cfg(test)]
-                    phase_sink_fault::before_append(&state_dir);
+                    phase_sink_fault::before_append(record.policy.directory());
                     let result = (|| -> std::io::Result<()> {
                         let _guard = LOG_LOCK
                             .lock()
                             .map_err(|_| std::io::Error::other("log lock poisoned"))?;
-                        write_record(&state_dir, &record.id, &record.bytes, false)
+                        write_record(&record.policy, &record.id, &record.bytes, false)
                     })();
                     if result.is_err() {
                         JOURNAL_DROPPED.fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(test)]
+                    phase_sink_fault::after_append(record.policy.directory());
                 }
             });
         Self {
@@ -398,6 +423,7 @@ pub(super) fn phase_summary(
             .try_send(PhaseRecord {
                 id: id.into(),
                 bytes,
+                policy: history::FilePolicy::new(&service.config),
             })
             .ok()
     })();
