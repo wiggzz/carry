@@ -500,7 +500,8 @@ impl Replay {
             0
         };
         let initialized_now = match self.scenario.initial_compaction(
-            self.result.coverage.primary_responses > 1
+            self.ancestor_primary_history
+                || self.result.coverage.primary_responses > 1
                 || self.result.coverage.prior_untracked_calls > 0,
             traditional,
             protected,

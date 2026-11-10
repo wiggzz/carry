@@ -302,9 +302,12 @@ pub struct RequestEvidence {
     numeric_lost: bool,
     #[serde(skip)]
     archive_access: Option<archive::Access>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison_context: Option<archive::ComparisonContext>,
 }
 #[path = "proxy_evidence_archive.rs"]
 mod archive;
+pub(crate) use archive::ComparisonContext;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum EvidenceFormat {
@@ -331,6 +334,7 @@ impl Default for RequestEvidence {
             numeric_primary_items: None,
             numeric_lost: false,
             archive_access: None,
+            comparison_context: None,
         }
     }
 }
@@ -649,14 +653,28 @@ impl RequestEvidence {
                     .checked_add(prefix.reviewer_attempts)
                     == Some(prior_untracked)
         });
-        replay.prior_untracked(if prefix.is_some() { 0 } else { prior_untracked });
+
         let mut rewrites = RewriteCount {
             prior_unknown: prior_untracked > 0,
             ..Default::default()
         };
         let mut dispatched = false;
         let (mut wire, mut semantic) = (Vec::new(), Vec::new());
-        let mut observe = |observation: &Observation| {
+        let mut observe = |observation: Option<&Observation>, context_complete: bool| {
+            let Some(observation) = observation else {
+                if self.comparison_context.is_some() {
+                    replay.begin_owned_window(context_complete);
+                    rewrites = RewriteCount {
+                        prior_unknown: prior_untracked > 0,
+                        ..Default::default()
+                    };
+                    dispatched = false;
+                    inferred_calls = 0;
+                    inferred_cost = 0.0;
+                }
+                replay.prior_untracked(if prefix.is_some() { 0 } else { prior_untracked });
+                return;
+            };
             match observation {
                 Observation::Dispatch {
                     newly_omitted_members,
@@ -740,14 +758,19 @@ impl RequestEvidence {
                 Observation::Boundary => replay.reset_epoch(),
             }
         };
+        let context_complete = self
+            .scan_comparison_context(|event| observe(Some(event), true))
+            .is_ok();
+        observe(None, context_complete);
         let archive_complete = if infer && self.archive.is_some() {
-            self.scan_numeric(&mut observe).is_ok()
+            self.scan_numeric(|event| observe(Some(event), true))
+                .is_ok()
         } else {
             for observation in &self.observations {
-                observe(observation);
+                observe(Some(observation), true);
             }
             true
-        };
+        } && context_complete;
         let mut estimate = replay.snapshot();
         estimate.rewrites = if archive_complete && !self.numeric_lost {
             rewrites

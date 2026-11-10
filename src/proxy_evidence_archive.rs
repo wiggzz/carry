@@ -33,6 +33,17 @@ fn journal_file(path: &Path, write: bool, create: bool) -> std::io::Result<File>
 const MAX_RECORD: u64 = 512 * 1024;
 const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
+/// Immutable ancestor journal cuts supply comparison context, not owned money.
+/// Sharing cuts avoids copying an ancestor's lifetime journal at every fork.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ComparisonContext {
+    scenario: Scenario,
+    marks: Vec<Watermark>,
+    primary_items: Option<usize>,
+    complete: bool,
+}
+const MAX_CONTEXT_CUTS: usize = 64;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Watermark {
     owner: String,
@@ -247,6 +258,99 @@ fn write_numeric(access: &Access, file: &mut File, bytes: &[u8]) -> std::io::Res
 }
 
 impl RequestEvidence {
+    pub(crate) fn comparison_context(&self) -> ComparisonContext {
+        let mut context = self
+            .comparison_context
+            .clone()
+            .unwrap_or(ComparisonContext {
+                scenario: self.scenario,
+                marks: Vec::new(),
+                primary_items: None,
+                complete: true,
+            });
+        context.complete &= hash(&context.scenario) == hash(&self.scenario)
+            && !self.numeric_lost
+            && self.numeric_pending.is_empty();
+        if let Some(mark) = &self.archive {
+            context.complete &= mark.prior_untracked == 0 && context.marks.len() < MAX_CONTEXT_CUTS;
+            if context.complete {
+                context.marks.push(mark.clone());
+            }
+        } else {
+            context.complete = false;
+        }
+        context.primary_items = self.numeric_primary_items;
+        context
+    }
+
+    pub(crate) fn inherit_comparison_context(
+        &mut self,
+        owner: &str,
+        context: Option<ComparisonContext>,
+    ) {
+        if self
+            .archive_access
+            .as_ref()
+            .is_none_or(|access| access.owner == owner)
+            || self.comparison_context.is_some()
+            || !self.observations.is_empty()
+            || self.prior_untracked > 0
+            || self.archive.is_some()
+            || !self.numeric_pending.is_empty()
+        {
+            return;
+        }
+        let context = context.unwrap_or(ComparisonContext {
+            scenario: self.scenario,
+            marks: Vec::new(),
+            primary_items: None,
+            complete: false,
+        });
+        self.numeric_primary_items = context.primary_items;
+        self.comparison_context = Some(context);
+    }
+
+    pub(super) fn scan_comparison_context(
+        &self,
+        mut observe: impl FnMut(&Observation),
+    ) -> std::io::Result<()> {
+        let Some(context) = &self.comparison_context else {
+            return Ok(());
+        };
+        if !context.complete
+            || hash(&context.scenario) != hash(&self.scenario)
+            || context.marks.is_empty()
+            || context.marks.len() > MAX_CONTEXT_CUTS
+        {
+            return Err(unavailable());
+        }
+        let access = self.archive_access.as_ref().ok_or_else(unavailable)?;
+        let mut owners = std::collections::HashSet::new();
+        for mark in &context.marks {
+            if mark.owner.len() != 64
+                || !mark
+                    .owner
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || mark.owner == access.owner
+                || mark.namespace != access.namespace
+                || mark.prior_untracked != 0
+                || !owners.insert(&mark.owner)
+            {
+                return Err(unavailable());
+            }
+            let ancestor = Access {
+                owner: mark.owner.clone(),
+                ..access.clone()
+            };
+            ancestor.scan(mark, |_, event| {
+                observe(event);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     /// Bind only after the canonical Session/index owner has loaded. Archive
     /// failures never reject core state or ordinary forwarding.
     pub(crate) fn bind_archive(
@@ -604,6 +708,67 @@ mod tests {
             Some("fixture-namespace"),
         );
         result
+    }
+
+    #[test]
+    fn ancestor_cuts_are_immutable_bounded_context_not_owned_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = FilePolicy::fixture(dir.path());
+        let owner = "a".repeat(64);
+        let child_owner = "b".repeat(64);
+        let mut ancestor = RequestEvidence::default();
+        ancestor.bind_archive(&policy, &owner, Some("scope"));
+        primary(&mut ancestor, 0);
+        ancestor.prepare_archive(&policy, &owner, Some("scope"));
+        let cut = ancestor.comparison_context();
+        primary(&mut ancestor, 1);
+        ancestor.prepare_archive(&policy, &owner, Some("scope"));
+
+        let mut child = RequestEvidence::default();
+        child.bind_archive(&policy, &child_owner, Some("scope"));
+        child.inherit_comparison_context(&owner, Some(cut.clone()));
+        let mut count = 0;
+        child.scan_comparison_context(|_| count += 1).unwrap();
+        assert_eq!(
+            count, 1,
+            "later ancestor receipts are outside the immutable cut"
+        );
+        primary(&mut child, 2);
+        child.prepare_archive(&policy, &child_owner, Some("scope"));
+        let serialized = serde_json::to_vec(&child).unwrap();
+        let mut restarted: RequestEvidence = serde_json::from_slice(&serialized).unwrap();
+        restarted.bind_archive(&policy, &child_owner, Some("scope"));
+        let snapshot = restarted.snapshot();
+        assert_eq!(snapshot.coverage.primary_responses, 1);
+        assert!((snapshot.observed_primary_cost.unwrap() - 0.002004).abs() < 1e-12);
+        assert_eq!(snapshot.chronological.unwrap().primary_responses, 1);
+        let before = serde_json::to_vec(&restarted).unwrap();
+        restarted.inherit_comparison_context(&owner, None);
+        assert_eq!(serde_json::to_vec(&restarted).unwrap(), before);
+
+        for bad in 0..7 {
+            let mut invalid = cut.clone();
+            match bad {
+                0 => invalid.complete = false,
+                1 => invalid.marks[0].sha256 = "0".repeat(64),
+                2 => invalid.marks[0].owner = "../escape".into(),
+                3 => invalid.marks[0].namespace = "foreign".into(),
+                4 => invalid.marks = vec![invalid.marks[0].clone(); MAX_CONTEXT_CUTS + 1],
+                5 => invalid.marks.push(invalid.marks[0].clone()),
+                _ => invalid.scenario.context_window += 1,
+            }
+            restarted.comparison_context = Some(invalid);
+            assert!(
+                restarted.scan_comparison_context(|_| {}).is_err(),
+                "negative {bad}"
+            );
+            let snapshot = restarted.snapshot();
+            assert!(!snapshot.priced);
+            assert!(snapshot.archive_unavailable);
+            assert!(snapshot.chronological.is_none());
+            assert_eq!(snapshot.coverage.primary_responses, 1);
+            assert!((snapshot.observed_primary_cost.unwrap() - 0.002004).abs() < 1e-12);
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ use evidence::PrimaryFacts;
 pub use evidence::RequestEvidence;
 #[cfg(test)]
 use evidence::RequestEvidence as Trajectory;
-pub(crate) use evidence::{HistoricalSuccessSeed, SuccessWindow};
+pub(crate) use evidence::{ComparisonContext, HistoricalSuccessSeed, SuccessWindow};
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
@@ -602,6 +602,8 @@ struct Replay {
     #[serde(skip)]
     inferred_continuity: bool,
     priced_primary_responses: u64,
+    #[serde(skip)]
+    ancestor_primary_history: bool,
 }
 /// A terminal observation with money already settled under dispatch-frozen
 /// tariffs. Comparison may forecast another history, never reprice this one.
@@ -645,10 +647,27 @@ impl Default for Replay {
             chronological: false,
             inferred_continuity: false,
             priced_primary_responses: 0,
+            ancestor_primary_history: false,
         }
     }
 }
 impl Replay {
+    /// Keep replayed context/cursors while opening this owner's paid window.
+    /// These values are transient replay state, never another persisted ledger.
+    fn begin_owned_window(&mut self, complete: bool) {
+        self.ancestor_primary_history = self.ancestor_primary_history
+            || self.result.coverage.primary_responses > 0
+            || self.result.coverage.prior_untracked_calls > 0
+            || !complete;
+        self.result = Self::default().result;
+        self.priced_primary_responses = 0;
+        self.available &= complete;
+        if !complete {
+            self.projection_known = false;
+            self.receipts.invalidate();
+        }
+    }
+
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
         estimate.initialization_policy =

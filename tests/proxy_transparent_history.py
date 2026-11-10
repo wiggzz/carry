@@ -948,7 +948,7 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(after["initial_compactions"], before["initial_compactions"])
             self.assertEqual(after["traditional_compactions"], before["traditional_compactions"])
             marginal = after["traditional_cost"] - before["traditional_cost"]
-            self.assertAlmostEqual(marginal, .00210405, places=12,
+            self.assertAlmostEqual(marginal, (21040 * .10 + .50) / 1e6, places=12,
                                    msg="A's 21k summary plus 40 native append; short-tier continuation")
             for arm in ("sibling", "sibling_restart"):
                 with self.subTest(context=kind + "_" + arm):

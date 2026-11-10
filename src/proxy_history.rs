@@ -185,6 +185,8 @@ struct Continuation {
     at: u64,
     submitted: Vec<u64>,
     input: crate::proxy_quantity::InputMeasurements,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison_context: Option<crate::proxy_savings::ComparisonContext>,
 }
 fn hash(value: &impl Serialize) -> String {
     format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
@@ -574,6 +576,10 @@ pub(super) fn hydrate(
             .map_err(read_failure)?;
     let advice = view.advice(namespace, input);
     if let Some(continuation) = continuation {
+        if let Some(evidence) = &mut session.request_evidence {
+            evidence
+                .inherit_comparison_context(&continuation.session, continuation.comparison_context);
+        }
         session.last_submitted_ids = continuation.submitted;
         session.primary_input = continuation.input;
     }
@@ -712,6 +718,10 @@ fn committed_locked(
                 at: now(),
                 submitted: session.last_submitted_ids.clone(),
                 input: session.primary_input.clone(),
+                comparison_context: session
+                    .request_evidence
+                    .as_ref()
+                    .map(|e| e.comparison_context()),
             },
             now(),
             id,
