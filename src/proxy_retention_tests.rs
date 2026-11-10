@@ -60,15 +60,13 @@ fn retention_existing_owner_admission_child() {
     };
     let directory = tempfile::tempdir().unwrap();
     let service = checkpoint_service(directory.path());
-    // Production establishes the durable store at namespace resolution before
-    // either candidate lookup or owner resolution can read it.
-    history::initialize(&service).unwrap();
     let input = vec![json!({"role":"user","content":"retained continuation"})];
     let body = json!({"input":input});
     let (id, pin) = history::resolve(&service, "admission-namespace", &body).unwrap();
     let mut session = Session {
         history_shared: true,
         history_namespace: Some("admission-namespace".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
         ..Session::default()
     };
     session.ingest(&input).unwrap();
