@@ -50,24 +50,26 @@ fn pin_owner(
         ));
     }
     if !pins.contains_key(&key) {
-        storage::maintain(
-            service,
-            pins.keys()
-                .filter(|(dir, _)| dir == &key.0)
-                .map(|(_, id)| id.clone())
-                .collect(),
-        )
-        .map_err(read_failure)?;
-        storage::admit_owner(
-            service,
-            pins.keys().filter(|(dir, _)| dir == &key.0).count() + 1,
-        )
-        .map_err(|_| {
-            failure(
-                StatusCode::INSUFFICIENT_STORAGE,
-                "durable history disk admission refused",
+        let owners = pins.keys().filter(|(dir, _)| dir == &key.0).count() + 1;
+        // A normal pin is read-only: do not expire the authority the caller is
+        // about to protect. Under pressure, maintenance spends its independent
+        // promise before retrying admission, not the new owner's headroom.
+        if storage::admit_owner(service, owners).is_err() {
+            storage::maintain(
+                service,
+                pins.keys()
+                    .filter(|(dir, _)| dir == &key.0)
+                    .map(|(_, id)| id.clone())
+                    .collect(),
             )
-        })?;
+            .map_err(read_failure)?;
+            storage::admit_owner(service, owners).map_err(|_| {
+                failure(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "durable history disk admission refused",
+                )
+            })?;
+        }
     }
     pins.entry(key.clone())
         .or_insert(Owner {

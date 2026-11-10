@@ -772,7 +772,20 @@ impl Store {
             // reclaims a bounded number of freelist pages; active read views
             // may defer reclamation, never force eviction or exceed admission.
             self.connection
-                .execute_batch("PRAGMA busy_timeout=0; PRAGMA incremental_vacuum(8); PRAGMA wal_checkpoint(TRUNCATE);")
+                .busy_timeout(Duration::ZERO)
+                .map_err(error)?;
+            // This pragma yields one row per reclaimed page. execute_batch
+            // steps once, so it would reclaim only one page despite the bound.
+            let mut vacuum = self
+                .connection
+                .prepare("PRAGMA incremental_vacuum(8)")
+                .map_err(error)?;
+            let mut rows = vacuum.query([]).map_err(error)?;
+            while rows.next().map_err(error)?.is_some() {}
+            drop(rows);
+            drop(vacuum);
+            self.connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .map_err(error)
         })();
         self.reserved_bytes.set(reserved);
