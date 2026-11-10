@@ -534,7 +534,8 @@ class TransparentHistory(unittest.TestCase):
         self.assertGreater(len(fixture.reviews),1,"selected projections must not suppress ordinary async review")
 
     def test_completed_advice_survives_two_days_and_more_than_eight_cuts(self):
-        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"retained_{n}")),
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"retained_{n}",
+                input_tokens=60000 if h[1] in _b["input"] else 100)),
             lambda body,n: (200,advice_response({"protected":[],"removable":[2],"memories":[]})))
         proxy = self.proxy(fixture,["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"])
         h = [{"role":"user","content":"goal"},{"role":"assistant","content":"reviewed source " * 6000},
@@ -678,7 +679,8 @@ class TransparentHistory(unittest.TestCase):
             return 200, advice_response({"protected": [], "removable": [2],
                 "memories": [{"source_ids": [2], "text": "EXACT_H_FACT"}]})
 
-        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}")), review)
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}",
+            input_tokens=10000 if history[1] in _b["input"] else 100)), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled"]
         proxy = self.proxy(fixture, options, wait_reviews=False)
@@ -719,6 +721,134 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(state["shadow"]["calls"], 0, "no sibling billed receipt inheritance")
         self.assertEqual(len(fixture.reviews), 1)
 
+
+    def test_late_ancestor_retirement_is_not_hidden_by_descendant_dispatch_after_restart(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        a = [{"role": "user", "content": "LATE_REVOCATION_GOAL"},
+             {"role": "assistant", "content": "LATE_SOURCE " + "payload " * 6000},
+             {"role": "user", "content": "A_REVIEW_CUT"}]
+        def review(body, n):
+            if n == 1:
+                return 200, advice_response({"protected": [], "removable": [2],
+                    "memories": [{"source_ids": [2], "text": "RETIRE_AT_A"}]})
+            self.assertEqual(n, 2)
+            memory = ledger(body)["eligible_memory_ids"][0]
+            held.set()
+            self.assertTrue(release.wait(10), "complete A retirement after descendant dispatch")
+            return 200, advice_response({"protected": [], "removable": [memory], "memories": []})
+        fixture = self.fixture(lambda body, n: (200, completed(response_id=f"late_{n}",
+            input_tokens=10000 if a[1] in body["input"] else 100)), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1", "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(a)[0], 200)
+        self.assertEqual(proxy.advice()["memories"][0]["text"], "RETIRE_AT_A")
+        proxy.wait_reviews = False
+        self.assertEqual(proxy.send(a)[0], 200)
+        self.assertTrue(held.wait(3))
+        d = a + [{"role": "user", "content": "DESCENDANT_BEFORE_RETIREMENT"}]
+        self.assertEqual(proxy.send(d)[0], 200)
+        self.assertNotIn(a[1], fixture.primaries[-1]["input"])
+        self.assertIn("RETIRE_AT_A", json.dumps(fixture.primaries[-1]["input"]),
+                      "descendant must actually publish the old applied selection")
+        release.set()
+        deadline = time.monotonic() + 5
+        while not proxy.reviewers_settled():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(proxy.advice()["memories"], [])
+        self.assertEqual(proxy.advice()["feedback"]["rejected_count"], 0)
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100", "--payoff-requests", "1",
+                                     "--classifier-cache-policy", "disabled"])
+        e = d + [{"role": "user", "content": "AFTER_LATE_RETIREMENT"}]
+        self.assertEqual(proxy.send(e)[0], 200)
+        saved = proxy.checkpoint(e)[1]
+        self.evidence.update(late_ancestor=saved, primaries=fixture.primaries, reviews=fixture.reviews)
+        self.assertEqual(len(fixture.primaries), 4)
+        self.assertEqual(len(fixture.reviews), 2)
+        self.assertEqual(saved["primary"]["calls"], 4)
+        self.assertEqual(saved["shadow"]["calls"], 2)
+        self.assertEqual(saved["primary"]["unavailable_cost_calls"], 0)
+        native_input = sum(10000 if a[1] in body["input"] else 100 for body in fixture.primaries)
+        self.assertAlmostEqual(saved["primary"]["cost_usd"], (native_input * .10 + 4 * .50) / 1e6, places=12)
+        self.assertAlmostEqual(saved["shadow"]["cost_usd"], 2 * (100 * .10 + .50) / 1e6, places=12)
+        self.assertIn(a[1], fixture.primaries[-1]["input"], "current A retirement revokes the old omission")
+        self.assertNotIn("RETIRE_AT_A", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertEqual(proxy.advice()["memories"], [])
+
+    def test_shared_prefix_tracking_boundary_cannot_grant_another_free_initialization(self):
+        """A sibling has fresh money, not a new traditional-history start."""
+        root = self.state
+        outcomes = {}
+        for arm in ("direct", "sibling", "sibling_restart", "fresh"):
+            with self.subTest(arm=arm):
+                self.state = root / ("chronology_" + arm)
+                self.state.mkdir()
+                a = [{"role": "user", "content": "TRACKED_A_GOAL"}]
+                b = a + [{"role": "user", "content": "AUXILIARY_B_ONLY"}]
+                c = a + [{"type": "reasoning", "summary": [],
+                          "encrypted_content": "OPAQUE_C_NATIVE_EXTENT"},
+                         {"role": "user", "content": "FOREGROUND_C"}]
+                receipts = []
+                def primary(body, n):
+                    tokens = 300000 if "FOREGROUND_C" in json.dumps(body) else 120 if body["input"] == b else 100
+                    value = completed([], response_id=f"chronology_{arm}_{n}", input_tokens=tokens)
+                    receipts.append(value)
+                    return 200, value
+                fixture = self.fixture(primary)
+                options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                proxy = self.proxy(fixture, options)
+                if arm != "fresh":
+                    self.assertEqual(proxy.send(a, max_output_tokens=1)[0], 200)
+                    owner_a, _ = proxy.checkpoint(a)
+                if arm.startswith("sibling"):
+                    self.assertEqual(proxy.send(b, max_output_tokens=1)[0], 200)
+                    self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                    if arm == "sibling_restart":
+                        proxy.close()
+                        proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(c, max_output_tokens=1)[0], 200)
+                owner_c, child = proxy.checkpoint(c)
+                states = read_index(self.state / "history.index")["snapshots"]
+                status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                self.assertEqual(status, 200)
+                estimate = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_c.stem)
+                outcomes[arm] = {"child": child, "estimate": estimate,
+                                 "receipts": receipts, "primaries": fixture.primaries}
+                self.evidence["chronology_" + arm] = outcomes[arm]
+                expected_calls = 3 if arm.startswith("sibling") else 1 if arm == "fresh" else 2
+                self.assertEqual(len(fixture.primaries), expected_calls)
+                self.assertEqual(len(receipts), expected_calls)
+                self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                    sum(v["usage"]["input_tokens"] * .10 / 1e6 + .50 / 1e6 for v in receipts), places=12)
+                self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), 0)
+                self.assertEqual(fixture.reviews, [], "no paid reviewer or rescue")
+                self.assertEqual(fixture.primaries[-1]["input"], c, "exact native C wire, no B-only content")
+                if arm.startswith("sibling"):
+                    self.assertNotEqual(owner_a, owner_c)
+                    self.assertEqual(child["primary"]["calls"], 1)
+                    self.assertEqual(child["primary"]["input_tokens"], 300000)
+                    self.assertAlmostEqual(child["primary"]["cost_usd"], .0300005, places=12)
+                    self.assertEqual(child["shadow"]["calls"], 0)
+                print("R8_CHRONOLOGY=" + json.dumps({"arm": arm, "estimate": estimate,
+                    "owner_primary_calls": child["primary"]["calls"], "total_calls": expected_calls}, sort_keys=True), flush=True)
+                proxy.close()
+        self.state = root
+        # Grade only after all four native-money/wire/fresh-start controls ran.
+        self.assertEqual(outcomes["fresh"]["estimate"]["initial_compactions"], 1,
+                         "a genuinely first oversized request still gets its one free start")
+        self.assertEqual(outcomes["direct"]["estimate"]["initial_compactions"], 0)
+        self.assertEqual(outcomes["direct"]["estimate"]["traditional_compactions"], 1)
+        self.assertGreater(outcomes["direct"]["estimate"]["summary_cost"], 0)
+        for arm in ("sibling", "sibling_restart"):
+            with self.subTest(continuity=arm):
+                self.assertEqual(outcomes[arm]["estimate"]["initial_compactions"], 0,
+                    "an internal sibling accounting boundary is not a fresh logical-history start")
+                self.assertEqual(outcomes[arm]["estimate"]["traditional_compactions"], 1)
+                self.assertGreater(outcomes[arm]["estimate"]["summary_cost"], 0)
 
     def test_shared_prefix_preserves_applied_projection_and_native_sizing_after_auxiliary_cancel(self):
         """Real wires/receipts: applied A is not B's current mutable tip."""
@@ -996,7 +1126,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), count)
 
 
-    def seed(self, env=None, review=None, extra=(), history=None, primary_input_tokens=100):
+    def seed(self, env=None, review=None, extra=(), history=None, primary_input_tokens=None):
         history = history or [{"role": "user", "content": "PROTECTED_GOAL"},
                    {"role": "assistant", "content": "RAW_A " + "payload " * 6000},
                    {"role": "user", "content": "A_BOUNDARY"}]
@@ -1005,7 +1135,13 @@ class TransparentHistory(unittest.TestCase):
             return 200, advice_response({"protected": [i for i in ids if i == 1],
                 "removable": [i for i in ids if i != 1],
                 "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
-        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}", input_tokens=primary_input_tokens)), review or default_review)
+        # Native anchors now survive cold branches. The default raw source has
+        # thousands of visible tokens: a 100-token total cannot support its
+        # subtraction. Script a coherent raw/projected pair, preserving explicit
+        # receipt overrides for tests that grade their own exact paid totals.
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}",
+            input_tokens=primary_input_tokens if primary_input_tokens is not None else
+                10000 if history[1] in _b["input"] else 100)), review or default_review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled", *extra]
         proxy = TransparentProxy(self.state, fixture, options, env)

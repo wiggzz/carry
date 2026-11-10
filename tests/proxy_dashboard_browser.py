@@ -182,10 +182,19 @@ class BrowserRetention(unittest.TestCase):
                     if page in [4, 39, 79, 119]:
                         cdp('HeapProfiler.collectGarbage')
                         metrics = cdp('Performance.getMetrics')
-                        report['samples'].append(dict(page=page + 1,
+                        sample = dict(page=page + 1,
                             heap_bytes=next(m['value'] for m in metrics['metrics'] if m['name'] == 'JSHeapUsedSize'),
                             dom=cdp('Memory.getDOMCounters'),
-                            caches=evaluate("({text:transcriptText.size,requests:transcriptRequests.size,rows:document.querySelectorAll('.session').length})")))
+                            caches=evaluate("({text:transcriptText.size,requests:transcriptRequests.size,rows:document.querySelectorAll('.session').length})"))
+                        # Keep the original post-GC population/grader intact.
+                        # Separately locate transient detached nodes: Chrome's
+                        # DOM counter is not just the connected document tree.
+                        sample['connected_nodes'] = evaluate("(()=>{const w=document.createTreeWalker(document,NodeFilter.SHOW_ALL);let n=1;while(w.nextNode())n++;return n})()")
+                        evaluate("new Promise(resolve=>setTimeout(resolve,0))")
+                        cdp('HeapProfiler.collectGarbage')
+                        sample['post_turn_dom'] = cdp('Memory.getDOMCounters')
+                        sample['post_turn_connected_nodes'] = evaluate("(()=>{const w=document.createTreeWalker(document,NodeFilter.SHOW_ALL);let n=1;while(w.nextNode())n++;return n})()")
+                        report['samples'].append(sample)
                     if page < pages - 1:
                         previous = evaluate("document.querySelector('.session').id")
                         # A periodic refresh can disable navigation between
