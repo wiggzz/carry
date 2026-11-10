@@ -50,6 +50,14 @@ fn pin_owner(
         ));
     }
     if !pins.contains_key(&key) {
+        storage::maintain(
+            service,
+            pins.keys()
+                .filter(|(dir, _)| dir == &key.0)
+                .map(|(_, id)| id.clone())
+                .collect(),
+        )
+        .map_err(read_failure)?;
         storage::admit_owner(
             service,
             pins.keys().filter(|(dir, _)| dir == &key.0).count() + 1,

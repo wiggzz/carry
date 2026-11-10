@@ -42,6 +42,13 @@ fn settlement_reserve(max_record: u64) -> u64 {
         .saturating_add(max_record.saturating_mul(2))
         .saturating_add(65536)
 }
+// Maintenance has its own bounded promise. Ordinary writes and paid settlement
+// both leave it intact, so expiry never depends on admitting another owner.
+fn maintenance_reserve(max_record: u64, disk_limit: u64) -> u64 {
+    write_charge(max_record)
+        .saturating_add(65536)
+        .min(disk_limit / 2)
+}
 fn full() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::StorageFull,
@@ -80,8 +87,12 @@ fn free_bytes(directory: &Path) -> std::io::Result<u64> {
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<()> {
-    let reserve =
-        settlement_reserve(service.config.history_max_bytes as u64).saturating_mul(owners as u64);
+    let reserve = settlement_reserve(service.config.history_max_bytes as u64)
+        .saturating_mul(owners as u64)
+        .saturating_add(maintenance_reserve(
+            service.config.history_max_bytes as u64,
+            service.config.history_disk_bytes,
+        ));
     if disk_bytes(&service.config.state_dir, 0)?.saturating_add(reserve)
         > service.config.history_disk_bytes
     {
@@ -92,6 +103,12 @@ pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<(
         return Err(full());
     }
     Ok(())
+}
+pub(super) fn maintain(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
+    if !service.config.state_dir.join("history.index").exists() {
+        return Ok(());
+    }
+    Store::open(service, pins, true)?.maintain()
 }
 pub(super) fn initialize(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     let path = service.config.state_dir.join("history.index");
@@ -412,7 +429,11 @@ impl Store {
             age: service.config.history_max_age_secs,
             reserved_bytes: std::cell::Cell::new(
                 settlement_reserve(service.config.history_max_bytes as u64)
-                    .saturating_mul(pins.len() as u64),
+                    .saturating_mul(pins.len() as u64)
+                    .saturating_add(maintenance_reserve(
+                        service.config.history_max_bytes as u64,
+                        service.config.history_disk_bytes,
+                    )),
             ),
             pins,
             accounting_age: service.config.accounting_max_age_secs,
@@ -680,8 +701,16 @@ impl Store {
             json!({"records":records,"has_more":more,"next":if more{next}else{None},"basis":"immutable cumulative observations; select one observation per owner and time, never sum snapshots", "accounting_retention_secs":self.accounting_age,"raw_history_retention_secs":self.age}),
         )
     }
-    fn expire(&self, kind: &str, cutoff: u64) -> std::io::Result<Vec<String>> {
-        let mut statement=self.connection.prepare("SELECT key,length(data) FROM records WHERE kind=?1 AND at<=?2 AND (?1 IN ('accounting','accounted') OR owner NOT IN (SELECT id FROM pins)) ORDER BY at,key LIMIT 32").map_err(error)?;
+    fn expire(&self, kind: &str, cutoff: u64, budget: &mut u64) -> std::io::Result<Vec<String>> {
+        // Protect ancestry by reachability, not by rewriting its original age.
+        // Live references can point to nodes older than their own publication
+        // (notably a paid-only settlement of an old pinned checkpoint).
+        let mut statement=self.connection.prepare("WITH RECURSIVE ancestry(key) AS (
+            SELECT json_extract(CAST(data AS TEXT),'$.history_frontier') FROM records WHERE kind='snapshots' AND (at>?2 OR owner IN (SELECT id FROM pins))
+            UNION SELECT key FROM records WHERE kind IN ('tips','reviews') AND (at>?2 OR owner IN (SELECT id FROM pins))
+            UNION SELECT json_extract(CAST(data AS TEXT),'$.frontier') FROM records WHERE kind='transcripts' AND (at>?2 OR owner IN (SELECT id FROM pins))
+            UNION SELECT json_extract(CAST(r.data AS TEXT),'$.parent') FROM records r JOIN ancestry a ON r.key=a.key WHERE r.kind='nodes')
+            SELECT key,length(data) FROM records WHERE kind=?1 AND at<=?2 AND (?1 IN ('accounting','accounted') OR owner NOT IN (SELECT id FROM pins)) AND (?1!='nodes' OR key NOT IN (SELECT key FROM ancestry WHERE key IS NOT NULL)) ORDER BY at,key LIMIT 8").map_err(error)?;
         let entries = statement
             .query_map(params![kind, cutoff], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
@@ -691,6 +720,10 @@ impl Store {
             .map_err(error)?;
         let mut keys = Vec::new();
         for (key, bytes) in entries {
+            let charge = write_charge(bytes);
+            if charge > *budget {
+                break;
+            }
             self.charge(bytes)?;
             self.connection
                 .execute(
@@ -698,13 +731,14 @@ impl Store {
                     params![kind, key],
                 )
                 .map_err(error)?;
+            *budget -= charge;
             keys.push(key);
         }
         Ok(keys)
     }
-    fn collect(&self) -> std::io::Result<()> {
+    fn collect(&self, budget: &mut u64) -> std::io::Result<()> {
         self.connection
-            .execute_batch("CREATE TEMP TABLE pins(id TEXT PRIMARY KEY) WITHOUT ROWID;")
+            .execute_batch("CREATE TEMP TABLE IF NOT EXISTS pins(id TEXT PRIMARY KEY) WITHOUT ROWID; DELETE FROM pins;")
             .map_err(error)?;
         for id in &self.pins {
             self.connection
@@ -712,27 +746,40 @@ impl Store {
                 .map_err(error)?;
         }
         if let Some(cutoff) = self.at.checked_sub(self.age) {
-            // Old in-flight owners retain their ancestry until paid settlement.
-            // This walk is only for expired pinned checkpoints, not the corpus.
-            let ancestry="WITH RECURSIVE ancestry(key) AS (
-                SELECT json_extract(CAST(data AS TEXT),'$.history_frontier') FROM records
-                WHERE kind='snapshots' AND at<=?1 AND owner IN (SELECT id FROM pins)
-                UNION SELECT json_extract(CAST(r.data AS TEXT),'$.parent') FROM records r JOIN ancestry a ON r.key=a.key WHERE r.kind='nodes')";
-            let retained:u64=self.connection.query_row(&format!("{ancestry} SELECT coalesce(sum(length(data)),0) FROM records WHERE kind='nodes' AND key IN (SELECT key FROM ancestry)"),[cutoff],|r|r.get(0)).map_err(error)?;
-            if retained > 0 {
-                self.charge(retained)?;
-                self.connection.execute(&format!("{ancestry} UPDATE records SET at=max(at,?2) WHERE kind='nodes' AND key IN (SELECT key FROM ancestry)"),params![cutoff,self.at]).map_err(error)?;
-            }
-            *self.retired.borrow_mut() = self.expire("snapshots", cutoff)?;
-            for kind in ["nodes", "tips", "transcripts", "reviews"] {
-                self.expire(kind, cutoff)?;
+            *self.retired.borrow_mut() = self.expire("snapshots", cutoff, budget)?;
+            for kind in ["tips", "transcripts", "reviews", "nodes"] {
+                self.expire(kind, cutoff, budget)?;
             }
         }
         if let Some(cutoff) = self.at.checked_sub(self.accounting_age) {
-            self.expire("accounting", cutoff)?;
-            self.expire("accounted", cutoff)?;
+            self.expire("accounting", cutoff, budget)?;
+            self.expire("accounted", cutoff, budget)?;
         }
         Ok(())
+    }
+    fn maintain(&self) -> std::io::Result<()> {
+        let allowance = maintenance_reserve(self.max_record as u64, self.disk_limit);
+        let reserved = self.reserved_bytes.get();
+        // Spend maintenance's promise only; every paid owner keeps its full
+        // settlement reserve. Restore the normal reservation even on failure.
+        self.reserved_bytes.set(reserved.saturating_sub(allowance));
+        let result = (|| {
+            self.start()?;
+            let mut budget = allowance.saturating_sub(65536 + write_charge(0));
+            self.collect(&mut budget)?;
+            self.commit()?;
+            // Without TRUNCATE a checkpoint merely recycles the WAL. Vacuum
+            // reclaims a bounded number of freelist pages; active read views
+            // may defer reclamation, never force eviction or exceed admission.
+            self.connection
+                .execute_batch("PRAGMA busy_timeout=0; PRAGMA incremental_vacuum(8); PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(error)
+        })();
+        self.reserved_bytes.set(reserved);
+        self.connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(error)?;
+        result
     }
     pub(super) fn begin_settlement(&self, owner: &str) -> std::io::Result<()> {
         // Only a bounded paid-only publication may use its owner's promise.
@@ -755,12 +802,12 @@ impl Store {
             .map_err(error)
     }
     pub(super) fn begin(&self) -> std::io::Result<()> {
-        self.start()?;
-        self.collect()
+        self.maintain()?;
+        self.start()
     }
     pub(super) fn commit(&self) -> std::io::Result<()> {
         self.connection.execute_batch("COMMIT").map_err(error)?;
-        for id in self.retired.borrow().iter() {
+        for id in self.retired.take() {
             if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
                 let _ = std::fs::remove_file(self.directory.join(format!("{id}.json")));
             }
