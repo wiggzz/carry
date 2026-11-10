@@ -13,6 +13,7 @@ fn dashboard_observed_money_survives_raw_expiry_without_summing_cumulative_snaps
                 State(service),
                 ConnectInfo("127.0.0.1:1".parse().unwrap()),
                 HeaderMap::new(),
+                axum::extract::Query(SessionPage::default()),
             )
             .await
             .unwrap();
@@ -219,6 +220,7 @@ async fn dashboard_failure_only_describes_the_latest_failed_primary() {
             State(service.clone()),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
+            axum::extract::Query(SessionPage::default()),
         )
         .await
         .unwrap();
@@ -366,6 +368,7 @@ async fn dashboard_read_view_preserves_authority_and_reloads_each_poll() {
             State(service.clone()),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
+            axum::extract::Query(SessionPage::default()),
         )
     };
     let response = poll().await.unwrap();
@@ -576,6 +579,7 @@ async fn dashboard_context_states_partition_sources_not_memories() {
         State(service),
         ConnectInfo("127.0.0.1:1".parse().unwrap()),
         HeaderMap::new(),
+        axum::extract::Query(SessionPage::default()),
     )
     .await
     .unwrap();

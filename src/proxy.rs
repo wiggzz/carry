@@ -1416,12 +1416,58 @@ async fn dashboard_accounting(
         .insert("cache-control", "no-store".parse().unwrap());
     Ok(response)
 }
+#[derive(Default, serde::Deserialize)]
+struct SessionPage {
+    #[serde(default)]
+    after_id: String,
+    limit: Option<usize>,
+}
 async fn dashboard_stats(
     State(service): State<Arc<Service>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    axum::extract::Query(page): axum::extract::Query<SessionPage>,
 ) -> Result<Response, Failure> {
     authorize_dashboard(&service, &headers, peer)?;
+    if !page.after_id.is_empty()
+        && (page.after_id.len() != 64 || !page.after_id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(failure(StatusCode::BAD_REQUEST, "invalid session cursor"));
+    }
+    let limit = page.limit.unwrap_or(100).clamp(1, 100);
+    // Select stable owner keys before constructing detailed rows. Keeping only
+    // the smallest limit+1 keys bounds the working set even for an unordered
+    // directory with many retained owners.
+    let mut selected = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&service.config.state_dir)
+        .map_err(|_| {
+            failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "state directory unavailable",
+            )
+        })?
+        .flatten()
+    {
+        let path = entry.path();
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|s| s.to_str()) == Some("json")
+            && id.len() == 64
+            && id.bytes().all(|b| b.is_ascii_hexdigit())
+            && id > page.after_id.as_str()
+        {
+            selected.insert(id.to_owned());
+            if selected.len() > limit + 1 {
+                selected.pop_last();
+            }
+        }
+    }
+    let has_more = selected.len() > limit;
+    if has_more {
+        selected.pop_last();
+    }
+    let next_after = has_more.then(|| selected.last().cloned()).flatten();
     let entries = std::fs::read_dir(&service.config.state_dir).map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1465,53 +1511,6 @@ async fn dashboard_stats(
             unavailable_sessions += 1;
             continue;
         };
-        if let Some(namespace) = &session.history_namespace {
-            let input = session
-                .history
-                .iter()
-                .map(|i| i.value.clone())
-                .collect::<Vec<_>>();
-            if let Some(record) = history
-                .as_ref()
-                .ok()
-                .and_then(|view| view.advice(namespace, &input))
-            {
-                record.apply(&mut session);
-            }
-        }
-        let submitted = session
-            .last_submitted_ids
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let retained = session
-            .history
-            .iter()
-            .filter(|item| submitted.contains(&item.id))
-            .count();
-        // Mutually exclusive source states: omitted in the last dispatch, then
-        // current eligibility/protection among the sources that were submitted.
-        // Memories are additive facts, never part of the source denominator.
-        let groups = session.groups();
-        let removable = groups
-            .iter()
-            .filter(|g| session.drop_authorized(g))
-            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
-            .sum::<usize>();
-        let protected = groups
-            .iter()
-            .filter(|g| {
-                g.pinned
-                    || g.members.iter().any(|id| {
-                        session
-                            .opinions
-                            .get(id)
-                            .is_some_and(|opinion| opinion == "keep")
-                    })
-            })
-            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
-            .sum::<usize>();
-        let planner = dashboard_plan(&session);
         let estimate = session
             .request_evidence
             .as_ref()
@@ -1550,6 +1549,55 @@ async fn dashboard_stats(
             // never restoring stale comparison coverage over a live owner.
             cost_estimate.observe(&estimate);
         }
+        if !selected.contains(id) {
+            continue;
+        }
+        if let Some(namespace) = &session.history_namespace {
+            let input = session
+                .history
+                .iter()
+                .map(|i| i.value.clone())
+                .collect::<Vec<_>>();
+            if let Some(record) = history
+                .as_ref()
+                .ok()
+                .and_then(|view| view.advice(namespace, &input))
+            {
+                record.apply(&mut session);
+            }
+        }
+        let submitted = session
+            .last_submitted_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let retained = session
+            .history
+            .iter()
+            .filter(|item| submitted.contains(&item.id))
+            .count();
+        // Omitted sources, then current eligibility/protection among submitted
+        // sources. Memories are additive, not part of the source denominator.
+        let groups = session.groups();
+        let removable = groups
+            .iter()
+            .filter(|g| session.drop_authorized(g))
+            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
+            .sum::<usize>();
+        let protected = groups
+            .iter()
+            .filter(|g| {
+                g.pinned
+                    || g.members.iter().any(|id| {
+                        session
+                            .opinions
+                            .get(id)
+                            .is_some_and(|opinion| opinion == "keep")
+                    })
+            })
+            .map(|g| g.members.iter().filter(|id| submitted.contains(id)).count())
+            .sum::<usize>();
+        let planner = dashboard_plan(&session);
         let updated_at = entry
             .metadata()
             .ok()
@@ -1586,12 +1634,7 @@ async fn dashboard_stats(
                 "shadow_records": 0}
         }));
     }
-    sessions.sort_by(|a, b| {
-        b["updated_at"]
-            .as_u64()
-            .cmp(&a["updated_at"].as_u64())
-            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-    });
+    sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     cost_estimate.excluded_sessions += unavailable_sessions;
     cost_estimate.unavailable_whole_windows(unavailable_sessions);
     let mut response = axum::Json(json!({
@@ -1615,6 +1658,7 @@ async fn dashboard_stats(
             "provider-implicit"
         },
         "sessions": sessions, "unavailable_sessions": unavailable_sessions,
+        "session_page": {"has_more": has_more, "next_after": next_after},
         "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
         "cost_scenario": crate::proxy_savings::Scenario::default(),
         "cost_estimate_basis": crate::proxy_savings::accounting_basis_label(),
@@ -4936,6 +4980,7 @@ mod tests {
             State(service),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             HeaderMap::new(),
+            axum::extract::Query(SessionPage::default()),
         )
         .await
         .unwrap();
