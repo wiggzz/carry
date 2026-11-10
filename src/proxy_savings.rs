@@ -227,6 +227,15 @@ pub struct DashboardEstimate {
     coverage: Coverage,
 }
 
+impl DashboardEstimate {
+    fn whole_window_incomplete(&self) -> bool {
+        self.whole_window.is_none()
+            && (self.coverage.primary_responses > 0
+                || self.coverage.reviewer_responses > 0
+                || self.coverage.prior_untracked_calls > 0)
+    }
+}
+
 impl Estimate {
     /// Pair the chronological alternative with the same successful observed
     /// population. Strict partial sums stay diagnostic; they cannot impute
@@ -491,11 +500,7 @@ impl DashboardTotals {
         // Sum complete session windows only, with explicit included/excluded
         // coverage. Neither strict partial sums nor all-attempt observed spend
         // may fill an unavailable peer or enter this comparison denominator.
-        if estimate.whole_window.is_none()
-            && (estimate.coverage.primary_responses > 0
-                || estimate.coverage.reviewer_responses > 0
-                || estimate.coverage.prior_untracked_calls > 0)
-        {
+        if estimate.whole_window_incomplete() {
             self.unavailable_whole_windows(1);
         } else if let Some(window) = &estimate.whole_window {
             self.whole_window_included_sessions += 1;
@@ -1519,7 +1524,7 @@ mod whole_window_tests {
         let absent: Estimate = serde_json::from_value(absent).unwrap();
         let missing = absent.dashboard(false);
         assert!(missing.whole_window.is_none());
-        assert!(missing.whole_window_incomplete);
+        assert!(missing.whole_window_incomplete());
         let old = known.dashboard(false);
         let mut total = DashboardTotals::default();
         total.observe(&Estimate::default().dashboard(false));

@@ -1275,8 +1275,15 @@ fn dashboard_plan(session: &Session) -> Value {
 fn load_dashboard_session(
     service: &Service,
     id: &str,
-    view: &history::ReadView,
+    history: &std::io::Result<history::ReadView>,
 ) -> Result<Session, Failure> {
+    // A diagnostic mirror cannot replace an unreadable shared authority.
+    let view = history.as_ref().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history index unavailable",
+        )
+    })?;
     match view.shared(id) {
         Ok(Some(session)) => return recover_success_prefix(service, id, session),
         Err(_) => {
@@ -1325,13 +1332,7 @@ async fn dashboard_transcript(
     if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(failure(StatusCode::BAD_REQUEST, "invalid session id"));
     }
-    // A diagnostic mirror never replaces an unreadable authority generation.
-    let history = history::ReadView::new(&service).map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history index unavailable",
-        )
-    })?;
+    let history = history::ReadView::new(&service);
     let mut session = load_dashboard_session(&service, &id, &history)?;
     let canonical = session
         .history
@@ -1339,7 +1340,10 @@ async fn dashboard_transcript(
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
     if let Some(namespace) = &session.history_namespace
-        && let Some(record) = history.advice(namespace, &canonical)
+        && let Some(record) = history
+            .as_ref()
+            .ok()
+            .and_then(|view| view.advice(namespace, &canonical))
     {
         record.apply(&mut session);
     }
@@ -1426,18 +1430,18 @@ async fn dashboard_stats(
     })?;
     let mut sessions = Vec::new();
     let mut unavailable_sessions = 0u64;
-    let history = history::ReadView::new(&service).map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "retained history unavailable",
-        )
-    })?;
-    let mut cost_estimate = history.accounting_totals().map_err(|_| {
-        failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "retained accounting unavailable",
-        )
-    })?;
+    let history = history::ReadView::new(&service);
+    let mut cost_estimate = match &history {
+        Ok(view) => view.expired_accounting_totals().map_err(|_| {
+            failure(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "retained accounting unavailable",
+            )
+        })?,
+        // Preserve the partial dashboard and per-owner unavailable counts when
+        // the authority cannot be read; never substitute diagnostic mirrors.
+        Err(_) => crate::proxy_savings::DashboardTotals::default(),
+    };
     for entry in entries {
         let Ok(entry) = entry else {
             unavailable_sessions += 1;
@@ -1467,7 +1471,11 @@ async fn dashboard_stats(
                 .iter()
                 .map(|i| i.value.clone())
                 .collect::<Vec<_>>();
-            if let Some(record) = history.advice(namespace, &input) {
+            if let Some(record) = history
+                .as_ref()
+                .ok()
+                .and_then(|view| view.advice(namespace, &input))
+            {
                 record.apply(&mut session);
             }
         }
@@ -1523,17 +1531,23 @@ async fn dashboard_stats(
             && (session.primary.calls > 0 || session.completed_requests > 0);
         let estimate =
             estimate.dashboard(session.background_review_pending || session.primary_pending);
-        if history.accounting_has_owner(id).map_err(|_| {
-            failure(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "retained accounting unavailable",
-            )
-        })? {
+        if history
+            .as_ref()
+            .unwrap()
+            .expired_accounting_has_owner(id)
+            .map_err(|_| {
+                failure(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "retained accounting unavailable",
+                )
+            })?
+        {
             cost_estimate
                 .observe_activity(session.background_review_pending || session.primary_pending);
         } else {
-            // Explicit file-only checkpoints can predate an indexed numeric
-            // observation. Once published, frozen accounting owns their totals.
+            // Current authoritative numeric coverage owns a live window. The
+            // frozen independent projection takes over only after raw expiry,
+            // never restoring stale comparison coverage over a live owner.
             cost_estimate.observe(&estimate);
         }
         let updated_at = entry
