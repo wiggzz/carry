@@ -1,5 +1,125 @@
 // Retention promises cannot be overridden by the continuation working-set cap.
 #[test]
+fn retention_unreadable_newest_advice_never_resurrects_older_permission() {
+    for oversized in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        let mut subject = semantic_subject();
+        subject.review_epoch = 10;
+        history::publish(&service, &subject, &subject).unwrap();
+        let mut input = subject.render_primary();
+        subject
+            .ingest(&[json!({"role":"user","content":"newer cut"})])
+            .unwrap();
+        subject.review_epoch = 11;
+        history::publish(&service, &subject, &subject).unwrap();
+        input.push(json!({"role":"user","content":"newer cut"}));
+        assert_eq!(
+            history::advice(&service, "fixture-owner", &input)
+                .unwrap()
+                .unwrap()
+                .generation,
+            11
+        );
+        let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
+        let newest: String = db.query_row("SELECT key FROM records WHERE kind='reviews' ORDER BY json_extract(CAST(data AS TEXT),'$.generation') DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        if oversized {
+            let length: u64 = db
+                .query_row(
+                    "SELECT length(data) FROM records WHERE kind='reviews' AND key=?1",
+                    [&newest],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            service.config.history_max_bytes = length - 1;
+        } else {
+            db.execute(
+                "UPDATE records SET data=?1 WHERE kind='reviews' AND key=?2",
+                rusqlite::params![b"corrupt".as_slice(), newest],
+            )
+            .unwrap();
+        }
+        let advice = history::advice(&service, "fixture-owner", &input);
+        assert!(
+            !advice.as_ref().is_ok_and(|r| r.is_some()),
+            "unreadable newest authority must not resurrect generation 10: {advice:?}"
+        );
+    }
+}
+
+#[test]
+fn retention_oversized_existing_owner_is_backpressure_not_a_cold_miss() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    let input = vec![json!({"role":"user","content":"retained owner"})];
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("oversized-owner".into()),
+        ..Session::default()
+    };
+    session.ingest(&input).unwrap();
+    history::committed(&service, "original-owner", &session, None).unwrap();
+    let body = json!({"input":input});
+    let (owner, pin) = history::resolve(&service, "oversized-owner", &body).unwrap();
+    assert_eq!(owner, "original-owner");
+    drop(pin);
+    let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
+    let length: u64 = db
+        .query_row(
+            "SELECT length(data) FROM records WHERE kind='snapshots'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    service.config.history_max_bytes = length - 1;
+    match history::resolve(&service, "oversized-owner", &body) {
+        Err(error) => assert_eq!(error.0, StatusCode::INSUFFICIENT_STORAGE),
+        Ok((owner, _)) => panic!("oversized retained owner silently resolved as {owner}"),
+    }
+}
+
+#[test]
+fn retention_existing_unversioned_sqlite_is_rejected_without_initialization() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.index");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES('preserve');",
+    )
+    .unwrap();
+    drop(db);
+    let original = std::fs::read(&path).unwrap();
+    let service = checkpoint_service(directory.path());
+    assert!(
+        history::ReadView::new(&service).is_err(),
+        "a nominal authority read initialized an unsupported database"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn retention_invalid_predecessor_record_types_preserve_original_authority() {
+    for kind in ["nodes", "tips", "reviews", "transcripts", "upstream_cache"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.index");
+        let mut index = json!({"format":"carry-prefix-history-v4", "nodes":{}, "tips":{}, "reviews":{}, "transcripts":{}, "snapshots":{}, "upstream_cache":[]});
+        if kind == "upstream_cache" {
+            index[kind] = json!({"invalid":"cache"});
+        } else {
+            index[kind]["invalid-record"] = json!({"unexpected":true});
+        }
+        let original = serde_json::to_vec(&index).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let service = checkpoint_service(directory.path());
+        assert!(
+            history::initialize(&service).is_err(),
+            "invalid {kind} replaced predecessor authority"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[test]
 fn retention_predecessor_import_preserves_money_bindings_and_rejects_capacity_atomically() {
     at_decision_clock(&[5_000_000], || {
         let directory = tempfile::tempdir().unwrap();
