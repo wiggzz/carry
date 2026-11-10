@@ -177,18 +177,118 @@ async fn dashboard_session_pages_keep_population_money_independent_of_raw_page()
         }
         assert_eq!(stats["session_page"]["has_more"], page_number < 3);
         if page_number < 3 {
-            after = stats["session_page"]["next_after"].as_str().unwrap().to_owned();
+            after = stats["session_page"]["next_after"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             assert_eq!(Some(&after), seen.last());
         } else {
             assert!(stats["session_page"]["next_after"].is_null());
         }
     }
     server.abort();
-    assert_eq!(seen, ids, "stable keyset pages cover every retained owner once");
+    assert_eq!(
+        seen, ids,
+        "stable keyset pages cover every retained owner once"
+    );
     assert_eq!(
         history::accounting(&service, 0, "", 100).unwrap()["records"],
         frozen,
         "paging cannot mutate frozen paid money or accounting provenance"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_population_money_does_not_require_decoding_off_page_raw_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let ids = (0..3).map(|n| format!("{n:064x}")).collect::<Vec<_>>();
+    let poll = |service: Arc<Service>| async move {
+        let response = dashboard_stats(
+            State(service),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            axum::extract::Query(SessionPage {
+                after_id: String::new(),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()
+    };
+    let frozen;
+    {
+        let service = Arc::new(checkpoint_service(directory.path()));
+        for (n, id) in ids.iter().enumerate() {
+            let mut session = Session {
+                history_shared: true,
+                history_namespace: Some(format!("off-page-raw-{id}")),
+                request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+                ..Session::default()
+            };
+            let input = (0..if n == 2 { 12 } else { 1 })
+                .map(|item| json!({"role":"user","content":format!("retained owner {n} source {item}")}))
+                .collect::<Vec<_>>();
+            session.ingest(&input).unwrap();
+            numeric_primary(&mut session, 0);
+            save(&service, id, &session).unwrap();
+            let restored = history::restore(&service, id).unwrap();
+            assert_eq!(restored.history.len(), input.len());
+            assert_eq!(restored.primary.calls, 1);
+            assert!((restored.primary.cost_usd - 0.002).abs() < 1e-12);
+        }
+        frozen = history::accounting(&service, 0, "", 100).unwrap()["records"].clone();
+        assert_eq!(frozen.as_array().unwrap().len(), 3);
+        let stats = poll(service).await;
+        assert!(
+            stats["cost_estimate"]["observed_primary_cost"]
+                .as_f64()
+                .is_some_and(|money| (money - 0.006).abs() < 1e-12)
+        );
+        assert_eq!(stats["unavailable_sessions"], 0);
+    }
+    // Reopen with a tighter raw-ancestry working set, not a changed retention
+    // age or disk cap. The off-page owner's paid numeric record still fits.
+    let mut bounded = checkpoint_service(directory.path());
+    bounded.config.history_max_nodes = 2;
+    let service = Arc::new(bounded);
+    for id in &ids[..2] {
+        let restored = history::restore(&service, id).unwrap();
+        assert_eq!(restored.history.len(), 1);
+        assert_eq!(restored.primary.calls, 1);
+        assert!((restored.primary.cost_usd - 0.002).abs() < 1e-12);
+    }
+    assert!(
+        history::restore(&service, &ids[2]).is_err(),
+        "oversized raw authority is backpressure, not a new or expired owner"
+    );
+    assert_eq!(
+        history::accounting(&service, 0, "", 100).unwrap()["records"],
+        frozen
+    );
+    let stats = poll(service.clone()).await;
+    let rows = stats["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], ids[0]);
+    assert_eq!(rows[1]["id"], ids[1]);
+    assert_eq!(stats["session_page"]["has_more"], true);
+    assert_eq!(
+        history::accounting(&service, 0, "", 100).unwrap()["records"],
+        frozen,
+        "dashboard reads cannot rewrite the frozen paid/provenance observations"
+    );
+    assert!(
+        stats["cost_estimate"]["observed_primary_cost"]
+            .as_f64()
+            .is_some_and(|money| (money - 0.006).abs() < 1e-12),
+        "population native money must not require off-page raw ancestry to fit the working set: {stats}"
+    );
+    assert_eq!(
+        stats["unavailable_sessions"], 0,
+        "off-page raw backpressure is not a failed detailed row on this page"
     );
 }
 
@@ -321,8 +421,10 @@ fn dashboard_counts_reuse_equivalent_prompts_without_repricing_receipts() {
     assert_eq!(equivalent.0.len(), 2);
     crate::prompt_quantity::reset_token_work();
     let dispatched = dispatch_measurement("request", "primary", &base);
-    assert_eq!(dispatched.outgoing_input_tokens, None,
-        "constructing telemetry must not eagerly count a prompt");
+    assert_eq!(
+        dispatched.outgoing_input_tokens, None,
+        "constructing telemetry must not eagerly count a prompt"
+    );
     assert_eq!(crate::prompt_quantity::token_work(), (0, 0));
     assert_eq!(
         dispatched.receipt_input_tokens, None,
@@ -441,7 +543,10 @@ fn dashboard_read_view_rechecks_expiry_pins_and_capacity_without_writing() {
     let pin = history::pin(&service, &ids[0]).unwrap();
     let bounded = history::ReadView::new(&service).unwrap();
     assert!(bounded.shared(&ids[0]).unwrap().is_some());
-    assert!(bounded.shared(&ids[1]).unwrap().is_some(), "a working-set cap cannot expire an unrelated retained owner");
+    assert!(
+        bounded.shared(&ids[1]).unwrap().is_some(),
+        "a working-set cap cannot expire an unrelated retained owner"
+    );
     assert_eq!(history::fixture::read_index(&path), original);
     drop(pin);
 }
