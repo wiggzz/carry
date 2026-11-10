@@ -292,6 +292,106 @@ async fn dashboard_population_money_does_not_require_decoding_off_page_raw_histo
     );
 }
 
+#[test]
+fn dashboard_all_attempt_lane_totals_survive_paging_restart_and_raw_expiry() {
+    let directory = tempfile::tempdir().unwrap();
+    let start = 20_000_000;
+    let ids = [format!("{:064x}", 911), format!("{:064x}", 912)];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let poll = |service: Arc<Service>| {
+        runtime.block_on(async {
+            let response = dashboard_stats(
+                State(service),
+                ConnectInfo("127.0.0.1:1".parse().unwrap()),
+                HeaderMap::new(),
+                axum::extract::Query(SessionPage {
+                    after_id: String::new(),
+                    limit: Some(1),
+                }),
+            )
+            .await
+            .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        })
+    };
+    let mut frozen = Value::Null;
+    let mut stats = Vec::new();
+    at_decision_clock(&[start], || {
+        let service = checkpoint_service(directory.path());
+        for (n, id) in ids.iter().enumerate() {
+            let mut session = Session {
+                history_shared: true,
+                history_namespace: Some(format!("all-attempt-dashboard-{id}")),
+                request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+                ..Session::default()
+            };
+            session
+                .ingest(&[json!({"role":"user","content":"private retained source"})])
+                .unwrap();
+            let usage = json!({"input_tokens":1000,"output_tokens":0,
+                "input_tokens_details":{"cached_tokens":0}});
+            // Numeric receipt-owner seam: one known and one unavailable
+            // reviewer contribution; neither is inferred from primary coverage.
+            session.shadow.observe_with_rates(
+                "gpt-6.1-sol",
+                &usage,
+                true,
+                if n == 0 {
+                    receipt_rates("gpt-6.1-sol", &usage, None, true)
+                } else {
+                    None
+                },
+            );
+            for turn in 0..if n == 0 { 2 } else { 1 } {
+                numeric_primary(&mut session, turn);
+                save(&service, id, &session).unwrap();
+            }
+            let restored = history::restore(&service, id).unwrap();
+            assert_eq!(restored.primary.calls, if n == 0 { 2 } else { 1 });
+            assert_eq!(restored.shadow.calls, 1);
+            assert_eq!(restored.shadow.unavailable_cost_calls, n as u64);
+            assert!((restored.shadow.cost_usd - if n == 0 { 0.002 } else { 0.0 }).abs() < 1e-12);
+        }
+        frozen = history::accounting(&service, 0, "", 100).unwrap()["records"].clone();
+        assert_eq!(frozen.as_array().unwrap().len(), 3);
+        drop(service);
+        let live = poll(Arc::new(checkpoint_service(directory.path())));
+        assert_eq!(live["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(live["session_page"]["has_more"], true);
+        stats.push(live);
+    });
+    at_decision_clock(&[start + 120 * 86400], || {
+        let service = Arc::new(checkpoint_service(directory.path()));
+        let expired = poll(service.clone());
+        assert!(expired["sessions"].as_array().unwrap().is_empty());
+        assert_eq!(
+            history::accounting(&service, 0, "", 100).unwrap()["records"],
+            frozen
+        );
+        stats.push(expired);
+    });
+    // Qualify both phases and frozen history before the new projection grader.
+    for (phase, report) in ["live bounded page", "expired raw after restart"]
+        .iter()
+        .zip(stats)
+    {
+        assert_eq!(report["usage"]["primary"]["calls"], 3, "{phase}: {report}");
+        assert_eq!(report["usage"]["primary"]["input_tokens"], 3000);
+        assert_eq!(report["usage"]["primary"]["unavailable_cost_calls"], 0);
+        assert!((report["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 0.006).abs() < 1e-12);
+        assert_eq!(report["usage"]["reviewer"]["calls"], 2);
+        assert_eq!(report["usage"]["reviewer"]["input_tokens"], 2000);
+        assert_eq!(report["usage"]["reviewer"]["unavailable_cost_calls"], 1);
+        assert!((report["usage"]["reviewer"]["cost_usd"].as_f64().unwrap() - 0.002).abs() < 1e-12);
+    }
+}
+
 #[tokio::test]
 async fn dashboard_failure_only_describes_the_latest_failed_primary() {
     let directory = tempfile::tempdir().unwrap();
