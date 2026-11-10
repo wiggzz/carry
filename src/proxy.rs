@@ -1581,18 +1581,18 @@ async fn dashboard_stats(
             }
         }
     }
-    let has_more = selected.len() > limit;
+    let mut has_more = selected.len() > limit;
     if has_more {
         selected.pop_last();
     }
-    let next_after = has_more.then(|| selected.last().cloned()).flatten();
+    let mut next_after = has_more.then(|| selected.last().cloned()).flatten();
     let entries = std::fs::read_dir(&service.config.state_dir).map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,
             "state directory unavailable",
         )
     })?;
-    let mut sessions = Vec::new();
+    let mut details = Vec::new();
     let mut unavailable_sessions = 0u64;
     let mut unavailable_accounting = 0u64;
     let history = history::ReadView::new(&service);
@@ -1663,9 +1663,60 @@ async fn dashboard_stats(
                     )
                 })?;
         }
-        if !selected.contains(id) {
-            continue;
+        if selected.contains(id) {
+            details.push(entry);
         }
+    }
+    cost_estimate.excluded_sessions += unavailable_accounting;
+    cost_estimate.unavailable_whole_windows(unavailable_accounting);
+    usage.unavailable_owners = unavailable_accounting;
+    let mut data = json!({
+        "cost_estimate": cost_estimate,
+        "usage": usage,
+        "mode": format!("{:?}", service.config.mode).to_lowercase(),
+        "auth": if service.config.codex_login { "codex" } else { "api-key" },
+        "classifier_model": service.config.classifier_model,
+        "background_reviews": true,
+        "classifier_effort": service.config.classifier_reasoning_effort,
+        "classifier_cache_policy": match service.config.classifier_cache_policy {
+            ClassifierCachePolicy::Auto => "auto",
+            ClassifierCachePolicy::Disabled => "disabled",
+            ClassifierCachePolicy::OpenaiExplicit => "openai-explicit",
+        },
+        "classifier_explicit_cache": classifier_cache_enabled(&service.config).unwrap_or(false),
+        "reviewer_cache_mode": if service.config.codex_login && service.config.classifier_url.is_none() {
+            "codex-implicit"
+        } else if classifier_cache_enabled(&service.config).unwrap_or(false) {
+            "openai-explicit"
+        } else {
+            "provider-implicit"
+        },
+        "sessions": [], "unavailable_sessions": u64::MAX,
+        // Reserve the largest final cursor/count encoding before adding rows.
+        "session_page": {"has_more": false, "next_after": "0".repeat(64)},
+        "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
+        "cost_scenario": crate::proxy_savings::Scenario::default(),
+        "cost_estimate_basis": crate::proxy_savings::accounting_basis_label(),
+        "cost_estimate_policy": crate::proxy_savings::accounting_policy(),
+        "scope": "retained latest per-owner cumulative accounting; raw session details have an independent shorter lifetime; completed/observed usage only"
+    });
+    // One response shares the history working-set bound, with a fixed upper
+    // ceiling even when individual histories are configured to be much larger.
+    // Account for the full envelope, not just raw row bytes. Materialize rows
+    // in cursor order and stop before retaining an over-budget next row.
+    let max_bytes = (service.config.history_max_bytes as usize).min(1024 * 1024);
+    let mut page_bytes = serde_json::to_vec(&data).unwrap().len();
+    if page_bytes > max_bytes {
+        return Err(failure(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "dashboard page exceeds working-set bound",
+        ));
+    }
+    details.sort_by_key(|entry| entry.file_name());
+    let mut sessions: Vec<Value> = Vec::new();
+    for entry in details {
+        let path = entry.path();
+        let id = path.file_stem().and_then(|s| s.to_str()).unwrap();
         let Ok(mut session) = load_dashboard_session(&service, id, &history) else {
             unavailable_sessions += 1;
             continue;
@@ -1735,7 +1786,7 @@ async fn dashboard_stats(
             .get(id)
             .and_then(Weak::upgrade)
             .is_some_and(|lock| lock.try_lock().is_err());
-        sessions.push(json!({
+        let row = json!({
             "updated_at": updated_at, "processing": processing,
             "last_failure": dashboard_current_failure(&session), "planner": planner,
             "id": id, "title": session.title(), "primary": session.primary, "shadow": session.shadow,
@@ -1756,42 +1807,29 @@ async fn dashboard_stats(
                 "removed_items": session.history.len() - retained,
                 "retained_input_bytes": serde_json::to_vec(&session.render_primary()).unwrap().len(),
                 "shadow_records": 0}
-        }));
+        });
+        let bytes = serde_json::to_vec(&row).unwrap().len() + 1;
+        if page_bytes.saturating_add(bytes) > max_bytes {
+            if sessions.is_empty() {
+                return Err(failure(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "dashboard row exceeds working-set bound",
+                ));
+            }
+            has_more = true;
+            next_after = sessions
+                .last()
+                .and_then(|row| row["id"].as_str())
+                .map(str::to_owned);
+            break;
+        }
+        page_bytes += bytes;
+        sessions.push(row);
     }
-    sessions.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    cost_estimate.excluded_sessions += unavailable_accounting;
-    cost_estimate.unavailable_whole_windows(unavailable_accounting);
-    usage.unavailable_owners = unavailable_accounting;
-    let mut response = axum::Json(json!({
-        "cost_estimate": cost_estimate,
-        "usage": usage,
-        "mode": format!("{:?}", service.config.mode).to_lowercase(),
-        "auth": if service.config.codex_login { "codex" } else { "api-key" },
-        "classifier_model": service.config.classifier_model,
-        "background_reviews": true,
-        "classifier_effort": service.config.classifier_reasoning_effort,
-        "classifier_cache_policy": match service.config.classifier_cache_policy {
-            ClassifierCachePolicy::Auto => "auto",
-            ClassifierCachePolicy::Disabled => "disabled",
-            ClassifierCachePolicy::OpenaiExplicit => "openai-explicit",
-        },
-        "classifier_explicit_cache": classifier_cache_enabled(&service.config).unwrap_or(false),
-        "reviewer_cache_mode": if service.config.codex_login && service.config.classifier_url.is_none() {
-            "codex-implicit"
-        } else if classifier_cache_enabled(&service.config).unwrap_or(false) {
-            "openai-explicit"
-        } else {
-            "provider-implicit"
-        },
-        "sessions": sessions, "unavailable_sessions": unavailable_sessions,
-        "session_page": {"has_more": has_more, "next_after": next_after},
-        "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
-        "cost_scenario": crate::proxy_savings::Scenario::default(),
-        "cost_estimate_basis": crate::proxy_savings::accounting_basis_label(),
-        "cost_estimate_policy": crate::proxy_savings::accounting_policy(),
-        "scope": "retained latest per-owner cumulative accounting; raw session details have an independent shorter lifetime; completed/observed usage only"
-    }))
-    .into_response();
+    data["sessions"] = json!(sessions);
+    data["unavailable_sessions"] = json!(unavailable_sessions);
+    data["session_page"] = json!({"has_more":has_more,"next_after":next_after});
+    let mut response = axum::Json(data).into_response();
     response
         .headers_mut()
         .insert("cache-control", "no-store".parse().unwrap());
