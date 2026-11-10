@@ -31,7 +31,7 @@ fn retention_unreadable_newest_advice_never_resurrects_older_permission() {
                     |r| r.get(0),
                 )
                 .unwrap();
-            service.config.history_max_bytes = length - 1;
+            service.config.history_max_bytes = u32::try_from(length - 1).unwrap();
         } else {
             db.execute(
                 "UPDATE records SET data=?1 WHERE kind='reviews' AND key=?2",
@@ -71,7 +71,7 @@ fn retention_oversized_existing_owner_is_backpressure_not_a_cold_miss() {
             |r| r.get(0),
         )
         .unwrap();
-    service.config.history_max_bytes = length - 1;
+    service.config.history_max_bytes = u32::try_from(length - 1).unwrap();
     match history::resolve(&service, "oversized-owner", &body) {
         Err(error) => assert_eq!(error.0, StatusCode::INSUFFICIENT_STORAGE),
         Ok((owner, _)) => panic!("oversized retained owner silently resolved as {owner}"),
@@ -117,6 +117,21 @@ fn retention_invalid_predecessor_record_types_preserve_original_authority() {
         );
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
+}
+
+#[test]
+fn retention_dangling_predecessor_frontier_preserves_original_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.index");
+    let index = json!({"format":"carry-prefix-history-v4", "nodes":{}, "tips":{ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {"session":"explicit-owner", "namespace":"observed-v1:fixture", "at":5_000_000}}, "reviews":{}, "transcripts":{}, "snapshots":{}, "upstream_cache":[]});
+    let original = serde_json::to_vec(&index).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    let service = checkpoint_service(directory.path());
+    assert!(
+        history::initialize(&service).is_err(),
+        "dangling typed frontier replaced predecessor authority"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
 #[test]
