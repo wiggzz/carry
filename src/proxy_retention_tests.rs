@@ -1366,6 +1366,11 @@ fn numeric_file_admission_control(fork: bool) {
     session
         .ingest(&[json!({"role":"user","content":"frozen numeric source"})])
         .unwrap();
+    session.request_evidence.as_mut().unwrap().bind_archive(
+        directory.path(),
+        id,
+        session.history_namespace.as_deref(),
+    );
     numeric_primary(&mut session, 0);
     let pin = history::pin(&service, id).unwrap();
     save(&service, id, &session).unwrap();
