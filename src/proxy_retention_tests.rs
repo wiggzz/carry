@@ -494,7 +494,11 @@ async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store
     let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let directory = tempfile::tempdir().unwrap();
     let mut service = checkpoint_service(directory.path());
-    service.config.mode = Mode::Off;
+    // Off mode intentionally uses a non-shared checkpoint and cannot qualify
+    // shared-owner settlement. Audit preserves the canonical wire and owner;
+    // the explicit floor suppresses review without leaving that lifecycle.
+    service.config.mode = Mode::Audit;
+    service.config.review_min_primary_tokens = 1_000_000;
     service.config.upstream_url = url;
     service.config.history_max_bytes = 65536;
     service.config.history_max_nodes = 512;
@@ -557,6 +561,14 @@ async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store
         );
         let pending = history::restore(&service, &id).unwrap();
         assert_eq!(pending.render_primary(), input);
+        assert!(
+            pending.history_shared,
+            "real request must retain the seeded shared owner"
+        );
+        assert_eq!(
+            pending.history_namespace.as_deref(),
+            Some(namespace.as_str())
+        );
         assert!(pending.primary_pending);
         assert_eq!(pending.primary.calls, 0);
         assert_eq!(pending.shadow.calls, 0);
@@ -622,7 +634,7 @@ async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store
         );
         assert_eq!(
             durable.shadow.calls, 0,
-            "off mode must not dispatch reviewers"
+            "audit admission floor must not dispatch reviewers"
         );
         let mut resume = json!({"input":[],"previous_response_id":response["id"]});
         assert!(
