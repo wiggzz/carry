@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from proxy_state_regressions import Fixture
 from proxy_transparent_history import TransparentProxy
+from proxy_retention_window import NativeFailureWindow
 
 
 class RetainedAccounting(unittest.TestCase):

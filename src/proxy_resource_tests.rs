@@ -187,7 +187,7 @@ fn retention_many_owner_resource_child() {
             let reopened = reopen();
             let began = std::time::Instant::now();
             let report = if query_window {
-                history::accounting_window(&reopened, start, start + 30 * 86400).unwrap()
+                history::accounting_window(&reopened, start - 1, start + 30 * 86400).unwrap()
             } else {
                 runtime.block_on(async {
                     let response = dashboard_stats(
