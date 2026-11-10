@@ -18,6 +18,8 @@ pub(super) fn error(e: rusqlite::Error) -> std::io::Error {
 pub(super) struct Store {
     pub(super) connection: Connection,
     max_record: usize,
+    physical_record_bound: u64,
+    publish_record_bound: bool,
     max_nodes: usize,
     at: u64,
     age: u64,
@@ -54,11 +56,11 @@ fn settlement_reserve(max_record: u64) -> u64 {
 }
 // Maintenance has its own bounded promise. Ordinary writes and paid settlement
 // both leave it intact, so expiry never depends on admitting another owner.
-fn maintenance_reserve(max_record: u64, disk_limit: u64) -> u64 {
+fn maintenance_reserve(physical_record_bound: u64, disk_limit: u64) -> u64 {
     // Keep the transaction's startup charge separate from the complete charge
     // of one deletion. Otherwise the largest admitted rows never fit, even in
     // an empty batch, and the oldest such row permanently blocks collection.
-    write_charge(max_record)
+    write_charge(physical_record_bound)
         .saturating_add(65536 + write_charge(0))
         .min(disk_limit / 2)
 }
@@ -105,11 +107,11 @@ pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<(
     // admitting against the closed footprint can spend maintenance's promise
     // before the next publication opens its connection. Keep this view alive
     // through the physical measurement, without modifying retained authority.
-    let _view = Store::open(service, HashSet::new(), false)?;
+    let view = Store::open(service, HashSet::new(), false)?;
     let reserve = settlement_reserve(service.config.history_max_bytes as u64)
         .saturating_mul(owners as u64)
         .saturating_add(maintenance_reserve(
-            service.config.history_max_bytes as u64,
+            view.physical_record_bound,
             service.config.history_disk_bytes,
         ));
     if disk_bytes(&service.config.state_dir, 0)?.saturating_add(reserve)
@@ -450,9 +452,39 @@ impl Store {
                 .pragma_update(None, "max_page_count", pages)
                 .map_err(error)?;
         }
+        // Physical maintenance promises survive a lower decode bound. Persist
+        // this scalar with successful publications; existing stores bootstrap
+        // from lengths once, without decoding their payloads. Normal opens use
+        // the primary-key lookup rather than rescanning the retained corpus.
+        let stored_bound: Option<Option<Vec<u8>>> = connection.query_row(
+            "SELECT CASE WHEN length(data)<=20 THEN data ELSE NULL END FROM records WHERE kind='metadata' AND key='physical_record_bound'",
+            [], |row| row.get(0),
+        ).optional().map_err(error)?;
+        let recorded = match stored_bound {
+            Some(bytes) => Some(serde_json::from_slice::<u64>(&bytes.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid physical record bound",
+                )
+            })?)?),
+            None => None,
+        };
+        let retained_bound = match recorded {
+            Some(bound) => bound,
+            None => connection
+                .query_row(
+                    "SELECT coalesce(max(length(data)),0) FROM records",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .map_err(error)?,
+        };
+        let physical_record_bound = retained_bound.max(service.config.history_max_bytes as u64);
         Ok(Self {
             connection,
             max_record: service.config.history_max_bytes as usize,
+            physical_record_bound,
+            publish_record_bound: recorded != Some(physical_record_bound),
             max_nodes: service.config.history_max_nodes as usize,
             at: now(),
             age: service.config.history_max_age_secs,
@@ -460,7 +492,7 @@ impl Store {
                 settlement_reserve(service.config.history_max_bytes as u64)
                     .saturating_mul(pins.len() as u64)
                     .saturating_add(maintenance_reserve(
-                        service.config.history_max_bytes as u64,
+                        physical_record_bound,
                         service.config.history_disk_bytes,
                     )),
             ),
@@ -943,7 +975,7 @@ impl Store {
         Ok(changed)
     }
     fn maintain(&self) -> std::io::Result<bool> {
-        let allowance = maintenance_reserve(self.max_record as u64, self.disk_limit);
+        let allowance = maintenance_reserve(self.physical_record_bound, self.disk_limit);
         let reserved = self.reserved_bytes.get();
         // Spend maintenance's promise only; every paid owner keeps its full
         // settlement reserve. Restore the normal reservation even on failure.
@@ -1005,6 +1037,15 @@ impl Store {
         self.maintain().map(|_| ())
     }
     pub(super) fn commit(&self) -> std::io::Result<()> {
+        if self.publish_record_bound {
+            self.put(
+                "metadata",
+                "physical_record_bound",
+                &self.physical_record_bound,
+                0,
+                "",
+            )?;
+        }
         let demand = self
             .pending
             .borrow()

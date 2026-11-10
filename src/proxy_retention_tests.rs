@@ -1023,6 +1023,15 @@ fn retention_expired_near_limit_records_recover_without_a_cap_increase() {
 
 #[test]
 fn retention_expiry_deletes_old_physical_rows_after_lowering_decode_bound() {
+    lowered_decode_expiry_control(true);
+}
+
+#[test]
+fn retention_existing_store_bootstraps_physical_bound_without_decoding_old_rows() {
+    lowered_decode_expiry_control(false);
+}
+
+fn lowered_decode_expiry_control(has_bound: bool) {
     let directory = tempfile::tempdir().unwrap();
     let mut service = checkpoint_service(directory.path());
     service.config.history_max_bytes = 65536;
@@ -1072,6 +1081,17 @@ fn retention_expiry_deletes_old_physical_rows_after_lowering_decode_bound() {
         .unwrap()
     };
     assert!(raw_exists(), "qualify a real legal near-limit physical row");
+    if !has_bound {
+        // A supported store written before the scalar existed must derive the
+        // physical promise from SQL lengths, not try to decode the large row.
+        rusqlite::Connection::open(directory.path().join("history.index"))
+            .unwrap()
+            .execute(
+                "DELETE FROM records WHERE kind='metadata' AND key='physical_record_bound'",
+                [],
+            )
+            .unwrap();
+    }
     service.config.history_max_bytes = 8192;
     let mut small = Session {
         history_shared: true,
