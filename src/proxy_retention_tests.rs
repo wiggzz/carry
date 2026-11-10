@@ -1,50 +1,54 @@
 // Retention promises cannot be overridden by the continuation working-set cap.
 #[test]
 fn retention_unreadable_newest_advice_never_resurrects_older_permission() {
-    for oversized in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut service = checkpoint_service(directory.path());
-        let mut subject = semantic_subject();
-        subject.review_epoch = 10;
-        history::publish(&service, &subject, &subject).unwrap();
-        let mut input = subject.render_primary();
-        subject
-            .ingest(&[json!({"role":"user","content":"newer cut"})])
-            .unwrap();
-        subject.review_epoch = 11;
-        history::publish(&service, &subject, &subject).unwrap();
-        input.push(json!({"role":"user","content":"newer cut"}));
-        assert_eq!(
-            history::advice(&service, "fixture-owner", &input)
-                .unwrap()
-                .unwrap()
-                .generation,
-            11
-        );
-        let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
-        let newest: String = db.query_row("SELECT key FROM records WHERE kind='reviews' ORDER BY json_extract(CAST(data AS TEXT),'$.generation') DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-        if oversized {
-            let length: u64 = db
-                .query_row(
-                    "SELECT length(data) FROM records WHERE kind='reviews' AND key=?1",
-                    [&newest],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            service.config.history_max_bytes = u32::try_from(length - 1).unwrap();
-        } else {
-            db.execute(
-                "UPDATE records SET data=?1 WHERE kind='reviews' AND key=?2",
-                rusqlite::params![b"corrupt".as_slice(), newest],
+    unreadable_advice_control(false);
+}
+#[test]
+fn retention_oversized_newest_advice_never_resurrects_older_permission() {
+    unreadable_advice_control(true);
+}
+fn unreadable_advice_control(oversized: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    let mut subject = semantic_subject();
+    subject.review_epoch = 10;
+    history::publish(&service, &subject, &subject).unwrap();
+    let mut input = subject.render_primary();
+    input.push(json!({"role":"user","content":"newer cut"}));
+    subject.ingest(&input).unwrap();
+    subject.review_epoch = 11;
+    subject.review_feedback = json!({"padding":"x".repeat(1024)});
+    history::publish(&service, &subject, &subject).unwrap();
+    assert_eq!(
+        history::advice(&service, "fixture-owner", &input)
+            .unwrap()
+            .unwrap()
+            .generation,
+        11
+    );
+    let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
+    let newest: String = db.query_row("SELECT key FROM records WHERE kind='reviews' ORDER BY json_extract(CAST(data AS TEXT),'$.generation') DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    if oversized {
+        let length: u64 = db
+            .query_row(
+                "SELECT length(data) FROM records WHERE kind='reviews' AND key=?1",
+                [&newest],
+                |r| r.get(0),
             )
             .unwrap();
-        }
-        let advice = history::advice(&service, "fixture-owner", &input);
-        assert!(
-            !advice.as_ref().is_ok_and(|r| r.is_some()),
-            "unreadable newest authority must not resurrect generation 10: {advice:?}"
-        );
+        service.config.history_max_bytes = u32::try_from(length - 1).unwrap();
+    } else {
+        db.execute(
+            "UPDATE records SET data=?1 WHERE kind='reviews' AND key=?2",
+            rusqlite::params![b"corrupt".as_slice(), newest],
+        )
+        .unwrap();
     }
+    let advice = history::advice(&service, "fixture-owner", &input);
+    assert!(
+        !advice.as_ref().is_ok_and(|r| r.is_some()),
+        "unreadable newest authority must not resurrect generation 10: {advice:?}"
+    );
 }
 
 #[test]
