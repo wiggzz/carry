@@ -774,7 +774,8 @@ class TransparentHistory(unittest.TestCase):
         native_input = sum(10000 if a[1] in body["input"] else 100 for body in fixture.primaries)
         self.assertAlmostEqual(saved["primary"]["cost_usd"], (native_input * .10 + 4 * .50) / 1e6, places=12)
         self.assertAlmostEqual(saved["shadow"]["cost_usd"], 2 * (100 * .10 + .50) / 1e6, places=12)
-        self.assertIn(a[1], fixture.primaries[-1]["input"], "current A retirement revokes the old omission")
+        self.assertNotIn(a[1], fixture.primaries[-1]["input"],
+                         "retiring a fact does not revoke independent source-drop authority")
         self.assertNotIn("RETIRE_AT_A", json.dumps(fixture.primaries[-1]["input"]))
         self.assertEqual(proxy.advice()["memories"], [])
 
@@ -822,8 +823,13 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(len(fixture.primaries), expected_calls)
                 self.assertEqual(len(receipts), expected_calls)
                 self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                # The 300k native receipt crosses gpt-6-luna's 272k
+                # long-context tariff: both input and output rates change.
                 self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
-                    sum(v["usage"]["input_tokens"] * .10 / 1e6 + .50 / 1e6 for v in receipts), places=12)
+                    sum((v["usage"]["input_tokens"] * .20 + .75) / 1e6
+                        if v["usage"]["input_tokens"] > 272000 else
+                        (v["usage"]["input_tokens"] * .10 + .50) / 1e6
+                        for v in receipts), places=12)
                 self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), 0)
                 self.assertEqual(fixture.reviews, [], "no paid reviewer or rescue")
                 self.assertEqual(fixture.primaries[-1]["input"], c, "exact native C wire, no B-only content")
@@ -831,13 +837,17 @@ class TransparentHistory(unittest.TestCase):
                     self.assertNotEqual(owner_a, owner_c)
                     self.assertEqual(child["primary"]["calls"], 1)
                     self.assertEqual(child["primary"]["input_tokens"], 300000)
-                    self.assertAlmostEqual(child["primary"]["cost_usd"], .0300005, places=12)
+                    self.assertAlmostEqual(child["primary"]["cost_usd"], .06000075, places=12)
                     self.assertEqual(child["shadow"]["calls"], 0)
+                outcomes[arm]["native_controls_passed"] = True
                 print("R8_CHRONOLOGY=" + json.dumps({"arm": arm, "estimate": estimate,
                     "owner_primary_calls": child["primary"]["calls"], "total_calls": expected_calls}, sort_keys=True), flush=True)
                 proxy.close()
         self.state = root
         # Grade only after all four native-money/wire/fresh-start controls ran.
+        self.assertEqual(set(outcomes), {"direct", "sibling", "sibling_restart", "fresh"})
+        self.assertTrue(all(row.get("native_controls_passed", False) for row in outcomes.values()),
+                        "a failed native control cannot qualify chronological semantics")
         self.assertEqual(outcomes["fresh"]["estimate"]["initial_compactions"], 1,
                          "a genuinely first oversized request still gets its one free start")
         self.assertEqual(outcomes["direct"]["estimate"]["initial_compactions"], 0)
@@ -1126,7 +1136,8 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), count)
 
 
-    def seed(self, env=None, review=None, extra=(), history=None, primary_input_tokens=None):
+    def seed(self, env=None, review=None, extra=(), history=None, primary_input_tokens=None,
+             raw_input_tokens=10000):
         history = history or [{"role": "user", "content": "PROTECTED_GOAL"},
                    {"role": "assistant", "content": "RAW_A " + "payload " * 6000},
                    {"role": "user", "content": "A_BOUNDARY"}]
@@ -1141,7 +1152,7 @@ class TransparentHistory(unittest.TestCase):
         # receipt overrides for tests that grade their own exact paid totals.
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}",
             input_tokens=primary_input_tokens if primary_input_tokens is not None else
-                10000 if history[1] in _b["input"] else 100)), review or default_review)
+                raw_input_tokens if history[1] in _b["input"] else 100)), review or default_review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled", *extra]
         proxy = TransparentProxy(self.state, fixture, options, env)
@@ -1854,7 +1865,10 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(fixture.primaries[-1]["input"], sent)
 
     def test_real_primary_overflow_never_dispatches_recovery(self):
-        proxy, fixture, history, options = self.seed()
+        # Keep the synthetic native remainder below the tested 1024-token
+        # capacity after removing the ~6000 visible source tokens. The generic
+        # 10k raw seed leaves ~4k and is not a fitting-child precondition.
+        proxy, fixture, history, options = self.seed(raw_input_tokens=6200)
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "CAPACITY_PARENT"}])[0], 200)
         proxy.close()
         options += ["--primary-context-tokens", "1024", "--primary-output-reserve-tokens", "1",

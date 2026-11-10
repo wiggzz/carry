@@ -239,6 +239,12 @@ class BrowserRetention(unittest.TestCase):
                 self.assertLessEqual(report['heap_growth_bytes'], 16 * 1024 * 1024)
                 self.assertTrue(all(s['caches'] == dict(text=2, requests=2, rows=2) for s in samples))
                 self.assertLessEqual(samples[-1]['dom']['nodes'], samples[0]['dom']['nodes'] + 100)
+                # In addition to the original terminal/first-GC bound, every
+                # sampled connected tree and post-event-turn GC must be bounded.
+                self.assertTrue(all(s['connected_nodes'] <= samples[0]['connected_nodes'] + 100
+                                    for s in samples))
+                self.assertTrue(all(s['post_turn_dom']['nodes'] <= samples[0]['post_turn_dom']['nodes'] + 100
+                                    for s in samples))
                 months = [r for r in report['requests'] if '/accounting?' in r['path']]
                 self.assertEqual(len(months), 2)
                 start = int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp()) - 1
