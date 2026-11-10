@@ -2388,26 +2388,12 @@ async fn forward_timed(
         session.review_context = cache_base(&body);
         session.upstream_cache = history::cache(&service)
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "cache index unavailable"))?;
-        // This is the only semantic lookup. Owner checkpoints have no selection
-        // authority, even after a previous request omitted this exact H.
-        session.opinions.clear();
-        session.completed_review_len = 0;
-        session.drop_members.clear();
-        session.memories.clear();
-        session.memory_anchors.clear();
-        if let Some(namespace) = &session.history_namespace
-            && let Some(record) =
-                history::advice(&service, namespace, body["input"].as_array().unwrap()).map_err(
-                    |_| {
-                        failure(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "advice index unavailable",
-                        )
-                    },
-                )?
-        {
-            record.apply(&mut session);
-        }
+        // One branch-qualified lookup owns advice and prior dispatch evidence.
+        // Paid-owner tips are indexes, never authority for a sibling's selection.
+        history::hydrate(&service, &mut session, &body)?;
+        session
+            .primary_input
+            .use_text_memo(&service.text_quantities);
         let active = !native && service.config.mode != Mode::Off;
         if active {
             outbound["input"] = json!(session.render_primary());

@@ -7,7 +7,7 @@ import json
 import sqlite3
 from contextlib import closing
 
-KINDS = ('nodes', 'tips', 'reviews', 'transcripts', 'snapshots')
+KINDS = ('nodes', 'tips', 'reviews', 'transcripts', 'snapshots', 'dispatches')
 
 
 def read_index(path):
@@ -35,8 +35,8 @@ def write_index(path, index):
         db.execute('CREATE INDEX IF NOT EXISTS records_age ON records(kind,at)')
         db.execute('CREATE INDEX IF NOT EXISTS records_owner ON records(kind,owner)')
         db.execute('PRAGMA user_version=1')
-        db.execute("DELETE FROM records WHERE kind IN ('nodes','tips','reviews','transcripts','snapshots','upstream_cache')")
-        at = max((r.get('at', 0) for k in ('tips', 'transcripts', 'reviews')
+        db.execute("DELETE FROM records WHERE kind IN ('nodes','tips','reviews','transcripts','snapshots','dispatches','upstream_cache')")
+        at = max((r.get('at', 0) for k in ('tips', 'transcripts', 'reviews', 'dispatches')
                   for r in index.get(k, {}).values()), default=0)
         owner_ages = {r['session']: r['at'] for r in index.get('tips', {}).values()}
         for kind in KINDS:

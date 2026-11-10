@@ -1006,7 +1006,7 @@ impl Store {
         // (notably a paid-only settlement of an old pinned checkpoint).
         let mut statement=self.connection.prepare("WITH RECURSIVE ancestry(key) AS (
             SELECT json_extract(CAST(data AS TEXT),'$.history_frontier') FROM records WHERE kind='snapshots' AND (at>?2 OR owner IN (SELECT id FROM pins))
-            UNION SELECT key FROM records WHERE kind IN ('tips','reviews') AND (at>?2 OR owner IN (SELECT id FROM pins))
+            UNION SELECT key FROM records WHERE kind IN ('tips','reviews','dispatches') AND (at>?2 OR owner IN (SELECT id FROM pins))
             UNION SELECT json_extract(CAST(data AS TEXT),'$.frontier') FROM records WHERE kind='transcripts' AND (at>?2 OR owner IN (SELECT id FROM pins))
             UNION SELECT key FROM publication_roots
             UNION SELECT json_extract(CAST(r.data AS TEXT),'$.parent') FROM records r JOIN ancestry a ON r.key=a.key WHERE r.kind='nodes')
@@ -1055,7 +1055,7 @@ impl Store {
         if let Some(cutoff) = self.at.checked_sub(self.age) {
             *self.retired.borrow_mut() = self.expire("snapshots", cutoff, budget)?;
             changed |= !self.retired.borrow().is_empty();
-            for kind in ["tips", "transcripts", "reviews", "nodes"] {
+            for kind in ["tips", "transcripts", "reviews", "dispatches", "nodes"] {
                 changed |= !self.expire(kind, cutoff, budget)?.is_empty();
             }
         }

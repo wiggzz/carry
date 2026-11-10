@@ -176,6 +176,16 @@ struct Transcript {
     session: String,
     at: u64,
 }
+/// Branch-qualified request evidence, never semantic removal permission or paid
+/// ownership. Advice and actual dispatch have independent completion clocks;
+/// copying advice to every dispatch cut would hide a later ancestor revocation.
+#[derive(Serialize, Deserialize)]
+struct Continuation {
+    session: String,
+    at: u64,
+    submitted: Vec<u64>,
+    input: crate::proxy_quantity::InputMeasurements,
+}
 fn hash(value: &impl Serialize) -> String {
     format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
 }
@@ -517,24 +527,60 @@ impl ReadView {
     }
     pub(super) fn advice(&self, namespace: &str, input: &[Value]) -> Option<semantic::Record> {
         let store = self.store.lock().unwrap();
-        // Presence of the newest applicable cut is a revocation barrier. Only
-        // absence/expiry permits looking at an older cut; unreadable authority
-        // (including a lowered decode bound) never revives older permission.
-        for key in path(namespace, input).iter().rev() {
-            match store.live("reviews", key) {
-                Ok(false) => continue,
-                Ok(true) => {
-                    return store
-                        .get::<semantic::Record>("reviews", key)
-                        .ok()
-                        .flatten()
-                        .filter(|r| r.policy.as_deref() == Some(self.policy.as_str()));
-                }
-                Err(_) => return None,
-            }
-        }
-        None
+        prefix_record::<semantic::Record>(&store, "reviews", namespace, input)
+            .ok()
+            .flatten()
+            .filter(|r| r.policy.as_deref() == Some(self.policy.as_str()))
     }
+}
+fn prefix_record<T: serde::de::DeserializeOwned>(
+    store: &Store,
+    kind: &str,
+    namespace: &str,
+    input: &[Value],
+) -> std::io::Result<Option<T>> {
+    // Presence of the newest applicable cut is a revocation barrier. Only
+    // absence/expiry permits looking at an older cut; unreadable authority
+    // (including a lowered decode bound) never revives older permission.
+    for key in path(namespace, input).iter().rev() {
+        if store.live(kind, key)? {
+            return store.get(kind, key);
+        }
+    }
+    Ok(None)
+}
+/// Hydrate both independent facts from one frozen branch view. The planner must
+/// reauthorize the prior dispatch against current advice/cohort/protection, and
+/// InputMeasurements still checks its own model/route/settings/opaque contract.
+pub(super) fn hydrate(
+    service: &Service,
+    session: &mut Session,
+    body: &Value,
+) -> Result<(), Failure> {
+    session.opinions.clear();
+    session.completed_review_len = 0;
+    session.drop_members.clear();
+    session.memories.clear();
+    session.memory_anchors.clear();
+    let Some(namespace) = session.history_namespace.as_deref() else {
+        return Ok(());
+    };
+    // Only review-mode array histories have a namespace. Off-mode forwarding
+    // still accepts non-array provider input without consulting shared state.
+    let input = body["input"].as_array().unwrap();
+    let view = ReadView::new(service).map_err(read_failure)?;
+    let continuation =
+        prefix_record::<Continuation>(&view.store.lock().unwrap(), "dispatches", namespace, input)
+            .map_err(read_failure)?;
+    let advice = view.advice(namespace, input);
+    if let Some(continuation) = continuation {
+        session.last_submitted_ids = continuation.submitted;
+        session.primary_input = continuation.input;
+    }
+    if let Some(advice) = advice {
+        advice.apply(session);
+    }
+    Ok(())
 }
 /// Publish captured paid facts against existing authority without replaying its
 /// ancestry, transcript bindings or advice. The caller constructs this Session
@@ -598,6 +644,7 @@ fn committed_locked(
         .map(|i| i.value.clone())
         .collect::<Vec<_>>();
     let keys = store.insert(namespace, &input)?;
+    let canonical_key = keys.last().unwrap_or(namespace).clone();
     let observed_keys = if let Some((input, _)) = observation {
         store.insert(namespace, input)?
     } else {
@@ -656,8 +703,23 @@ fn committed_locked(
     if session.history_shared {
         store.put("snapshots", id, &compact(session), now(), id)?;
     }
+    if observation.is_some() {
+        store.put(
+            "dispatches",
+            &canonical_key,
+            &Continuation {
+                session: id.into(),
+                at: now(),
+                submitted: session.last_submitted_ids.clone(),
+                input: session.primary_input.clone(),
+            },
+            now(),
+            id,
+        )?;
+    }
     store.commit()
 }
+#[cfg(test)]
 pub(super) fn advice(
     service: &Service,
     namespace: &str,

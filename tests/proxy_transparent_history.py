@@ -865,6 +865,9 @@ class TransparentHistory(unittest.TestCase):
                 # Complete money/wire/isolation guards before the reported seam.
                 self.assertNotIn(a[1], sent, "shared A's applied projection/native sizing must survive B's sole-tip advance")
                 self.assertIn("R8_A_FACT", json.dumps(sent))
+                self.assertEqual(child["last_plan"]["baseline_omitted_members"], [2])
+                self.assertIsNotNone(child["last_plan"]["primary_input_basis"],
+                                     "the reauthorized continuation retains compatible A quantities")
                 proxy.close()
         self.state = root
 
