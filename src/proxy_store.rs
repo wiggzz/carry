@@ -97,6 +97,34 @@ fn maintenance_reserve(physical_record_bound: u64, disk_limit: u64) -> u64 {
         .saturating_add(65536 + write_charge(0))
         .min(disk_limit / 2)
 }
+fn protected_bytes(max_record: u64, physical_bound: u64, owners: usize, disk_limit: u64) -> u64 {
+    settlement_reserve(max_record)
+        .saturating_mul(owners as u64)
+        .saturating_add(maintenance_reserve(physical_bound, disk_limit))
+}
+fn admit_extent(
+    directory: &Path,
+    disk_limit: u64,
+    reserved: u64,
+    additional: u64,
+) -> std::io::Result<()> {
+    if disk_bytes(directory, 0)?
+        .saturating_add(additional)
+        .saturating_add(reserved)
+        > disk_limit
+    {
+        return Err(full());
+    }
+    #[cfg(unix)]
+    if free_bytes(directory)?
+        < additional
+            .saturating_add(reserved)
+            .saturating_add(16 * 1024 * 1024)
+    {
+        return Err(full());
+    }
+    Ok(())
+}
 fn full() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::StorageFull,
@@ -141,22 +169,18 @@ pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<(
     // before the next publication opens its connection. Keep this view alive
     // through the physical measurement, without modifying retained authority.
     let view = Store::open(service, HashSet::new(), false)?;
-    let reserve = settlement_reserve(service.config.history_max_bytes as u64)
-        .saturating_mul(owners as u64)
-        .saturating_add(maintenance_reserve(
-            view.physical_record_bound,
-            service.config.history_disk_bytes,
-        ));
-    if disk_bytes(&service.config.state_dir, 0)?.saturating_add(reserve)
-        > service.config.history_disk_bytes
-    {
-        return Err(full());
-    }
-    #[cfg(unix)]
-    if free_bytes(&service.config.state_dir)? < reserve.saturating_add(16 * 1024 * 1024) {
-        return Err(full());
-    }
-    Ok(())
+    let reserve = protected_bytes(
+        service.config.history_max_bytes as u64,
+        view.physical_record_bound,
+        owners,
+        service.config.history_disk_bytes,
+    );
+    admit_extent(
+        &service.config.state_dir,
+        service.config.history_disk_bytes,
+        reserve,
+        0,
+    )
 }
 pub(super) fn maintain(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     if !service.config.state_dir.join("history.index").exists() {
@@ -404,23 +428,12 @@ impl Store {
         // External files consume exact new bytes, not SQL page/WAL charges.
         // Keep the connected footprint and the very same paid/maintenance
         // promises used by transaction admission until the writer is finished.
-        let reserved = self.reserved_bytes.get();
-        if disk_bytes(&self.directory, 0)?
-            .saturating_add(additional)
-            .saturating_add(reserved)
-            > self.disk_limit
-        {
-            return Err(full());
-        }
-        #[cfg(unix)]
-        if free_bytes(&self.directory)?
-            < additional
-                .saturating_add(reserved)
-                .saturating_add(16 * 1024 * 1024)
-        {
-            return Err(full());
-        }
-        Ok(())
+        admit_extent(
+            &self.directory,
+            self.disk_limit,
+            self.reserved_bytes.get(),
+            additional,
+        )
     }
     fn charge(&self, bytes: u64) -> std::io::Result<()> {
         // Reserve index/overflow pages and WAL copies before SQLite can spill.
@@ -480,6 +493,20 @@ impl Store {
             Err(e) => return Err(e),
         };
         if !exists && write {
+            // The first connection also writes authority: reserve its complete
+            // bounded main/WAL/SHM extent before even creating a target. Import
+            // staging uses this same path and cannot borrow paid promises.
+            admit_extent(
+                &policy.directory,
+                policy.disk_limit,
+                protected_bytes(
+                    policy.max_record as u64,
+                    policy.max_record as u64,
+                    pins.len(),
+                    policy.disk_limit,
+                ),
+                write_charge(16 * 4096),
+            )?;
             drop(private_file(path, false)?);
         }
         let connection = if exists && !write {
@@ -504,10 +531,13 @@ impl Store {
             ));
         }
         if version == 0 {
-            connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; CREATE TABLE records(kind TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;
+            // Bound schema creation itself, not just its preflight estimate.
+            // One transaction limits WAL frames to the new sixteen-page store;
+            // normal publication receives the configured page limit below.
+            connection.execute_batch("PRAGMA page_size=4096; PRAGMA max_page_count=16; PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; BEGIN IMMEDIATE; CREATE TABLE records(kind TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;
                 CREATE INDEX records_age ON records(kind,at);
                 CREATE INDEX records_owner ON records(kind,owner);
-                PRAGMA user_version=1;").map_err(error)?;
+                PRAGMA user_version=1; COMMIT;").map_err(error)?;
         }
         if write {
             let pages = (policy.disk_limit / 4096).max(16);
@@ -551,14 +581,12 @@ impl Store {
             max_nodes: policy.max_nodes,
             at: now(),
             age: policy.age,
-            reserved_bytes: std::cell::Cell::new(
-                settlement_reserve(policy.max_record as u64)
-                    .saturating_mul(pins.len() as u64)
-                    .saturating_add(maintenance_reserve(
-                        physical_record_bound,
-                        policy.disk_limit,
-                    )),
-            ),
+            reserved_bytes: std::cell::Cell::new(protected_bytes(
+                policy.max_record as u64,
+                physical_record_bound,
+                pins.len(),
+                policy.disk_limit,
+            )),
             pins,
             accounting_age: policy.accounting_age,
             directory: policy.directory.clone(),
@@ -1180,6 +1208,45 @@ mod initialization_admission_tests {
     #[test]
     fn import_staging_schema_refuses_before_crossing_physical_capacity() {
         schema_capacity_control(true);
+    }
+
+    #[test]
+    fn admitted_schema_reopens_without_rewriting_authority() {
+        for staging in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut policy = Policy::fixture(directory.path());
+            policy.max_record = 8192;
+            policy.disk_limit = 2 * 1024 * 1024;
+            let path = directory.path().join(if staging {
+                ".history-import.tmp"
+            } else {
+                "history.index"
+            });
+            let store = Store::open_path(&policy, HashSet::new(), true, &path).unwrap();
+            let pages: u64 = store
+                .connection
+                .pragma_query_value(None, "page_count", |row| row.get(0))
+                .unwrap();
+            assert!(pages <= 16);
+            let configured_pages: u64 = store
+                .connection
+                .pragma_query_value(None, "max_page_count", |row| row.get(0))
+                .unwrap();
+            assert_eq!(configured_pages, policy.disk_limit / 4096);
+            assert!(disk_bytes(directory.path(), 0).unwrap() <= write_charge(16 * 4096));
+            assert!(store.get::<Value>("snapshots", "absent").unwrap().is_none());
+            drop(store);
+            let frozen = std::fs::read(&path).unwrap();
+            let reopened = Store::open_path(&policy, HashSet::new(), false, &path).unwrap();
+            assert!(
+                reopened
+                    .get::<Value>("snapshots", "absent")
+                    .unwrap()
+                    .is_none()
+            );
+            drop(reopened);
+            assert_eq!(std::fs::read(&path).unwrap(), frozen);
+        }
     }
 
     fn schema_capacity_control(staging: bool) {
