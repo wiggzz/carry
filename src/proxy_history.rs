@@ -285,7 +285,7 @@ pub(super) fn candidate(
         owner = prefix_owner(&store, namespace, input).map_err(read_failure)?;
     }
     owner
-        .map(|id| pin(service, &id).map(|pin| (id, pin)))
+        .map(|id| pin_owner(service, &id, &mut PINS.lock().unwrap()).map(|pin| (id, pin)))
         .transpose()
 }
 fn prefix_owner(
@@ -321,7 +321,8 @@ pub(super) fn resolve(
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
     if let Some(id) = prefix_owner(&store, namespace, input).map_err(read_failure)? {
-        return Ok((id.clone(), pin(service, &id)?));
+        let pin = pin_owner(service, &id, &mut PINS.lock().unwrap())?;
+        return Ok((id, pin));
     }
     reserve(
         service,
