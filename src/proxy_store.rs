@@ -100,6 +100,12 @@ fn free_bytes(directory: &Path) -> std::io::Result<u64> {
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<()> {
+    // Measure the connected store, not its smaller last-connection-closed
+    // footprint. SQLite recreates WAL sidecars even for a read-only view;
+    // admitting against the closed footprint can spend maintenance's promise
+    // before the next publication opens its connection. Keep this view alive
+    // through the physical measurement, without modifying retained authority.
+    let _view = Store::open(service, HashSet::new(), false)?;
     let reserve = settlement_reserve(service.config.history_max_bytes as u64)
         .saturating_mul(owners as u64)
         .saturating_add(maintenance_reserve(
