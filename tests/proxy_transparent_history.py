@@ -860,6 +860,98 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(outcomes[arm]["estimate"]["traditional_compactions"], 1)
                 self.assertGreater(outcomes[arm]["estimate"]["summary_cost"], 0)
 
+    def test_response_ancestor_empty_input_preserves_comparison_without_namespace_fallback(self):
+        """Observed response ancestry qualifies an empty cut, not its whole namespace."""
+        root = self.state
+        outcomes = {}
+        for empty in (False, True):
+            for arm in ("direct", "sibling", "sibling_restart"):
+                key = f"{'empty' if empty else 'nonempty'}_{arm}"
+                with self.subTest(setup=key):
+                    self.state = root / key
+                    self.state.mkdir()
+                    a = [] if empty else [{"role": "user", "content": "EMPTY_CUT_A"}]
+                    output = {"type": "message", "role": "assistant",
+                              "content": [{"type": "output_text", "text": "VERIFIED_A_OUTPUT"}]}
+                    b = [{"role": "user", "content": "EMPTY_CUT_B_ONLY"}]
+                    c = [{"type": "reasoning", "summary": [],
+                          "encrypted_content": "EMPTY_CUT_C_OPAQUE"},
+                         {"role": "user", "content": "EMPTY_CUT_FOREGROUND_C"}]
+                    receipts = []
+                    def primary(body, n):
+                        tokens = 300000 if body["input"][-1:] == c[-1:] else 120 if n > 1 else 100
+                        value = completed([output] if n == 1 else [],
+                                          response_id=f"empty_cut_{key}_{n}", input_tokens=tokens)
+                        receipts.append(value)
+                        return 200, value
+                    fixture = self.fixture(primary)
+                    options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                    proxy = self.proxy(fixture, options)
+                    fields = {"max_output_tokens": 1}
+                    self.assertEqual(proxy.send(a, **fields)[0], 200)
+                    owner_a, _ = proxy.checkpoint(a)
+                    response_a = f"empty_cut_{key}_1"
+                    if arm.startswith("sibling"):
+                        self.assertEqual(proxy.send(b, previous_response_id=response_a, **fields)[0], 200)
+                        self.assertEqual(fixture.primaries[-1]["input"], a + [output] + b)
+                        self.assertEqual(proxy.checkpoint(a + [output] + b)[0], owner_a)
+                        if arm == "sibling_restart":
+                            proxy.close()
+                            proxy = self.proxy(fixture, options)
+                    self.assertEqual(proxy.send(c, previous_response_id=response_a, **fields)[0], 200)
+                    owner_c, child = proxy.checkpoint(a + [output] + c)
+                    index = read_index(self.state / "history.index")
+                    status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                    self.assertEqual(status, 200)
+                    estimate = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_c.stem)
+                    expected_calls = 3 if arm.startswith("sibling") else 2
+                    self.assertEqual(len(fixture.primaries), expected_calls)
+                    self.assertEqual(len(receipts), expected_calls)
+                    self.assertEqual(sum(s["primary"]["calls"] for s in index["snapshots"].values()), expected_calls)
+                    self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in index["snapshots"].values()),
+                        sum((v["usage"]["input_tokens"] * .20 + .75) / 1e6
+                            if v["usage"]["input_tokens"] > 272000 else
+                            (v["usage"]["input_tokens"] * .10 + .50) / 1e6
+                            for v in receipts), places=12)
+                    self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in index["snapshots"].values()), 0)
+                    self.assertEqual(fixture.reviews, [])
+                    self.assertEqual(fixture.primaries[-1], {"model": "gpt-6-luna", "input": a + [output] + c, **fields})
+                    if arm.startswith("sibling"):
+                        self.assertNotEqual(owner_a, owner_c)
+                        self.assertEqual(child["primary"]["calls"], 1)
+                        self.assertEqual(child["primary"]["input_tokens"], 300000)
+                        self.assertAlmostEqual(child["primary"]["cost_usd"], .06000075, places=12)
+                        self.assertEqual(child["shadow"]["calls"], 0)
+                    outcomes[key] = {"estimate": estimate, "child": child,
+                                     "receipts": list(receipts), "primaries": list(fixture.primaries)}
+                    self.evidence[key] = outcomes[key]
+                    print("EMPTY_CUT_CHRONOLOGY=" + json.dumps({"arm": key, "estimate": estimate}), flush=True)
+                    if empty and arm == "sibling_restart":
+                        unrelated = [{"type": "reasoning", "summary": [],
+                                      "encrypted_content": "UNRELATED_OPAQUE"}, c[-1]]
+                        self.assertEqual(proxy.send(unrelated, **fields)[0], 200)
+                        owner, fresh = proxy.checkpoint(unrelated)
+                        self.assertNotIn(owner, (owner_a, owner_c))
+                        self.assertEqual(fresh["primary"]["calls"], 1)
+                        self.assertAlmostEqual(fresh["primary"]["cost_usd"], .06000075, places=12)
+                        self.assertEqual(fixture.primaries[-1]["input"], unrelated)
+                        _, stats = proxy.request("GET", "/carry/dashboard/stats")
+                        fresh_estimate = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner.stem)
+                        self.assertEqual(fresh_estimate["initial_compactions"], 1,
+                                         "an unrelated input cannot inherit an empty namespace cut")
+                        self.assertEqual(fresh_estimate["traditional_compactions"], 0)
+                        self.evidence["unrelated"] = {"estimate": fresh_estimate, "child": fresh,
+                                                       "primaries": list(fixture.primaries), "receipts": list(receipts)}
+                    proxy.close()
+        self.state = root
+        self.assertEqual(len(outcomes), 6)
+        for key, row in outcomes.items():
+            with self.subTest(continuity=key):
+                self.assertEqual(row["estimate"]["initial_compactions"], 0,
+                                 "verified response ancestry cannot grant another free initial compaction")
+                self.assertEqual(row["estimate"]["traditional_compactions"], 1)
+                self.assertAlmostEqual(row["estimate"]["summary_cost"], .05675, places=12)
+
     def test_shared_prefix_preserves_already_summarized_context_without_inheriting_paid_totals(self):
         """A's summarized quantity survives B; A's and B's money stays owned."""
         root = self.state
@@ -2046,7 +2138,9 @@ class TransparentHistory(unittest.TestCase):
 
     def test_concurrent_siblings_keep_independent_selection_and_restart(self):
         import concurrent.futures
-        proxy, fixture, history, options = self.seed()
+        # Four concurrent owners must fit the unchanged disk ceiling. Their
+        # small records do not require four default 32 MiB settlement promises.
+        proxy, fixture, history, options = self.seed(extra=["--history-max-bytes", "262144"])
         # Retire the common live tip so both children use the immutable review.
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
         children = [history + [{"role": "user", "content": f"SIBLING_{n}"}] for n in range(4)]
