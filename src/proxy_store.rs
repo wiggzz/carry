@@ -160,7 +160,21 @@ fn free_bytes(directory: &Path) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    Ok(filesystem_available_bytes(stat.f_bavail, stat.f_frsize))
+}
+#[cfg(unix)]
+fn filesystem_available_bytes(blocks: impl Into<u64>, block_size: impl Into<u64>) -> u64 {
+    // statvfs uses different integer widths on Linux and Darwin. Normalize both
+    // operands before multiplication so neither target narrows capacity.
+    blocks.into().saturating_mul(block_size.into())
+}
+#[cfg(all(test, unix))]
+#[test]
+fn filesystem_capacity_preserves_platform_widths_and_saturates() {
+    assert_eq!(filesystem_available_bytes(3u32, 1u64 << 33), 3u64 << 33);
+    assert_eq!(filesystem_available_bytes(3u64, 4096u64), 12288);
+    assert_eq!(filesystem_available_bytes(u32::MAX, u64::MAX), u64::MAX);
+    assert_eq!(filesystem_available_bytes(0u32, u64::MAX), 0);
 }
 pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<()> {
     // Measure the connected store, not its smaller last-connection-closed
