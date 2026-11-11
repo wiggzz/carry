@@ -15,6 +15,105 @@ class NoodleRegressions(unittest.TestCase):
     fixture = history_fixture.TransparentHistory.fixture
     proxy = history_fixture.TransparentHistory.proxy
 
+    def explicit_paid_pressure(self, *, pressure):
+        """Hold a real first Off receipt while preserving every promised byte."""
+        import threading
+        import http.client
+
+        held, release = threading.Event(), threading.Event()
+        def primary(_body, n):
+            if n == 1:
+                held.set()
+                self.assertTrue(release.wait(15), "release the actual held paid receipt")
+            return 200, completed(response_id=f"explicit_paid_{n}")
+
+        fixture = self.fixture(primary)
+        self.stack.callback(release.set)
+        options = ["--request-timeout-secs", "20"]
+        proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(proxy.close)
+        body = {"model": "gpt-6-luna", "input": [
+            {"role": "user", "content": "EXPLICIT_OFF_FIRST_PAID_RECEIPT"}]}
+        result = {}
+        def send():
+            try:
+                result["response"] = proxy.request("POST", "/v1/responses", body)
+            except (http.client.HTTPException, OSError) as error:
+                result["error"] = type(error).__name__
+        worker = threading.Thread(target=send, daemon=True)
+        worker.start()
+        self.assertTrue(held.wait(10), "real primary must reach upstream before pressure")
+        pending = proxy.saved()
+        self.assertTrue(pending["primary_pending"])
+        self.assertEqual(pending["primary"]["calls"], 0)
+        self.assertFalse(pending["history_shared"])
+        self.assertIsNone(pending.get("history_namespace"))
+        self.assertEqual(fixture.primaries, [body], "Off forwarding preserves the entire wire")
+        self.assertEqual(fixture.reviews, [])
+        # Default policy: one paid owner plus independent maintenance. Sparse
+        # synthetic external pressure consumes ordinary headroom, not promises.
+        max_record, disk_limit = 32 * 1024**2, 1024**3
+        charge = lambda size: size * 4 + 16384
+        paid = charge(max_record) * 2 + charge(128) * 2 + max_record * 2 + 65536
+        maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
+        before_bytes = sum(p.stat().st_size for p in self.state.rglob("*"))
+        pressure_file = self.state / "ordinary-pressure.bin"
+        if pressure:
+            extent = disk_limit - paid - maintenance - 65536 - before_bytes
+            self.assertGreater(extent, 0)
+            with pressure_file.open("wb") as file:
+                file.truncate(extent)
+            self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
+                             disk_limit - paid - maintenance - 65536)
+        schema_before_receipt = (self.state / "history.index").exists()
+        release.set()
+        worker.join(timeout=25)
+        self.assertFalse(worker.is_alive(), "held request must finish within its declared deadline")
+        settled = proxy.saved()
+        proxy.close()
+        if pressure:
+            pressure_file.unlink()
+        # A genuine process restart plus another real dispatch exercises pending
+        # recovery; inspecting only an in-memory worker would miss lost receipts.
+        restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(restarted.close)
+        self.assertEqual(restarted.request("POST", "/v1/responses", body)[0], 200)
+        cold = restarted.saved()
+        self.assertEqual(fixture.primaries, [body, body])
+        self.assertEqual(fixture.reviews, [])
+        restarted.close()
+        outcome = {"result": result, "pending": pending, "settled": settled,
+                   "restarted": cold, "primaries": fixture.primaries,
+                   "reviews": fixture.reviews, "schema_before_receipt": schema_before_receipt,
+                   "paid_promise": paid, "maintenance_promise": maintenance,
+                   "disk_limit": disk_limit, "ordinary_slack": 65536,
+                   "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
+        self.evidence[str(pressure)] = outcome
+        return outcome
+
+    def test_first_explicit_off_receipt_survives_default_limit_pressure_and_restart(self):
+        root = self.state
+        for pressure in (False, True):
+            with self.subTest(pressure=pressure):
+                self.state = root / ("pressure" if pressure else "control")
+                self.state.mkdir()
+                outcome = self.explicit_paid_pressure(pressure=pressure)
+                known = (100 * .10 + .50) / 1e6
+                # Grade both settlement and cold recovery even if the first
+                # money assertion fails, preserving the complete loss witness.
+                with self.subTest(phase="settled"):
+                    self.assertNotIn("error", outcome["result"])
+                    self.assertEqual(outcome["result"]["response"][0], 200)
+                    self.assertEqual(outcome["settled"]["primary"]["calls"], 1)
+                    self.assertEqual(outcome["settled"]["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(outcome["settled"]["primary"]["cost_usd"], known, places=12)
+                    self.assertFalse(outcome["settled"]["primary_pending"])
+                with self.subTest(phase="restart"):
+                    self.assertEqual(outcome["restarted"]["primary"]["calls"], 2)
+                    self.assertEqual(outcome["restarted"]["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(outcome["restarted"]["primary"]["cost_usd"], known * 2, places=12)
+                    self.assertFalse(outcome["restarted"]["primary_pending"])
+
     def history(self):
         return [{"role": "user", "content": "NOODLE_GOAL"},
                 {"role": "assistant", "content": "NOODLE_SOURCE " + "payload " * 3000},

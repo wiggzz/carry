@@ -660,12 +660,10 @@ fn committed_locked(
     session: &Session,
     observation: Option<(&[Value], &Value)>,
 ) -> std::io::Result<()> {
-    if session.history_namespace.is_none()
-        && session.primary.calls == 0
-        && session.shadow.calls == 0
-    {
-        return Ok(());
-    }
+    // Every admitted pending checkpoint, including a fresh explicit Off owner,
+    // needs durable accounting authority before transport can spend money. Do
+    // not defer schema creation until settlement, when ordinary headroom may
+    // already be exhausted while the paid promise itself remains protected.
     let store = Store::open(service, pinned(service), true)?;
     store.begin()?;
     store.put(
