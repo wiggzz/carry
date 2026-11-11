@@ -338,6 +338,179 @@ class NoodleRegressions(unittest.TestCase):
                     self.assertFalse(cold["primary_pending"])
         self.state = root
 
+    def test_reviewer_receipt_growth_preserves_known_money(self):
+        self.reviewer_receipt_growth()
+
+    def test_near_bound_reviewer_receipt_growth_preserves_known_money(self):
+        root = self.state
+        self.state = root / "calibration"
+        self.state.mkdir()
+        self.reviewer_receipt_growth()
+        calibration = dict(self.evidence)
+        self.evidence.clear()
+        self.state = root / "boundary"
+        self.state.mkdir()
+        try:
+            self.reviewer_receipt_growth(max_record=calibration["extension-False-pressure-False"]["snapshot_bytes"] + 16,
+                                        near_bound=True)
+        finally:
+            self.evidence["calibration"] = calibration
+            self.state = root
+
+    def reviewer_receipt_growth(self, *, max_record=256 * 1024, near_bound=False):
+        import threading
+
+        root = self.state
+        for extension in ((False,) if near_bound else (False, True)):
+            for pressure in (False, True):
+                with self.subTest(extension=extension, pressure=pressure):
+                    self.state = root / f"extension-{extension}-pressure-{pressure}"
+                    self.state.mkdir()
+                    held, release = threading.Event(), threading.Event()
+                    replies = []
+                    def reviewer(_body, _n):
+                        response = advice_response({"protected": [2], "removable": [], "memories": []})
+                        if extension:
+                            # Valid native usage remains identical. An unrelated
+                            # provider extension must not expand mandatory state
+                            # beyond what was admitted before this paid call.
+                            response["usage"]["provider_extension"] = "x" * (300 * 1024)
+                        replies.append(response)
+                        held.set()
+                        if not release.wait(15):
+                            raise AssertionError("release actual paid reviewer")
+                        return 200, response
+                    fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"reviewer_growth_{n}")), reviewer)
+                    self.stack.callback(release.set)
+                    disk_limit = 64 * 1024**2
+                    options = ["--history-max-bytes", str(max_record), "--history-disk-bytes", str(disk_limit),
+                               "--review-replayed-history", "--payoff-requests", "1",
+                               "--classifier-cache-policy", "disabled"]
+                    proxy = TransparentProxy(self.state, fixture, options, mode="audit", wait_reviews=False)
+                    self.stack.callback(proxy.close)
+                    h = [{"role": "user", "content": "REVIEWER_GROWTH_GOAL"},
+                         {"role": "assistant", "content": "REVIEWER_GROWTH_SOURCE " + "payload " * 20},
+                         {"role": "user", "content": "REVIEWER_GROWTH_TASK"}]
+                    body = {"model": "gpt-6-luna", "input": h}
+                    initial = proxy.send(h, wait=False)
+                    if near_bound and initial[0] in (500, 507) and not fixture.primaries and not fixture.reviews:
+                        self.assertEqual(list(self.state.glob(".*.tmp")), [])
+                        self.evidence[f"extension-{extension}-pressure-{pressure}"] = {
+                            "classification": "safe_before_any_billing_refusal", "result": initial,
+                            "record_bound": max_record, "primaries": fixture.primaries,
+                            "reviews": fixture.reviews}
+                        proxy.close()
+                        continue
+                    self.assertEqual(initial[0], 200)
+                    arrived = held.wait(1 if near_bound else 10)
+                    if near_bound and not arrived:
+                        self.assertTrue(proxy.reviewers_settled())
+                        safe = proxy.saved()
+                        self.assertEqual(fixture.primaries, [body])
+                        self.assertEqual(fixture.reviews, [])
+                        self.assertEqual(safe["primary"]["calls"], 1)
+                        self.assertEqual(safe["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(safe["primary"]["cost_usd"], (100 * .10 + .50) / 1e6, places=12)
+                        self.assertEqual(safe["shadow"]["calls"], 0)
+                        self.assertFalse(safe["background_review_pending"])
+                        proxy.close()
+                        restarted_options = [o for o in options if o != "--review-replayed-history"]
+                        restarted = TransparentProxy(self.state, fixture, restarted_options,
+                                                     mode="audit", wait_reviews=False)
+                        self.stack.callback(restarted.close)
+                        self.assertEqual(restarted.request("GET", "/carry/dashboard/stats")[0], 200)
+                        cold, = read_index(self.state / "history.index")["snapshots"].values()
+                        self.assertEqual(cold["primary"], safe["primary"])
+                        self.assertEqual(cold["shadow"], safe["shadow"])
+                        self.assertFalse(cold["background_review_pending"])
+                        restarted.close()
+                        self.evidence[f"extension-{extension}-pressure-{pressure}"] = {
+                            "classification": "safe_before_reviewer_billing_refusal", "settled": safe,
+                            "restarted": cold, "record_bound": max_record,
+                            "primaries": fixture.primaries, "reviews": fixture.reviews}
+                        continue
+                    self.assertTrue(arrived, "actual reviewer must dispatch before pressure")
+                    pending = proxy.saved()
+                    import sqlite3
+                    from contextlib import closing
+                    with closing(sqlite3.connect(self.state / "history.index")) as db:
+                        snapshot_bytes, = db.execute("SELECT length(data) FROM records WHERE kind='snapshots'").fetchone()
+                    self.assertLessEqual(snapshot_bytes, max_record)
+                    if near_bound:
+                        self.assertLessEqual(max_record - snapshot_bytes, 32)
+                    self.assertTrue(pending["history_shared"])
+                    self.assertTrue(pending["background_review_pending"])
+                    self.assertEqual(pending["primary"]["calls"], 1)
+                    self.assertEqual(pending["shadow"]["calls"], 0)
+                    self.assertEqual(fixture.primaries, [body])
+                    self.assertEqual(len(fixture.reviews), 1)
+                    self.assertEqual(len(replies), 1)
+                    self.assertEqual(replies[0]["usage"]["input_tokens"], 100)
+                    self.assertEqual(replies[0]["usage"]["output_tokens"], 1)
+                    charge = lambda size: 4 * size + 16384
+                    paid = 2 * charge(max_record) + 2 * charge(128) + 2 * max_record + 65536
+                    maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
+                    pressure_file = self.state / "ordinary-pressure.bin"
+                    before = sum(p.stat().st_size for p in self.state.rglob("*"))
+                    if pressure:
+                        extent = disk_limit - paid - maintenance - 65536 - before
+                        self.assertGreater(extent, 0)
+                        with pressure_file.open("wb") as file:
+                            file.truncate(extent)
+                        self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
+                                         disk_limit - paid - maintenance - 65536)
+                    release.set()
+                    deadline = time.monotonic() + 10
+                    while not any(e["event"] == "background_review_merged" for e in self.events()):
+                        self.assertLess(time.monotonic(), deadline, "actual reviewer worker must finish")
+                        time.sleep(.02)
+                    settled = proxy.saved()
+                    completed_events = self.events()
+                    index = read_index(self.state / "history.index")
+                    proxy.close()
+                    if pressure:
+                        pressure_file.unlink()
+                    restarted_options = [o for o in options if o != "--review-replayed-history"]
+                    restarted_options += ["--review-every-requests", "100"]
+                    restarted = TransparentProxy(self.state, fixture, restarted_options,
+                                                 mode="audit", wait_reviews=False)
+                    self.stack.callback(restarted.close)
+                    restart_result = restarted.send(h, wait=False)
+                    cold_index = read_index(self.state / "history.index")
+                    cold, = cold_index["snapshots"].values()
+                    restarted.close()
+                    self.assertEqual(fixture.primaries, [body] if restart_result[0] == 507 else [body, body])
+                    self.assertEqual(len(fixture.reviews), 1, "restart must not rebill reviewer")
+                    key = f"extension-{extension}-pressure-{pressure}"
+                    self.evidence[key] = {"pending": pending, "settled": settled, "restarted": cold,
+                        "primaries": fixture.primaries, "reviews": fixture.reviews, "provider_responses": replies,
+                        "restart_result": restart_result, "events": completed_events, "advice_records": index["reviews"],
+                        "record_bound": max_record, "snapshot_bytes": snapshot_bytes, "disk_limit": disk_limit,
+                        "paid_promise": paid, "maintenance_promise": maintenance,
+                        "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
+                    known = (100 * .10 + .50) / 1e6
+                    with self.subTest(phase="settled"):
+                        self.assertEqual(settled["shadow"]["calls"], 1)
+                        self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(settled["shadow"]["cost_usd"], known, places=12)
+                        self.assertEqual(settled["shadow"]["input_tokens"], 100)
+                        self.assertEqual(settled["shadow"]["output_tokens"], 1)
+                        self.assertFalse(settled["background_review_pending"])
+                    with self.subTest(phase="restart"):
+                        # A fresh primary may itself be refused before billing
+                        # at this unchanged bound; that cannot erase the already
+                        # completed reviewer's known receipt.
+                        self.assertIn(restart_result[0], (200, 507))
+                        self.assertEqual(cold["shadow"]["calls"], 1)
+                        self.assertEqual(cold["shadow"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(cold["shadow"]["cost_usd"], known, places=12)
+                        primary_calls = len(fixture.primaries)
+                        self.assertEqual(cold["primary"]["calls"], primary_calls)
+                        self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(cold["primary"]["cost_usd"], primary_calls * known, places=12)
+                        self.assertFalse(cold["background_review_pending"])
+        self.state = root
+
     def history(self):
         return [{"role": "user", "content": "NOODLE_GOAL"},
                 {"role": "assistant", "content": "NOODLE_SOURCE " + "payload " * 3000},
