@@ -121,6 +121,157 @@ class NoodleRegressions(unittest.TestCase):
                     self.assertAlmostEqual(outcome["restarted"]["primary"]["cost_usd"], known * 2, places=12)
                     self.assertFalse(outcome["restarted"]["primary_pending"])
 
+    def test_explicit_checkpoint_bound_refuses_oversize_before_paid_dispatch(self):
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"bounded_explicit_{n}")))
+        options = ["--history-max-bytes", "65536", "--history-disk-bytes", "8388608"]
+        proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(proxy.close)
+        small = {"model": "gpt-6-luna", "input": [
+            {"role": "user", "content": "ESTABLISHED_PAID_AUTHORITY"}]}
+        large = {"model": "gpt-6-luna", "input": [
+            {"role": "user", "content": "EXPLICIT_CHECKPOINT_BOUND_" + "x" * 1024**2}]}
+        self.assertEqual(proxy.request("POST", "/v1/responses", small)[0], 200)
+        seed = proxy.saved()
+        path, = self.state.glob("*.json")
+        seed_bytes = path.read_bytes()
+        result = proxy.request("POST", "/v1/responses", large)
+        after = proxy.saved()
+        proxy.close()
+        self.evidence["oversize"] = {"result": result, "seed": seed, "after": after,
+                                     "primaries": fixture.primaries, "reviews": fixture.reviews}
+        # A safe pre-dispatch rejection is not a successfully settled paid call.
+        # Keep it separate from the admitted-large pressure controls below.
+        with self.subTest(phase="admission"):
+            self.assertIn(result[0], (500, 507))
+            self.assertEqual(fixture.primaries, [small])
+        with self.subTest(phase="authority"):
+            self.assertEqual(path.read_bytes(), seed_bytes)
+            self.assertEqual(after["primary"], seed["primary"])
+            self.assertFalse(after["primary_pending"])
+            self.assertEqual(fixture.reviews, [])
+            self.assertEqual(list(self.state.glob(".*.tmp")), [])
+        restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(restarted.close)
+        self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
+        cold = restarted.saved()
+        self.evidence["oversize"]["restarted"] = cold
+        self.evidence["oversize"]["primaries"] = fixture.primaries
+        with self.subTest(phase="restart"):
+            self.assertEqual(fixture.primaries, [small, small])
+            self.assertEqual(cold["primary"]["calls"], 2)
+            self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+            self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * (100 * .10 + .50) / 1e6, places=12)
+        restarted.close()
+
+    def test_admitted_large_explicit_checkpoint_settles_protected_pressure_and_restart(self):
+        import threading
+        import http.client
+
+        root = self.state
+        for pressure in (False, True):
+            with self.subTest(pressure=pressure):
+                self.state = root / ("large-pressure" if pressure else "large-control")
+                self.state.mkdir()
+                held, release = threading.Event(), threading.Event()
+                def primary(_body, n):
+                    if n == 2:
+                        held.set()
+                        self.assertTrue(release.wait(15), "release actual admitted-large receipt")
+                    return 200, completed(response_id=f"admitted_large_{n}")
+                fixture = self.fixture(primary)
+                self.stack.callback(release.set)
+                # The SAME record bound owns SQL, explicit checkpoint admission
+                # and the paid promise. This declares a legal large record; it
+                # does not raise the configured cap while the request is paid.
+                max_record, disk_limit = 2 * 1024**2, 64 * 1024**2
+                options = ["--request-timeout-secs", "20", "--history-max-bytes", str(max_record),
+                           "--history-disk-bytes", str(disk_limit)]
+                proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+                self.stack.callback(proxy.close)
+                small = {"model": "gpt-6-luna", "input": [
+                    {"role": "user", "content": "ESTABLISHED_PAID_AUTHORITY"}]}
+                large = {"model": "gpt-6-luna", "input": [
+                    {"role": "user", "content": "ADMITTED_LARGE_CHECKPOINT_" + "x" * 1024**2}]}
+                self.assertEqual(proxy.request("POST", "/v1/responses", small)[0], 200)
+                seed = proxy.saved()
+                self.assertTrue((self.state / "history.index").is_file())
+                known = (100 * .10 + .50) / 1e6
+                self.assertEqual(seed["primary"]["calls"], 1)
+                self.assertEqual(seed["primary"]["unavailable_cost_calls"], 0)
+                self.assertAlmostEqual(seed["primary"]["cost_usd"], known, places=12)
+                result = {}
+                def send():
+                    try:
+                        result["response"] = proxy.request("POST", "/v1/responses", large)
+                    except (http.client.HTTPException, OSError) as error:
+                        result["error"] = type(error).__name__
+                worker = threading.Thread(target=send, daemon=True)
+                worker.start()
+                self.assertTrue(held.wait(10), "legal large checkpoint must reach upstream")
+                pending = proxy.saved()
+                path, = self.state.glob("*.json")
+                checkpoint_bytes = path.stat().st_size
+                self.assertGreater(checkpoint_bytes, 1024**2)
+                self.assertLessEqual(checkpoint_bytes, max_record)
+                self.assertFalse(pending["history_shared"])
+                self.assertIsNone(pending.get("history_namespace"))
+                self.assertTrue(pending["primary_pending"])
+                self.assertEqual(pending["primary"], seed["primary"])
+                self.assertEqual(fixture.primaries, [small, large])
+                self.assertEqual(fixture.reviews, [])
+                charge = lambda size: 4 * size + 16384
+                paid = 2 * charge(max_record) + 2 * charge(128) + 2 * max_record + 65536
+                maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
+                before = sum(p.stat().st_size for p in self.state.rglob("*"))
+                pressure_file = self.state / "ordinary-pressure.bin"
+                if pressure:
+                    extent = disk_limit - paid - maintenance - 65536 - before
+                    self.assertGreater(extent, 0)
+                    with pressure_file.open("wb") as file:
+                        file.truncate(extent)
+                    self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
+                                     disk_limit - paid - maintenance - 65536)
+                release.set()
+                worker.join(timeout=25)
+                self.assertFalse(worker.is_alive())
+                settled = proxy.saved()
+                proxy.close()
+                if pressure:
+                    pressure_file.unlink()
+                restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+                self.stack.callback(restarted.close)
+                self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
+                cold = restarted.saved()
+                restarted.close()
+                self.assertEqual(fixture.primaries, [small, large, small])
+                self.assertEqual(fixture.reviews, [])
+                self.evidence[str(pressure)] = {
+                    "result": result, "seed": seed, "pending": pending, "settled": settled,
+                    "restarted": cold, "primaries": fixture.primaries, "reviews": fixture.reviews,
+                    "checkpoint_bytes": checkpoint_bytes, "record_bound": max_record,
+                    "paid_promise": paid, "maintenance_promise": maintenance,
+                    "disk_limit": disk_limit, "ordinary_slack": 65536,
+                    "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
+                with self.subTest(phase="settled"):
+                    self.assertEqual(settled["primary"]["calls"], 2)
+                    self.assertEqual(settled["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(settled["primary"]["cost_usd"], 2 * known, places=12)
+                    self.assertFalse(settled["primary_pending"])
+                with self.subTest(phase="delivery"):
+                    if pressure:
+                        self.assertEqual(result, {"error": "IncompleteRead"})
+                        self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id"),
+                                         "paid fallback must not publish rejected new ancestry")
+                    else:
+                        self.assertNotIn("error", result)
+                        self.assertEqual(result["response"][0], 200)
+                with self.subTest(phase="restart"):
+                    self.assertEqual(cold["primary"]["calls"], 3)
+                    self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(cold["primary"]["cost_usd"], 3 * known, places=12)
+                    self.assertFalse(cold["primary_pending"])
+        self.state = root
+
     def history(self):
         return [{"role": "user", "content": "NOODLE_GOAL"},
                 {"role": "assistant", "content": "NOODLE_SOURCE " + "payload " * 3000},
