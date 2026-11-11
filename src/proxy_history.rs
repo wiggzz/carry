@@ -32,6 +32,14 @@ impl FilePolicy {
     }
 }
 impl Publication {
+    pub(super) fn admit_checkpoint(
+        &self,
+        directory: &Path,
+        bytes: u64,
+        reusable: u64,
+    ) -> std::io::Result<()> {
+        self.store.admit_checkpoint(directory, bytes, reusable)
+    }
     pub(crate) fn admit_file(&self, directory: &Path, additional: u64) -> std::io::Result<()> {
         self.store.admit_file(directory, additional)
     }

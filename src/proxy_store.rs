@@ -432,6 +432,19 @@ fn validate_predecessor(value: &Value) -> Result<Value, ()> {
 }
 
 impl Store {
+    pub(super) fn admit_checkpoint(
+        &self,
+        directory: &Path,
+        bytes: u64,
+        reusable: u64,
+    ) -> std::io::Result<()> {
+        // Explicit files share the SQL record bound used to promise paid
+        // settlement capacity, including the full coexisting staged file.
+        if bytes > self.max_record as u64 {
+            return Err(full());
+        }
+        self.admit_file(directory, bytes.saturating_sub(reusable))
+    }
     pub(super) fn admit_file(&self, directory: &Path, additional: u64) -> std::io::Result<()> {
         if directory != self.directory.as_path() {
             return Err(std::io::Error::new(

@@ -541,8 +541,6 @@ async fn session_lock(service: &Service, id: &str) -> OwnedMutexGuard<()> {
     lock.lock_owned().await
 }
 
-const CHECKPOINT_MAX_BYTES: usize = 64 * 1024 * 1024;
-
 fn recover_success_prefix(
     service: &Service,
     id: &str,
@@ -629,7 +627,7 @@ fn load_with_restore(
 ) -> Result<Session, Failure> {
     let path = service.config.state_dir.join(format!("{id}.json"));
     match std::fs::read(path) {
-        Ok(bytes) if bytes.len() <= CHECKPOINT_MAX_BYTES => {
+        Ok(bytes) if bytes.len() <= service.config.history_max_bytes as usize => {
             serde_json::from_slice::<Session>(&bytes)
                 .and_then(|session| {
                     if session.version != 0 && session.version != 3 {
@@ -789,7 +787,7 @@ fn save_publication(
             service,
             id,
             session,
-            CHECKPOINT_MAX_BYTES,
+            service.config.history_max_bytes as usize,
             &publication,
             || publish(session, &publication),
         );
@@ -802,7 +800,7 @@ fn save_publication(
         service,
         id,
         &history::compact(session),
-        CHECKPOINT_MAX_BYTES,
+        service.config.history_max_bytes as usize,
         &publication,
         || Ok(()),
     )?;
@@ -861,7 +859,7 @@ fn save_checkpoint(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(error),
     };
-    publication.admit_file(&service.config.state_dir, size.0.saturating_sub(reusable))?;
+    publication.admit_checkpoint(&service.config.state_dir, size.0, reusable)?;
     let mut file = private_file(&temporary, false)?;
     serde_json::to_writer(&mut file, session)?;
     // Never replace a loadable checkpoint with one the loader would reject.
@@ -1351,11 +1349,13 @@ fn load_dashboard_accounting(
     // fields during numeric decoding instead of allocating their raw values.
     let file = File::open(service.config.state_dir.join(format!("{id}.json")))
         .map_err(|_| unavailable())?;
-    if file.metadata().map_err(|_| unavailable())?.len() > CHECKPOINT_MAX_BYTES as u64 {
+    if file.metadata().map_err(|_| unavailable())?.len()
+        > u64::from(service.config.history_max_bytes)
+    {
         return Err(unavailable());
     }
     let numbers: crate::proxy_state::AccountingView = serde_json::from_reader(
-        std::io::BufReader::new(file.take(CHECKPOINT_MAX_BYTES as u64 + 1)),
+        std::io::BufReader::new(file.take(u64::from(service.config.history_max_bytes) + 1)),
     )
     .map_err(|_| unavailable())?;
     let session = numbers.into_session();
