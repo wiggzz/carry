@@ -99,15 +99,22 @@ class NoodleRegressions(unittest.TestCase):
                 self.state.mkdir()
                 outcome = self.explicit_paid_pressure(pressure=pressure)
                 known = (100 * .10 + .50) / 1e6
-                # Grade both settlement and cold recovery even if the first
-                # money assertion fails, preserving the complete loss witness.
+                # Ordinary history publication may fail closed while the paid
+                # accounting transaction succeeds. Grade native receipt facts
+                # independently of that deliberate client-delivery failure.
                 with self.subTest(phase="settled"):
-                    self.assertNotIn("error", outcome["result"])
-                    self.assertEqual(outcome["result"]["response"][0], 200)
                     self.assertEqual(outcome["settled"]["primary"]["calls"], 1)
                     self.assertEqual(outcome["settled"]["primary"]["unavailable_cost_calls"], 0)
                     self.assertAlmostEqual(outcome["settled"]["primary"]["cost_usd"], known, places=12)
                     self.assertFalse(outcome["settled"]["primary_pending"])
+                with self.subTest(phase="delivery"):
+                    if pressure:
+                        self.assertEqual(outcome["result"], {"error": "IncompleteRead"})
+                        self.assertIsNone(outcome["settled"].get("last_response_id"),
+                                          "paid facts must not publish the rejected response ancestry")
+                    else:
+                        self.assertNotIn("error", outcome["result"])
+                        self.assertEqual(outcome["result"]["response"][0], 200)
                 with self.subTest(phase="restart"):
                     self.assertEqual(outcome["restarted"]["primary"]["calls"], 2)
                     self.assertEqual(outcome["restarted"]["primary"]["unavailable_cost_calls"], 0)
