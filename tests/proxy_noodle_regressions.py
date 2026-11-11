@@ -164,6 +164,28 @@ class NoodleRegressions(unittest.TestCase):
         restarted.close()
 
     def test_admitted_large_explicit_checkpoint_settles_protected_pressure_and_restart(self):
+        self.admitted_large_explicit_checkpoint()
+
+    def test_near_bound_explicit_checkpoint_never_loses_known_paid_receipt(self):
+        root = self.state
+        self.state = root / "calibration"
+        self.state.mkdir()
+        self.admitted_large_explicit_checkpoint()
+        calibration = dict(self.evidence)
+        # Resolve a fresh configured bound BEFORE dispatch, against the actual
+        # pending representation emitted by this exact binary. No admitted
+        # record or policy changes while its receipt is held upstream.
+        bound = calibration["False"]["checkpoint_bytes"] + 16
+        self.evidence.clear()
+        self.state = root / "boundary"
+        self.state.mkdir()
+        try:
+            self.admitted_large_explicit_checkpoint(max_record=bound, near_bound=True)
+        finally:
+            self.evidence["calibration"] = calibration
+            self.state = root
+
+    def admitted_large_explicit_checkpoint(self, *, max_record=2 * 1024**2, near_bound=False):
         import threading
         import http.client
 
@@ -183,7 +205,7 @@ class NoodleRegressions(unittest.TestCase):
                 # The SAME record bound owns SQL, explicit checkpoint admission
                 # and the paid promise. This declares a legal large record; it
                 # does not raise the configured cap while the request is paid.
-                max_record, disk_limit = 2 * 1024**2, 64 * 1024**2
+                disk_limit = 64 * 1024**2
                 options = ["--request-timeout-secs", "20", "--history-max-bytes", str(max_record),
                            "--history-disk-bytes", str(disk_limit)]
                 proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
@@ -200,19 +222,59 @@ class NoodleRegressions(unittest.TestCase):
                 self.assertEqual(seed["primary"]["unavailable_cost_calls"], 0)
                 self.assertAlmostEqual(seed["primary"]["cost_usd"], known, places=12)
                 result = {}
+                finished = threading.Event()
+                seed_path, = self.state.glob("*.json")
+                seed_bytes = seed_path.read_bytes()
                 def send():
                     try:
                         result["response"] = proxy.request("POST", "/v1/responses", large)
                     except (http.client.HTTPException, OSError) as error:
                         result["error"] = type(error).__name__
+                    finally:
+                        finished.set()
                 worker = threading.Thread(target=send, daemon=True)
                 worker.start()
+                if near_bound:
+                    deadline = time.monotonic() + 10
+                    while not held.is_set() and not finished.is_set() and time.monotonic() < deadline:
+                        held.wait(.02)
+                    if finished.is_set() and not held.is_set():
+                        # Refusing an impossible settlement obligation before
+                        # billing is safe, not proof that a paid receipt settled.
+                        self.assertNotIn("error", result)
+                        self.assertIn(result["response"][0], (500, 507))
+                        self.assertEqual(fixture.primaries, [small])
+                        self.assertEqual(fixture.reviews, [])
+                        self.assertEqual(seed_path.read_bytes(), seed_bytes)
+                        self.assertEqual(list(self.state.glob(".*.tmp")), [])
+                        release.set()  # The restarted small request is now fixture arrival two.
+                        worker.join(timeout=1)
+                        self.assertFalse(worker.is_alive())
+                        proxy.close()
+                        restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+                        self.stack.callback(restarted.close)
+                        self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
+                        cold = restarted.saved()
+                        restarted.close()
+                        self.assertEqual(fixture.primaries, [small, small])
+                        self.assertEqual(cold["primary"]["calls"], 2)
+                        self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * known, places=12)
+                        self.assertFalse(cold["primary_pending"])
+                        self.evidence[str(pressure)] = {
+                            "classification": "safe_before_billing_refusal", "result": result,
+                            "seed": seed, "restarted": cold, "record_bound": max_record,
+                            "primaries": fixture.primaries, "reviews": fixture.reviews}
+                        continue
                 self.assertTrue(held.wait(10), "legal large checkpoint must reach upstream")
                 pending = proxy.saved()
                 path, = self.state.glob("*.json")
                 checkpoint_bytes = path.stat().st_size
                 self.assertGreater(checkpoint_bytes, 1024**2)
                 self.assertLessEqual(checkpoint_bytes, max_record)
+                if near_bound:
+                    self.assertLessEqual(max_record - checkpoint_bytes, 32,
+                                         "exercise actual admitted pending-record boundary")
                 self.assertFalse(pending["history_shared"])
                 self.assertIsNone(pending.get("history_namespace"))
                 self.assertTrue(pending["primary_pending"])
@@ -262,6 +324,10 @@ class NoodleRegressions(unittest.TestCase):
                         self.assertEqual(result, {"error": "IncompleteRead"})
                         self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id"),
                                          "paid fallback must not publish rejected new ancestry")
+                    elif near_bound and "error" in result:
+                        self.assertEqual(result, {"error": "IncompleteRead"})
+                        self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id"),
+                                         "record-bound rejection must not publish new ancestry")
                     else:
                         self.assertNotIn("error", result)
                         self.assertEqual(result["response"][0], 200)

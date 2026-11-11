@@ -1777,9 +1777,12 @@ class TransparentHistory(unittest.TestCase):
         # live owner now backpressures instead of deleting its authority.
         self.assertEqual(proxy.send([{"role": "user", "content": "TOO_SMALL_OWNER"}])[0], 507)
         self.assertEqual(fixture.primaries, [])
-        rejected = read_index(self.state / "history.index")
-        self.assertFalse(rejected["snapshots"])
-        self.assertFalse(rejected["transcripts"])
+        # Admission can now reject before creating the history store at all.
+        # If initialization did occur, it must contain no published authority.
+        if (self.state / "history.index").exists():
+            rejected = read_index(self.state / "history.index")
+            self.assertFalse(rejected["snapshots"])
+            self.assertFalse(rejected["transcripts"])
         self.assertEqual(list(self.state.glob("*.json")),[])
         proxy.close()
         # The roomy arm must fit a completed selected snapshot, including its
