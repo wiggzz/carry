@@ -302,6 +302,11 @@ pub(super) struct Session {
     pub review_epoch: u64,
     #[serde(default)]
     pub primary_pending: bool,
+    /// Admitted terminal growth, not money or a second accounting authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_settlement_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_settlement_bytes: Option<u64>,
     #[serde(default)]
     pub background_review_pending: bool,
     #[serde(default)]

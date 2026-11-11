@@ -2,28 +2,47 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+const REVIEW_USAGE_FIELDS: [&str; 5] = [
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "cache_creation_input_tokens",
+];
+const REVIEW_USAGE_DETAILS: [&str; 4] = [
+    "cached_tokens",
+    "cache_write_tokens",
+    "cache_creation_tokens",
+    "audio_tokens",
+];
+const REVIEW_USAGE_CONTAINERS: [&str; 2] = ["input_tokens_details", "output_tokens_details"];
+
+/// Complete possible shape of the same bounded numeric projection, for
+/// pre-dispatch representation admission only.
+pub(super) fn review_usage_shape() -> Value {
+    let mut shape = json!({});
+    for field in REVIEW_USAGE_FIELDS {
+        shape[field] = json!(0);
+    }
+    for field in REVIEW_USAGE_CONTAINERS {
+        for key in REVIEW_USAGE_DETAILS {
+            shape[field][key] = json!(0);
+        }
+    }
+    shape
+}
+
 /// One content-free numeric receipt projection for synchronous and background review.
 /// Invalid presence stays a bounded sentinel, not an invented zero partition.
 pub(crate) fn numeric_review_usage(usage: &Value) -> Value {
     let mut result = json!({});
-    for field in [
-        "input_tokens",
-        "output_tokens",
-        "cached_input_tokens",
-        "cache_write_input_tokens",
-        "cache_creation_input_tokens",
-    ] {
+    for field in REVIEW_USAGE_FIELDS {
         if let Some(value) = usage.get(field) {
             result[field] = value.as_u64().map_or(json!(-1), |n| json!(n));
         }
     }
-    for field in ["input_tokens_details", "output_tokens_details"] {
-        for key in [
-            "cached_tokens",
-            "cache_write_tokens",
-            "cache_creation_tokens",
-            "audio_tokens",
-        ] {
+    for field in REVIEW_USAGE_CONTAINERS {
+        for key in REVIEW_USAGE_DETAILS {
             if let Some(value) = usage[field].get(key) {
                 result[field][key] = value.as_u64().map_or(json!(-1), |n| json!(n));
             }

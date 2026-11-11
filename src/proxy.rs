@@ -220,6 +220,8 @@ pub(crate) mod history;
 mod planning;
 #[path = "proxy_advice.rs"]
 mod semantic;
+#[path = "proxy_settlement.rs"]
+pub(crate) mod settlement;
 use planning::plan;
 #[path = "proxy_log.rs"]
 mod logging;
@@ -685,15 +687,22 @@ fn save_paid_accounting(
 ) -> std::io::Result<()> {
     let mut durable = load_existing(service, id)
         .map_err(|_| std::io::Error::other("paid accounting authority unavailable"))?;
-    let calls = paid.primary.calls.saturating_sub(durable.primary.calls)
-        + paid.shadow.calls.saturating_sub(durable.shadow.calls);
+    let primary_calls = paid.primary.calls.saturating_sub(durable.primary.calls);
+    let calls = primary_calls + paid.shadow.calls.saturating_sub(durable.shadow.calls);
     durable.primary = paid.primary.clone();
     durable.shadow = paid.shadow.clone();
     durable.completed_requests = paid.completed_requests;
     durable.failed_primaries = paid.failed_primaries;
     durable.primary_pending = paid.primary_pending;
     durable.background_review_pending = paid.background_review_pending;
+    durable.primary_settlement_bytes = paid.primary_settlement_bytes;
+    durable.reviewer_settlement_bytes = paid.reviewer_settlement_bytes;
     durable.request_evidence = paid.request_evidence.clone();
+    if primary_calls > 0
+        && let Some(evidence) = &mut durable.request_evidence
+    {
+        evidence.retain_numeric_terminal();
+    }
     for (target, source, lane) in [
         (
             &mut durable.last_primary_dispatch,
@@ -761,6 +770,12 @@ fn save_publication(
     publish: impl FnOnce(&Session, &history::Publication) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let mut persisted = session.clone();
+    if !persisted.primary_pending {
+        persisted.primary_settlement_bytes = None;
+    }
+    if !persisted.background_review_pending {
+        persisted.reviewer_settlement_bytes = None;
+    }
     let policy = history::FilePolicy::new(&service.config);
     if let Some(evidence) = &mut persisted.request_evidence
         && evidence.archive_tracking()
@@ -847,6 +862,13 @@ fn save_checkpoint(
     // The full staged file coexists with its old target through SQL publication.
     let mut size = CheckpointSize(0);
     serde_json::to_writer(&mut size, session)?;
+    let outstanding = settlement::outstanding(session);
+    if outstanding > 0 && size.0.saturating_add(outstanding) > max_bytes as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "checkpoint cannot admit its mandatory terminal representation",
+        ));
+    }
     let path = service.config.state_dir.join(format!("{id}.json"));
     let temporary = service.config.state_dir.join(format!(".{id}.tmp"));
     let reusable = match std::fs::symlink_metadata(&temporary) {
@@ -2421,6 +2443,16 @@ async fn forward_timed(
             let before = session.clone();
             session.review_epoch = next_review_generation();
             session.background_review_pending = true;
+            let projection = planning::Projection::canonical(&session);
+            let review_body = review_body_projected(&bounded.config, &session, &projection);
+            session.last_reviewer_dispatch =
+                Some(dispatch_measurement(&request_id, "reviewer", &review_body));
+            settlement::reserve(&service, &mut session, &review_body, false).map_err(|_| {
+                failure(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "cannot admit exceptional review settlement",
+                )
+            })?;
             save(&service, &id, &session).map_err(|_| {
                 failure(
                     StatusCode::INSUFFICIENT_STORAGE,
@@ -2431,7 +2463,6 @@ async fn forward_timed(
                 request_id: request_id.clone(),
                 ..ReviewRun::default()
             };
-            let projection = planning::Projection::canonical(&session);
             timing.active_phase = "blocking_review";
             let started = Instant::now();
             run_review(&bounded, &id, &mut session, &projection, &mut run).await;
@@ -2450,12 +2481,14 @@ async fn forward_timed(
             );
             // run_review already meters synchronous work; publish its receipts
             // before a no-help/failure exit or the primary attempt.
-            save(&service, &id, &session).map_err(|_| {
-                failure(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "review settlement failed",
-                )
-            })?;
+            save(&service, &id, &session)
+                .or_else(|_| save_paid_accounting(&service, &id, &session, &request_id))
+                .map_err(|_| {
+                    failure(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "review settlement failed",
+                    )
+                })?;
             if run.accepted {
                 let _ = history::publish(&bounded, &session, &session);
             }
@@ -2603,6 +2636,12 @@ async fn forward_timed(
         let reviewed = session.clone();
         let mut reserved = session.clone();
         reserved.primary_pending = true;
+        settlement::reserve(&service, &mut reserved, &outbound, true).map_err(|_| {
+            failure(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "cannot admit primary settlement",
+            )
+        })?;
         save(&service, &id, &reserved).map_err(|error| {
             if error.kind() == std::io::ErrorKind::StorageFull {
                 failure(
@@ -3030,7 +3069,10 @@ async fn dispatch_review_for(
     session.last_review_request = session.completed_requests;
     session.review_epoch = next_review_generation();
     session.last_reviewer_dispatch = Some(dispatch_measurement(&request_id, "reviewer", &body));
-    if save(&service, &id, session).is_err() {
+    if settlement::reserve(&service, session, &body, false)
+        .and_then(|_| save(&service, &id, session))
+        .is_err()
+    {
         session.background_review_pending = false;
         service.background_reviews.lock().await.remove(&id);
         return;

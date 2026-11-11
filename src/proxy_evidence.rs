@@ -302,6 +302,10 @@ pub struct RequestEvidence {
     numeric_lost: bool,
     #[serde(skip)]
     archive_access: Option<archive::Access>,
+    // The actual terminal event before semantic prefix compression. Only its
+    // fixed-size numeric witness is needed by mandatory paid-only publication.
+    #[serde(skip)]
+    terminal_numeric: Option<Observation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     comparison_context: Option<archive::ComparisonContext>,
 }
@@ -334,6 +338,7 @@ impl Default for RequestEvidence {
             numeric_primary_items: None,
             numeric_lost: false,
             archive_access: None,
+            terminal_numeric: None,
             comparison_context: None,
         }
     }
@@ -485,6 +490,97 @@ impl RequestEvidence {
         Ok(())
     }
 
+    /// Upper envelope of one mandatory terminal append, its numeric archive
+    /// suffix and the publication-failure boundary. No provider response is
+    /// invented or persisted: this is shape/size admission before transport.
+    pub(crate) fn completion_bound(
+        &self,
+        body: &Value,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+        primary: bool,
+    ) -> std::io::Result<u64> {
+        let event = if primary {
+            // Source/prompt/configuration identities are fixed-width digests.
+            // Their CONTENT is irrelevant to size admission: do not hash or
+            // tokenize another copy of the actual (possibly large) prompt.
+            let shape_body = json!({"model":body["model"]});
+            let mut facts = PrimaryFacts::extract(
+                PrimaryObservation {
+                    body: &shape_body,
+                    response: &Value::Null,
+                    route,
+                    at: 0,
+                    standard: true,
+                    resolved,
+                    cost: Some(0.0),
+                    measurements: None,
+                },
+                None,
+                self.scenario,
+                Some(0),
+            );
+            facts.input = None;
+            facts.semantic_input = None;
+            facts.semantic_output = None;
+            facts.prompt = Some(PromptWitness {
+                items: 0,
+                wire: "0".repeat(64),
+                semantic: "0".repeat(64),
+                prior_prefix: Some((0, "0".repeat(64), "0".repeat(64))),
+            });
+            facts.native = Some(Usage::default());
+            facts.retained = Some(0);
+            facts.retained_visible = Some(0);
+            facts.retained_opaque = Some(0);
+            facts.retained_member = Some(0);
+            facts.allowance = Some(0);
+            facts.fixed = Some(0);
+            facts.protected = Some(0);
+            facts.read_refresh = Some(0);
+            // Implicit and Disabled are the longest serialized mode variants.
+            facts.cache_mode = carry::models::ScenarioCacheMode::Disabled;
+            Observation::Primary {
+                facts: Box::new(facts),
+                restoration: Some(crate::proxy_quantity::RestorationEstimate {
+                    tokens: 0,
+                    measured: true,
+                    estimated_opaque_items: 0,
+                }),
+                edited: false,
+            }
+        } else {
+            Observation::Reviewer {
+                usage: receipts::review_usage_shape(),
+                standard: true,
+                cost: Some(0.0),
+            }
+        };
+        crate::proxy::settlement::size_bound(&json!({
+            "observations":[&event, Observation::Boundary],
+            "numeric_pending":[&event, Observation::Boundary],
+            "numeric_primary_items":0,
+            "prior_untracked":0,
+            "numeric_lost":false,
+            "archive":self.archive,
+        }))
+    }
+
+    /// Keep the actual new receipt's bounded witness without dropping any prior
+    /// observations. Successful semantic publication still keeps full hashes;
+    /// paid-only publication deliberately grants no new semantic authority.
+    pub(crate) fn retain_numeric_terminal(&mut self) {
+        if let Some(event @ Observation::Primary { .. }) = &self.terminal_numeric
+            && let Some(target) = self
+                .observations
+                .iter_mut()
+                .rev()
+                .find(|event| matches!(event, Observation::Primary { .. }))
+        {
+            *target = event.clone();
+        }
+    }
+
     const MAX_OBSERVATIONS: usize = 4096;
     const MAX_REFERENCES: usize = 65536;
 
@@ -532,26 +628,29 @@ impl RequestEvidence {
         self.observations.clear();
     }
     fn append(&mut self, mut observation: Observation) {
+        let numeric = match &observation {
+            Observation::Primary {
+                facts,
+                restoration,
+                edited,
+            } => Some(Observation::Primary {
+                facts: Box::new(
+                    facts.numeric(
+                        self.numeric_primary_items
+                            .unwrap_or_else(|| self.last_prompt().0.len()),
+                    ),
+                ),
+                restoration: *restoration,
+                edited: *edited,
+            }),
+            _ => None,
+        };
+        if numeric.is_some() {
+            self.terminal_numeric = numeric.clone();
+        }
         if self.archive_access.is_some() {
             self.start_numeric();
-            let numeric = match &observation {
-                Observation::Primary {
-                    facts,
-                    restoration,
-                    edited,
-                } => Observation::Primary {
-                    facts: Box::new(
-                        facts.numeric(
-                            self.numeric_primary_items
-                                .unwrap_or_else(|| self.last_prompt().0.len()),
-                        ),
-                    ),
-                    restoration: *restoration,
-                    edited: *edited,
-                },
-                other => other.clone(),
-            };
-            self.queue_numeric(numeric);
+            self.queue_numeric(numeric.unwrap_or_else(|| observation.clone()));
         }
         if self.observations.len() == Self::MAX_OBSERVATIONS {
             self.discard_prefix();
