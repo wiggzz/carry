@@ -952,6 +952,68 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(row["estimate"]["traditional_compactions"], 1)
                 self.assertAlmostEqual(row["estimate"]["summary_cost"], .05675, places=12)
 
+    def test_empty_response_ancestor_keeps_comparison_after_owner_advances(self):
+        """An observed ID remains a cut even when neither input nor output has nodes."""
+        root = self.state
+        outcomes = {}
+        for arm in ("direct", "sibling", "sibling_restart"):
+            with self.subTest(setup=arm):
+                self.state = root / arm
+                self.state.mkdir()
+                b = [{"role": "user", "content": "EMPTY_OUTPUT_B_ONLY"}]
+                c = [{"type": "reasoning", "summary": [], "encrypted_content": "EMPTY_OUTPUT_C"},
+                     {"role": "user", "content": "EMPTY_OUTPUT_FOREGROUND_C"}]
+                receipts = []
+                def primary(body, n):
+                    tokens = 300000 if body["input"] == c else 100
+                    value = completed([], response_id=f"empty_output_{arm}_{n}", input_tokens=tokens)
+                    receipts.append(value)
+                    return 200, value
+                fixture = self.fixture(primary)
+                options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                proxy = self.proxy(fixture, options)
+                fields = {"max_output_tokens": 1}
+                self.assertEqual(proxy.send([], **fields)[0], 200)
+                owner_a, _ = proxy.checkpoint([])
+                ancestor = f"empty_output_{arm}_1"
+                if arm.startswith("sibling"):
+                    self.assertEqual(proxy.send(b, previous_response_id=ancestor, **fields)[0], 200)
+                    self.assertEqual(fixture.primaries[-1]["input"], b)
+                    self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                    if arm == "sibling_restart":
+                        proxy.close()
+                        proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(c, previous_response_id=ancestor, **fields)[0], 200)
+                owner_c, child = proxy.checkpoint(c)
+                states = read_index(self.state / "history.index")["snapshots"]
+                status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                self.assertEqual(status, 200)
+                estimate = next(s["cost_estimate"] for s in stats["sessions"] if s["id"] == owner_c.stem)
+                expected_calls = 2 + int(arm.startswith("sibling"))
+                self.assertEqual(len(receipts), expected_calls)
+                self.assertEqual(len(fixture.primaries), expected_calls)
+                self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                    .06000075 + (expected_calls - 1) * .0000105, places=12)
+                self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), 0)
+                self.assertEqual(fixture.reviews, [])
+                self.assertEqual(fixture.primaries[-1], {"model": "gpt-6-luna", "input": c, **fields})
+                if arm.startswith("sibling"):
+                    self.assertNotEqual(owner_a, owner_c)
+                    self.assertEqual(child["primary"]["calls"], 1)
+                    self.assertAlmostEqual(child["primary"]["cost_usd"], .06000075, places=12)
+                outcomes[arm] = estimate
+                self.evidence[arm] = {"estimate": estimate, "child": child, "states": states,
+                                      "primaries": list(fixture.primaries), "receipts": list(receipts)}
+                proxy.close()
+        self.state = root
+        self.assertEqual(set(outcomes), {"direct", "sibling", "sibling_restart"})
+        for arm, estimate in outcomes.items():
+            with self.subTest(continuity=arm):
+                self.assertEqual(estimate["initial_compactions"], 0)
+                self.assertEqual(estimate["traditional_compactions"], 1)
+                self.assertAlmostEqual(estimate["summary_cost"], .05675, places=12)
+
     def test_shared_prefix_preserves_already_summarized_context_without_inheriting_paid_totals(self):
         """A's summarized quantity survives B; A's and B's money stays owned."""
         root = self.state

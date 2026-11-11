@@ -175,11 +175,15 @@ struct Transcript {
     frontier: String,
     session: String,
     at: u64,
+    // An empty request has no content cut. Bind its dispatch to the observed
+    // response, never the namespace root shared by unrelated histories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    empty_dispatch: Option<Continuation>,
 }
 /// Branch-qualified request evidence, never semantic removal permission or paid
 /// ownership. Advice and actual dispatch have independent completion clocks;
 /// copying advice to every dispatch cut would hide a later ancestor revocation.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Continuation {
     session: String,
     at: u64,
@@ -534,6 +538,36 @@ impl ReadView {
             .flatten()
             .filter(|r| r.policy.as_deref() == Some(self.policy.as_str()))
     }
+    fn continuation(
+        &self,
+        namespace: &str,
+        input: &[Value],
+        original: &Value,
+    ) -> std::io::Result<Option<Continuation>> {
+        let store = self.store.lock().unwrap();
+        if let Some(cut) = prefix_record(&store, "dispatches", namespace, input)? {
+            return Ok(Some(cut));
+        }
+        let external = original["previous_response_id"]
+            .as_str()
+            .map(|id| ("response", id))
+            .or_else(|| conversation(original).map(|id| ("conversation", id)));
+        let Some((kind, external)) = external else {
+            return Ok(None);
+        };
+        let key = hash(&(namespace, kind, external));
+        if !store.live("transcripts", &key)? {
+            return Ok(None);
+        }
+        let Some(reference) = store.get::<Transcript>("transcripts", &key)? else {
+            return Ok(None);
+        };
+        let ancestor = store.ancestry(namespace, &reference.frontier)?;
+        if !input.starts_with(&ancestor) {
+            return Err(std::io::Error::other("invalid observed dispatch ancestry"));
+        }
+        Ok(reference.empty_dispatch)
+    }
 }
 fn prefix_record<T: serde::de::DeserializeOwned>(
     store: &Store,
@@ -558,6 +592,7 @@ pub(super) fn hydrate(
     service: &Service,
     session: &mut Session,
     body: &Value,
+    original: &Value,
 ) -> Result<(), Failure> {
     session.opinions.clear();
     session.completed_review_len = 0;
@@ -571,9 +606,9 @@ pub(super) fn hydrate(
     // still accepts non-array provider input without consulting shared state.
     let input = body["input"].as_array().unwrap();
     let view = ReadView::new(service).map_err(read_failure)?;
-    let continuation =
-        prefix_record::<Continuation>(&view.store.lock().unwrap(), "dispatches", namespace, input)
-            .map_err(read_failure)?;
+    let continuation = view
+        .continuation(namespace, input, original)
+        .map_err(read_failure)?;
     let advice = view.advice(namespace, input);
     if let Some(continuation) = continuation {
         if let Some(evidence) = &mut session.request_evidence {
@@ -651,6 +686,21 @@ fn committed_locked(
         .collect::<Vec<_>>();
     let keys = store.insert(namespace, &input)?;
     let canonical_key = keys.last().unwrap_or(namespace).clone();
+    let mut continuation = observation.map(|_| Continuation {
+        session: id.into(),
+        at: now(),
+        submitted: session.last_submitted_ids.clone(),
+        input: session.primary_input.clone(),
+        comparison_context: session
+            .request_evidence
+            .as_ref()
+            .map(|e| e.comparison_context()),
+    });
+    let empty_dispatch = if keys.is_empty() {
+        continuation.take()
+    } else {
+        None
+    };
     let observed_keys = if let Some((input, _)) = observation {
         store.insert(namespace, input)?
     } else {
@@ -685,6 +735,7 @@ fn committed_locked(
                             frontier: frontier.clone(),
                             session: id.into(),
                             at: now(),
+                            empty_dispatch: empty_dispatch.clone(),
                         },
                         now(),
                         id,
@@ -709,23 +760,8 @@ fn committed_locked(
     if session.history_shared {
         store.put("snapshots", id, &compact(session), now(), id)?;
     }
-    if observation.is_some() {
-        store.put(
-            "dispatches",
-            &canonical_key,
-            &Continuation {
-                session: id.into(),
-                at: now(),
-                submitted: session.last_submitted_ids.clone(),
-                input: session.primary_input.clone(),
-                comparison_context: session
-                    .request_evidence
-                    .as_ref()
-                    .map(|e| e.comparison_context()),
-            },
-            now(),
-            id,
-        )?;
+    if let Some(continuation) = continuation {
+        store.put("dispatches", &canonical_key, &continuation, now(), id)?;
     }
     store.commit()
 }

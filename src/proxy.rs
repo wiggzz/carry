@@ -2390,7 +2390,7 @@ async fn forward_timed(
             .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "cache index unavailable"))?;
         // One branch-qualified lookup owns advice and prior dispatch evidence.
         // Paid-owner tips are indexes, never authority for a sibling's selection.
-        history::hydrate(&service, &mut session, &body)?;
+        history::hydrate(&service, &mut session, &body, &original_body)?;
         session
             .primary_input
             .use_text_memo(&service.text_quantities);
