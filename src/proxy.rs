@@ -4535,7 +4535,7 @@ async fn relay(
                         }
                     }
                     commit.candidate.last_response_id = value["id"].as_str().map(str::to_owned);
-                    if let Some(conversation) = history::conversation(&value) {
+                    if let Some(conversation) = history::conversation(value) {
                         commit.candidate.history_conversation = Some(conversation.into());
                     }
                     commit.candidate.response_frontier = Some(commit.candidate.next_id);
