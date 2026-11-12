@@ -142,7 +142,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.ok(details && !details.open, 'technical detail is available but initially collapsed');
   const context = byClass(root,'context-overview');
   assert.ok(context, 'source state breakdown stays outside technical details');
-  for(const phrase of ['145 removed','12 removable','24 protected','19 unreviewed','4 memories']) {
+  for(const phrase of ['145 removed','12 removable','24 protected','19 unclassified','4 memories']) {
     assert.ok(text(context).includes(phrase), 'context overview includes '+phrase);
   }
   assert.ok(!walk(details).includes(context));
@@ -163,8 +163,14 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     'removed history is not represented by a broken or scaled segment');
   assert.ok(!/not to scale/i.test(text(context)),'no scale disclaimer is needed for a count badge');
   assert.match(bar.getAttribute('aria-label'),/current context/i);
+  assert.match(bar.getAttribute('aria-label'),/19 unclassified/,
+    'accessible counts describe residual classification, not review exposure');
+  assert.ok(!/unreviewed/i.test(text(context)+' '+bar.getAttribute('aria-label')),
+    'a residual source-item count cannot establish that items were never reviewed');
   const legendKeys = walk(context).filter(n => n.className === 'context-key');
   assert.equal(legendKeys.length,3,'every current-context state has a color legend');
+  assert.match(legendKeys[2].title,/not marked removable or protected/i,
+    'residual tooltip explains classification without inventing review history');
   for (const [index,state] of ['removable','protected','unreviewed'].entries()) {
     assert.equal(legendKeys[index].getAttribute('data-state-label'),state);
     assert.equal(bar.children[index].getAttribute('data-state'),state);

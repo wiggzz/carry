@@ -278,7 +278,7 @@ function contextOverview(c){
  const el=document.createElement('div');el.className='context-overview';
  const heading=document.createElement('div');heading.className='context-heading';
  note(heading,'Context · '+fmt(c.history_items)+' source items','label');note(heading,'Item share, not token share','context-basis');el.append(heading);
- const states=[['removable','Removable',c.removable_items],['protected','Protected',c.protected_items],['unreviewed','Unreviewed',c.unreviewed_items]];
+ const states=[['removable','Removable',c.removable_items],['protected','Protected',c.protected_items],['unreviewed','Unclassified',c.unreviewed_items]];
  const known=states.every(([, ,n])=>n!=null),total=known?states.reduce((a,[,,n])=>a+n,0):null;
  const current=document.createElement('div');current.className='context-current';
  const currentHeading=document.createElement('div');currentHeading.className='context-current-heading';
@@ -292,7 +292,7 @@ function contextOverview(c){
  if(total>0)for(const [state,label,n] of states){if(!n)continue;const segment=document.createElement('span');segment.className='context-segment';segment.setAttribute('data-state',state);segment.style.width=(100*n/total)+'%';segment.title=label+': '+fmt(n)+' items ('+(100*n/total).toFixed(1)+'% of current context)';bar.append(segment)}
  current.append(bar);el.append(current);
  const legend=document.createElement('div');legend.className='context-legend';
- for(const [state,label,n] of states){const key=document.createElement('span');key.className='context-key';key.setAttribute('data-state-label',state);key.textContent=fmt(n)+' '+label.toLowerCase();key.title=state==='removable'?'Still included, but authorized for omission.':state==='protected'?'Still included and protected.':'Still included without a current reviewer decision.';legend.append(key)}
+ for(const [state,label,n] of states){const key=document.createElement('span');key.className='context-key';key.setAttribute('data-state-label',state);key.textContent=fmt(n)+' '+label.toLowerCase();key.title=state==='removable'?'Still included, but authorized for omission.':state==='protected'?'Still included and protected.':'Still included; not marked removable or protected. Review history is not inferred.';legend.append(key)}
  const memories=document.createElement('span');memories.className='memories';memories.textContent=fmt(c.memories)+' memories';memories.title='Stored memories; separate from source items and excluded from the bar.';legend.append(memories);el.append(legend);return el;
 }
 function tokenMetrics(s){
