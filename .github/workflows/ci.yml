@@ -207,7 +207,7 @@ jobs:
         run: >-
           python3 -m unittest -v
           scripts/test_benchmark_progress.py
-          scripts/test_benchmark_comparison.py scripts/test_benchmark_direct.py scripts/test_slopcodebench_runtime_cli.py scripts/test_swebench_comparison.py
+          scripts/test_benchmark_comparison.py scripts/test_benchmark_direct.py scripts/test_benchmark_budget.py scripts/test_slopcodebench_runtime_cli.py scripts/test_swebench_comparison.py
           scripts/test_benchmark_preparation_telemetry.py
           scripts/test_benchmark_worker_diagnostics.py
           scripts/test_render_swebench_worker_user_data.py
@@ -511,7 +511,10 @@ jobs:
       - name: Official SCB report component contract (model-free, no Docker)
         env:
           SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
-        run: .scb-upstream/.venv/bin/python -B -m unittest -v scripts.test_benchmark_comparison scripts.test_slopcodebench
+        run: >-
+          .scb-upstream/.venv/bin/python -B -m unittest -v
+          scripts.test_benchmark_comparison scripts.test_slopcodebench
+          scripts.test_slopcodebench_prepare scripts.test_slopcodebench_workflow
       - name: Actual official runner, native exec/retry, gold evaluator, containment and paired receipts
         if: ${{ !cancelled() }}
         timeout-minutes: 12
