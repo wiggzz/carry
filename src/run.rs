@@ -1135,7 +1135,7 @@ async fn run_loop(
         }
         log_assistant_output_text(&mut logger, &reply.raw["output"], step_index)?;
 
-        match reply.step.action.kind {
+        let item_id = match reply.step.action.kind {
             ActionKind::Shell => {
                 if let Some(message) = reply.step.action.message.as_deref() {
                     logger.event(
@@ -1165,37 +1165,51 @@ async fn run_loop(
                 )
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;
-                let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
+                let item_id = context_state.add_tool(reply.output_items, output)?;
                 logger.event(
                     "shell_finished",
                     json!({"result": &result, "context_id": item_id}),
                     &terminal_shell_result(&result),
                 )?;
-                let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
-                    context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
-                    context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
-                protected_until_request.push(item_id);
-                protected_until_request.extend(signals.added.iter().copied());
-                maybe_attach_keep_lease_review(
-                    &mut context_state,
-                    &protected_until_request,
-                    &mut cache,
-                    &mut logger,
-                    &config,
-                    item_id,
+                item_id
+            }
+            ActionKind::Finish => {
+                let output = function_output(
+                    &reply.function_call,
+                    "The answer was delivered to the human; the session may continue.",
                 )?;
-                logger.event_silent(
-                    "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
-                )?;
-                persist_context_checkpoint(&config, &context_state)?;
+                context_state.add_tool(reply.output_items, output)?
+            }
+        };
+        let signals = context_state.record_signals(&reply.step.context, item_id);
+        let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+            context_state.advance_retention_turn();
+            let expired = context_state.resolve_keep_lease_review(&signals.keep);
+            context_state.arm_keep_leases(&signals.keep, lease_turns);
+            expired
+        } else {
+            Vec::new()
+        };
+        protected_until_request.push(item_id);
+        protected_until_request.extend(signals.added.iter().copied());
+        if reply.step.action.kind == ActionKind::Shell || input.is_some() {
+            maybe_attach_keep_lease_review(
+                &mut context_state,
+                &protected_until_request,
+                &mut cache,
+                &mut logger,
+                &config,
+                item_id,
+            )?;
+        }
+        logger.event_silent(
+            "context_signals",
+            json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
+        )?;
+        persist_context_checkpoint(&config, &context_state)?;
 
+        match reply.step.action.kind {
+            ActionKind::Shell => {
                 if let Some(receiver) = input.as_mut()
                     && drain_user_input(receiver, &mut context_state, &mut logger, &config)?.0
                 {
@@ -1219,37 +1233,6 @@ async fn run_loop(
             }
             ActionKind::Finish => {
                 let answer = reply.step.action.answer.clone();
-                let output = function_output(
-                    &reply.function_call,
-                    "The answer was delivered to the human; the session may continue.",
-                )?;
-                let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
-                    context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
-                    context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
-                protected_until_request.push(item_id);
-                protected_until_request.extend(signals.added.iter().copied());
-                if input.is_some() {
-                    maybe_attach_keep_lease_review(
-                        &mut context_state,
-                        &protected_until_request,
-                        &mut cache,
-                        &mut logger,
-                        &config,
-                        item_id,
-                    )?;
-                }
-                logger.event_silent(
-                    "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
-                )?;
-                persist_context_checkpoint(&config, &context_state)?;
                 logger.event(
                     if input.is_some() {
                         "turn_finished"
