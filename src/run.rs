@@ -210,14 +210,51 @@ const TOOL_OUTPUT_PREVIEW_BYTES: usize = TOOL_OUTPUT_INLINE_BYTES / 2;
 const BINARY_OUTPUT_OMISSION_REASON: &str =
     "Shell stream is not UTF-8 text or appears binary; inspect its artifact path instead.";
 
-#[derive(Clone, Debug, Serialize)]
-struct ToolOutputPreview {
-    encoding: &'static str,
-    head: String,
-    tail: Option<String>,
-    omitted_bytes: usize,
-    omission_reason: Option<&'static str>,
-    offloaded: bool,
+#[derive(Clone, Debug)]
+enum ToolOutputPreview {
+    Inline(String),
+    Truncated {
+        head: String,
+        tail: String,
+        omitted_bytes: usize,
+    },
+    Binary(usize),
+}
+
+impl ToolOutputPreview {
+    fn offloaded(&self) -> bool {
+        !matches!(self, Self::Inline(_))
+    }
+}
+
+impl Serialize for ToolOutputPreview {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value = match self {
+            Self::Inline(text) => json!({"output": text}),
+            Self::Truncated {
+                head,
+                tail,
+                omitted_bytes,
+            } => {
+                let mut value = json!({
+                    "metadata": {"truncated": true},
+                    "output_head": head,
+                    "output_tail": tail,
+                });
+                if *omitted_bytes > 0 {
+                    value["metadata"]["omitted_bytes"] = json!(omitted_bytes);
+                }
+                value
+            }
+            Self::Binary(bytes) => json!({"metadata": {
+                "encoding": "binary",
+                "truncated": true,
+                "omitted_bytes": bytes,
+                "omission_reason": BINARY_OUTPUT_OMISSION_REASON,
+            }}),
+        };
+        value.serialize(serializer)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1776,127 +1813,59 @@ async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn preview_tool_output(output: &[u8]) -> ToolOutputPreview {
     let Ok(text) = std::str::from_utf8(output) else {
-        return omitted_binary_output(output.len());
+        return ToolOutputPreview::Binary(output.len());
     };
     if text.contains('\0') {
-        return omitted_binary_output(output.len());
+        return ToolOutputPreview::Binary(output.len());
     }
 
     if output.len() <= TOOL_OUTPUT_INLINE_BYTES
         && json_string_size(text) <= TOOL_OUTPUT_INLINE_BYTES + 2
     {
-        return ToolOutputPreview {
-            encoding: "utf-8",
-            head: text.to_owned(),
-            tail: None,
-            omitted_bytes: 0,
-            omission_reason: None,
-            offloaded: false,
-        };
+        return ToolOutputPreview::Inline(text.to_owned());
     }
 
     let head_end = bounded_utf8_head_end(text);
     let tail_start = bounded_utf8_tail_start(text);
-    if let (Some(head_end), Some(tail_start)) = (head_end, tail_start)
-        && head_end <= tail_start
-    {
-        return ToolOutputPreview {
-            encoding: "utf-8",
-            head: text[..head_end].to_owned(),
-            tail: Some(text[tail_start..].to_owned()),
-            omitted_bytes: tail_start - head_end,
-            omission_reason: None,
-            offloaded: true,
-        };
-    }
-
-    omitted_binary_output(output.len())
-}
-
-fn omitted_binary_output(output_bytes: usize) -> ToolOutputPreview {
-    ToolOutputPreview {
-        encoding: "binary",
-        head: String::new(),
-        tail: None,
-        omitted_bytes: output_bytes,
-        omission_reason: Some(BINARY_OUTPUT_OMISSION_REASON),
-        offloaded: true,
+    ToolOutputPreview::Truncated {
+        head: text[..head_end].to_owned(),
+        tail: text[tail_start..].to_owned(),
+        omitted_bytes: tail_start - head_end,
     }
 }
 
-fn bounded_utf8_head_end(text: &str) -> Option<usize> {
+fn bounded_utf8_head_end(text: &str) -> usize {
     let mut end = TOOL_OUTPUT_PREVIEW_BYTES.min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    loop {
-        if json_string_size(&text[..end]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
-            return Some(end);
-        }
-        if end == 0 {
-            break;
-        }
+    while json_string_size(&text[..end]) > TOOL_OUTPUT_PREVIEW_BYTES + 2 {
         end -= 1;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
     }
-    None
+    end
 }
 
-fn bounded_utf8_tail_start(text: &str) -> Option<usize> {
+fn bounded_utf8_tail_start(text: &str) -> usize {
     let mut start = text.len().saturating_sub(TOOL_OUTPUT_PREVIEW_BYTES);
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    loop {
-        if json_string_size(&text[start..]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
-            return Some(start);
-        }
-        if start == text.len() {
-            break;
-        }
+    while json_string_size(&text[start..]) > TOOL_OUTPUT_PREVIEW_BYTES + 2 {
         start += 1;
         while !text.is_char_boundary(start) {
             start += 1;
         }
     }
-    None
+    start
 }
 
 fn json_string_size(value: &str) -> usize {
     serde_json::to_string(value)
         .expect("serializing a string cannot fail")
         .len()
-}
-
-fn render_stream_output(preview: &ToolOutputPreview) -> serde_json::Value {
-    let mut metadata = serde_json::Map::new();
-    if preview.encoding != "utf-8" {
-        metadata.insert("encoding".into(), json!(preview.encoding));
-    }
-    if preview.offloaded {
-        metadata.insert("truncated".into(), json!(true));
-    }
-    if preview.omitted_bytes > 0 {
-        metadata.insert("omitted_bytes".into(), json!(preview.omitted_bytes));
-    }
-    if let Some(reason) = preview.omission_reason {
-        metadata.insert("omission_reason".into(), json!(reason));
-    }
-    let mut stream = serde_json::Map::new();
-    if !metadata.is_empty() {
-        stream.insert("metadata".into(), serde_json::Value::Object(metadata));
-    }
-    if preview.omission_reason.is_none() {
-        if let Some(tail) = preview.tail.as_ref() {
-            stream.insert("output_head".into(), json!(preview.head));
-            stream.insert("output_tail".into(), json!(tail));
-        } else {
-            stream.insert("output".into(), json!(preview.head));
-        }
-    }
-    serde_json::Value::Object(stream)
 }
 
 fn render_tool_result(result: &ShellResult) -> String {
@@ -1917,20 +1886,14 @@ fn render_tool_result(result: &ShellResult) -> String {
     if result.stderr_bytes > 0 {
         payload.insert("stderr_bytes".into(), json!(result.stderr_bytes));
     }
-    if result.prompt_output.stdout.offloaded {
+    if result.prompt_output.stdout.offloaded() {
         payload.insert("full_stdout_path".into(), json!(result.stdout_path));
     }
-    if result.prompt_output.stderr.offloaded {
+    if result.prompt_output.stderr.offloaded() {
         payload.insert("full_stderr_path".into(), json!(result.stderr_path));
     }
-    payload.insert(
-        "stdout".into(),
-        render_stream_output(&result.prompt_output.stdout),
-    );
-    payload.insert(
-        "stderr".into(),
-        render_stream_output(&result.prompt_output.stderr),
-    );
+    payload.insert("stdout".into(), json!(&result.prompt_output.stdout));
+    payload.insert("stderr".into(), json!(&result.prompt_output.stderr));
     serde_json::to_string_pretty(&serde_json::Value::Object(payload))
         .expect("serializing a shell result cannot fail")
 }
@@ -2562,19 +2525,22 @@ mod tests {
     fn small_stream_output_stays_inline() {
         let output = b"all stdout";
         let preview = preview_tool_output(output);
-        assert_eq!(preview.encoding, "utf-8");
-        assert_eq!(preview.head, String::from_utf8(output.to_vec()).unwrap());
-        assert!(preview.tail.is_none());
-        assert_eq!(preview.omitted_bytes, 0);
+        assert_eq!(json!(preview), json!({"output": "all stdout"}));
     }
 
     #[test]
     fn exact_inline_byte_boundary_is_not_offloaded() {
         let exact = vec![b'x'; 10 * 1024];
-        assert!(preview_tool_output(&exact).tail.is_none());
+        assert!(matches!(
+            preview_tool_output(&exact),
+            ToolOutputPreview::Inline(_)
+        ));
 
         let over = vec![b'x'; 10 * 1024 + 1];
-        assert!(preview_tool_output(&over).tail.is_some());
+        assert!(matches!(
+            preview_tool_output(&over),
+            ToolOutputPreview::Truncated { .. }
+        ));
     }
 
     #[test]
@@ -2582,35 +2548,72 @@ mod tests {
         let full = "ordinary search result\n".repeat(2_000).into_bytes();
         let preview = preview_tool_output(&full);
 
-        assert_eq!(preview.encoding, "utf-8");
-        assert!(preview.tail.is_some());
-        assert!(preview.omission_reason.is_none());
+        let serialized = json!(preview);
+        assert!(serialized["output_tail"].is_string());
+        assert!(serialized["metadata"].get("encoding").is_none());
+        assert!(serialized["metadata"].get("omission_reason").is_none());
     }
 
     #[test]
     fn utf8_preview_boundaries_do_not_split_code_points() {
         let full = "🦀".repeat((TOOL_OUTPUT_INLINE_BYTES / 4) + 1).into_bytes();
         let preview = preview_tool_output(&full);
-        assert_eq!(preview.encoding, "utf-8");
-        let tail = preview.tail.as_ref().unwrap();
-        assert!(!preview.head.contains('�'));
+        let ToolOutputPreview::Truncated {
+            head,
+            tail,
+            omitted_bytes,
+        } = preview
+        else {
+            panic!("large UTF-8 output must retain text previews");
+        };
+        assert!(!head.contains('�'));
         assert!(!tail.contains('�'));
-        assert_eq!(
-            preview.head.len() + preview.omitted_bytes + tail.len(),
-            full.len()
-        );
+        assert_eq!(head.len() + omitted_bytes + tail.len(), full.len());
+    }
+
+    #[test]
+    fn text_preview_preserves_bytes_and_both_serialized_budgets() {
+        for unit in ["x", "🦀", "\n", "\r\t", "\"\\", "a\u{1f}🦀\n"] {
+            for bytes in [0, 1, TOOL_OUTPUT_PREVIEW_BYTES, TOOL_OUTPUT_INLINE_BYTES] {
+                let text = unit.repeat(bytes / unit.len() + 1);
+                let preview = preview_tool_output(text.as_bytes());
+                match &preview {
+                    ToolOutputPreview::Inline(actual) => {
+                        assert_eq!(actual, &text);
+                        assert!(actual.len() <= TOOL_OUTPUT_INLINE_BYTES);
+                        assert!(json_string_size(actual) <= TOOL_OUTPUT_INLINE_BYTES + 2);
+                    }
+                    ToolOutputPreview::Truncated {
+                        head,
+                        tail,
+                        omitted_bytes,
+                    } => {
+                        assert!(text.starts_with(head));
+                        assert!(text.ends_with(tail));
+                        assert_eq!(head.len() + omitted_bytes + tail.len(), text.len());
+                        for part in [head, tail] {
+                            assert!(part.len() <= TOOL_OUTPUT_PREVIEW_BYTES);
+                            assert!(json_string_size(part) <= TOOL_OUTPUT_PREVIEW_BYTES + 2);
+                        }
+                    }
+                    ToolOutputPreview::Binary(_) => panic!("valid non-NUL UTF-8 is text"),
+                }
+            }
+        }
     }
 
     #[test]
     fn binary_output_is_omitted_from_the_model_payload() {
         let full = vec![0; TOOL_OUTPUT_INLINE_BYTES + 1];
         let preview = preview_tool_output(&full);
-        assert_eq!(preview.encoding, "binary");
-        assert!(preview.head.is_empty());
-        assert!(preview.tail.is_none());
-        assert_eq!(preview.omitted_bytes, full.len());
-        assert_eq!(preview.omission_reason, Some(BINARY_OUTPUT_OMISSION_REASON));
-        assert!(preview.offloaded);
+        assert!(preview.offloaded());
+        assert_eq!(
+            json!(preview),
+            json!({"metadata": {
+                "encoding": "binary", "truncated": true, "omitted_bytes": full.len(),
+                "omission_reason": BINARY_OUTPUT_OMISSION_REASON,
+            }})
+        );
     }
 
     #[test]
@@ -2618,12 +2621,14 @@ mod tests {
         let mut full = vec![b'x'; TOOL_OUTPUT_INLINE_BYTES + 1];
         full[100] = 0xff;
         let preview = preview_tool_output(&full);
-        assert_eq!(preview.encoding, "binary");
-        assert!(preview.head.is_empty());
-        assert!(preview.tail.is_none());
-        assert_eq!(preview.omitted_bytes, full.len());
-        assert_eq!(preview.omission_reason, Some(BINARY_OUTPUT_OMISSION_REASON));
-        assert!(preview.offloaded);
+        assert!(preview.offloaded());
+        assert_eq!(
+            json!(preview),
+            json!({"metadata": {
+                "encoding": "binary", "truncated": true, "omitted_bytes": full.len(),
+                "omission_reason": BINARY_OUTPUT_OMISSION_REASON,
+            }})
+        );
     }
 
     #[tokio::test]

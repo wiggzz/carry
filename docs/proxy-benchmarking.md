@@ -503,8 +503,8 @@ recalculating savings; null amounts display `Unavailable`. Excluded sessions
 remain in usage totals and the session list. Scenario fields never disclose the
 prior prompt kept privately for cache matching; session title excerpts are
 disclosed above.
-See [the proxy backlog](proxy-backlog.md) for completed background review and
-consolidation with the shared main savings/report estimator.
+See [the proxy history contract](proxy-fork-continuity.md) for background review
+and request-time projections.
 
 Review modes (`compact`/`audit`) accept full-history input or a delta referencing
 the latest completed `previous_response_id` in the explicit session/branch. Unknown
