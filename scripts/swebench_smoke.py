@@ -1921,36 +1921,42 @@ def agent_timed_out(error: BaseException) -> bool:
     )
 
 
-def publish_agent_artifacts(source: pathlib.Path, destination: pathlib.Path) -> None:
-    """Publish only host-owned regular copies, never the agent's raw tree.
+def publish_agent_artifacts(source: pathlib.Path, destination: pathlib.Path, *, paths=None) -> None:
+    """Publish host-owned regular copies through the rooted no-follow reader.
 
-    Directory validation is not a cleanup guarantee: root-owned/readonly
-    rejected entries can survive. Raw output stays in private worker scratch.
-    Reopen each source with the existing rooted no-follow reader so a mutation
-    after validation cannot turn a copied file into a host-file read.
+    Native consumers may supply their selected relative paths: ignored entries
+    must not be read, validated or mutated. Unfiltered publication retains full
+    tree validation. Both paths share the same byte and published-entry bounds.
     """
-    validate_agent_artifacts(source)
+    if paths is None:
+        validate_agent_artifacts(source)
     if destination.is_symlink() or (destination.exists() and any(destination.iterdir())):
         raise AgentArtifactError('publication destination must be fresh and host-owned')
     destination.mkdir(parents=True, exist_ok=True)
-    count, total = 0, 0
-    for current, directories, files in os.walk(source, followlinks=False):
-        relative = pathlib.Path(current).relative_to(source)
-        for name in directories + files:
-            count += 1
-            if count > 10000 or (pathlib.Path(current)/name).is_symlink():
-                raise AgentArtifactError('unsafe agent publication tree')
-        for name in directories:
-            (destination/relative/name).mkdir(parents=True, exist_ok=True)
-        for name in files:
-            data = agent_artifact_bytes(source, relative/name)
-            total += len(data)
-            if total > AGENT_ARTIFACT_TOTAL_BYTES:
-                raise AgentArtifactError('agent artifact publication budget exceeded')
-            # The destination is outside the agent's mount and never writable
-            # by it. Exclusive creation also refuses a stale publication.
-            with (destination/relative/name).open('xb') as stream:
-                stream.write(data)
+    if paths is None:
+        paths, count = [], 0
+        for current, directories, files in os.walk(source, followlinks=False):
+            relative = pathlib.Path(current).relative_to(source)
+            for name in directories + files:
+                count += 1
+                if count > 10000 or (pathlib.Path(current)/name).is_symlink():
+                    raise AgentArtifactError('unsafe agent publication tree')
+            for name in directories:
+                (destination/relative/name).mkdir(parents=True, exist_ok=True)
+            paths.extend(relative/name for name in files)
+    total, published = 0, set()
+    for relative in paths:
+        relative = pathlib.Path(relative)
+        data = agent_artifact_bytes(source, relative)
+        published.update((relative, *[p for p in relative.parents if p != pathlib.Path('.')]))
+        total += len(data)
+        if len(published) > 10000 or total > AGENT_ARTIFACT_TOTAL_BYTES:
+            raise AgentArtifactError('agent artifact publication budget exceeded')
+        target = destination/relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive host-owned output; the agent cannot mutate this copy.
+        with target.open('xb') as stream:
+            stream.write(data)
 
 
 def run_agent(*, output: pathlib.Path, **kwargs) -> dict[str, Any]:

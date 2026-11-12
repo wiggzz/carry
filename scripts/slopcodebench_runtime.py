@@ -188,7 +188,8 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
     from slop_code.execution.docker_runtime.exec import DockerExecRuntime
     from slop_code.agent_runner.agents.utils import HOME_PATH
     from slop_code.agent_runner.agents.codex.agent import CodexAgent
-    from slop_code.execution.snapshot import Snapshot
+    from slop_code.execution import snapshot as snapshot_module
+    Snapshot = snapshot_module.Snapshot
     old_snapshot = Snapshot.__dict__['from_directory']
     snapshot_from_directory = Snapshot.from_directory
     old_usage = CodexAgent._read_latest_trace_usage
@@ -271,19 +272,28 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
         from slop_code.execution.docker_runtime.streaming import DockerStreamingRuntime
         agents = []
         def owned_snapshot(cls, cwd, *args, **kwargs):
-            # A successful exec can leave background writers. Freeze all owned
-            # agent processes while making the existing bounded no-follow copy;
-            # upstream glob/archive code must see only host-owned regular files.
+            # Let the pinned snapshot owner resolve default/explicit filters.
+            # Its archive may only read bounded host-owned selected files, never
+            # ignored agent state such as virtualenv interpreter symlinks.
             private = snapshots.enter_context(tempfile.TemporaryDirectory(prefix='scb-owned-snapshot-'))
             owned = Path(private)/'workspace'
+            owned.mkdir()
             with ExitStack() as frozen:
                 for agent_runtime in agents:
                     container = agent_runtime._container
                     if container is not None:
                         container.pause()
                         frozen.callback(container.unpause)
-                swebench_smoke.publish_agent_artifacts(cwd, owned)
-            result = snapshot_from_directory(owned, *args, **kwargs)
+                walk = snapshot_module._walk_candidates
+                def select_owned(root, ignore_globs, keep_globs):
+                    if root != owned:
+                        raise ValueError('unexpected official snapshot selection root')
+                    matched, other = walk(cwd, ignore_globs, keep_globs)
+                    swebench_smoke.publish_agent_artifacts(cwd, owned, paths=matched)
+                    return matched, other
+                frozen.callback(setattr, snapshot_module, '_walk_candidates', walk)
+                snapshot_module._walk_candidates = select_owned
+                result = snapshot_from_directory(owned, *args, **kwargs)
             return result.model_copy(update={'path': cwd})
 
         class AgentRuntime(DockerStreamingRuntime):

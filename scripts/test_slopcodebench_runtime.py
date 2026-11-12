@@ -227,6 +227,51 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('CARRY_SCB_HOSTED_FIXTURE') == '1', 'pinned official SCB source required')
 class OfficialSnapshotBoundaryTests(unittest.TestCase):
+    def test_actual_session_finishes_with_ignored_virtualenv_intact(self):
+        self.check_session_snapshot_selection({})
+
+    def test_actual_session_preserves_explicit_ignore_and_keep_precedence(self):
+        for filters in ({'keep_globs': {'cfgpipe.py', '.venv/**', 'drop.pyc'}},
+                        {'ignore_globs': {'.venv/*', '*.txt'}, 'keep_globs': {'*.py', '*.txt'}}):
+            with self.subTest(filters=filters):
+                self.check_session_snapshot_selection(filters)
+
+    def check_session_snapshot_selection(self, filters):
+        from types import SimpleNamespace
+        import venv
+        from slop_code.execution import snapshot as native
+        from slop_code.execution.session import Session
+        from slop_code.execution.workspace import Workspace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with Workspace(None, lambda cwd: native.Snapshot.from_directory(
+                               cwd, env={}, save_path=root/'archives', **filters),
+                           is_agent_infer=True) as workspace:
+                cwd = workspace.working_dir
+                (cwd/'cfgpipe.py').write_text('print("owned solution")\n')
+                (cwd/'extra.txt').write_text('ordinary non-kept fixture')
+                (cwd/'drop.pyc').write_bytes(b'officially ignored bytecode fixture')
+                venv.EnvBuilder(with_pip=False, symlinks=True).create(cwd/'.venv')
+                links = {p.relative_to(cwd): os.readlink(p) for p in (cwd/'.venv').rglob('*') if p.is_symlink()}
+                self.assertTrue(links, 'fixture must contain actual interpreter symlinks')
+                expected = native.Snapshot.from_directory(cwd, env={}, save_path=root/'baseline', **filters)
+                session = Session(SimpleNamespace(type='docker'), workspace, is_agent_infer=True)
+                failure = None
+                with runtime.protected_runtimes({}, {}):
+                    try:
+                        session.finish_checkpoint(root/'completed')
+                    except runtime.swebench_smoke.AgentArtifactError as error:
+                        failure = error
+                    self.assertIsNone(failure, 'officially ignored virtualenv must not abort checkpoint')
+                    actual = workspace.initial_snapshot
+                    self.assertEqual(actual.extract_contents(), expected.extract_contents())
+                    self.assertEqual(actual.matched_paths, expected.matched_paths)
+                    self.assertEqual(actual.other_paths, expected.other_paths)
+                    self.assertEqual((root/'completed/cfgpipe.py').read_bytes(), (cwd/'cfgpipe.py').read_bytes())
+                    self.assertFalse((root/'completed/.venv').exists())
+                    self.assertEqual({p.relative_to(cwd): os.readlink(p) for p in (cwd/'.venv').rglob('*')
+                                      if p.is_symlink()}, links)
+
     def test_actual_snapshot_never_reopens_an_agent_parent_after_discovery(self):
         from slop_code.execution import snapshot as native
         original = native.Snapshot.__dict__['from_directory']
@@ -237,14 +282,15 @@ class OfficialSnapshotBoundaryTests(unittest.TestCase):
             outside = root/'host'; outside.mkdir()
             sentinel = b'HARMLESS_HOST_ONLY_SENTINEL'
             (outside/'payload').write_bytes(sentinel)
-            walk = native._walk_candidates
-            def replace_parent_after_discovery(cwd, *args, **kwargs):
-                result = walk(cwd, *args, **kwargs)
+            publish = runtime.swebench_smoke.publish_agent_artifacts
+            def replace_parent_after_publication(source, destination, **kwargs):
+                result = publish(source, destination, **kwargs)
                 (raw/'sub').rename(raw/'previous')
                 (raw/'sub').symlink_to(outside, target_is_directory=True)
                 return result
             with runtime.protected_runtimes({}, {}), \
-                 patch.object(native, '_walk_candidates', side_effect=replace_parent_after_discovery):
+                 patch.object(runtime.swebench_smoke, 'publish_agent_artifacts',
+                              side_effect=replace_parent_after_publication):
                 captured = native.Snapshot.from_directory(raw, env={})
                 contents = captured.extract_contents()
                 self.assertNotIn(sentinel, contents.values())
@@ -253,16 +299,41 @@ class OfficialSnapshotBoundaryTests(unittest.TestCase):
                 self.assertFalse(captured.archive.is_relative_to(raw))
             self.assertIs(native.Snapshot.__dict__['from_directory'], original)
 
+    def test_actual_snapshot_rejects_parent_swap_before_selected_copy(self):
+        from slop_code.execution import snapshot as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root/'agent'; (raw/'sub').mkdir(parents=True)
+            (raw/'sub/payload').write_bytes(b'agent solution')
+            outside = root/'host'; outside.mkdir()
+            sentinel = b'HARMLESS_HOST_ONLY_SENTINEL'
+            (outside/'payload').write_bytes(sentinel)
+            walk = native._walk_candidates
+            def replace_selected_parent(cwd, *args, **kwargs):
+                result = walk(cwd, *args, **kwargs)
+                (raw/'sub').rename(raw/'previous')
+                (raw/'sub').symlink_to(outside, target_is_directory=True)
+                return result
+            with runtime.protected_runtimes({}, {}), \
+                 patch.object(native, '_walk_candidates', side_effect=replace_selected_parent), \
+                 patch.object(native.tarfile, 'open') as archive:
+                with self.assertRaises(runtime.swebench_smoke.AgentArtifactError):
+                    native.Snapshot.from_directory(raw, env={})
+                archive.assert_not_called()
+                self.assertEqual((outside/'payload').read_bytes(), sentinel)
+            self.assertIs(native._walk_candidates, walk)
+
     def test_snapshot_failure_resumes_every_successfully_frozen_runtime(self):
         from slop_code.execution import runtime as registry, snapshot as native
         from slop_code.execution.docker_runtime.streaming import DockerStreamingRuntime
+        original_walk = native._walk_candidates
         for failure in ('freeze', 'copy'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, \
                  patch.object(DockerStreamingRuntime, '__init__', return_value=None), \
                  patch.object(DockerStreamingRuntime, 'cleanup'), \
                  patch.object(runtime.swebench_smoke, 'force_remove_container'), \
                  patch.object(runtime.swebench_smoke, 'publish_agent_artifacts') as publish, \
-                 patch.object(native, '_walk_candidates') as walk, runtime.protected_runtimes({}, {}):
+                 patch.object(native.tarfile, 'open') as archive, runtime.protected_runtimes({}, {}):
                 agents = [registry.STREAMING_RUNTIME_REGISTRY['docker']() for _ in range(2)]
                 for agent in agents:
                     agent._container = Mock()
@@ -278,7 +349,8 @@ class OfficialSnapshotBoundaryTests(unittest.TestCase):
                     publish.assert_not_called()
                 else:
                     agents[1]._container.unpause.assert_called_once()
-                walk.assert_not_called()
+                archive.assert_not_called()
+                self.assertIs(native._walk_candidates, original_walk)
 
     def test_actual_snapshot_rejects_existing_links_before_native_archive(self):
         from slop_code.execution import snapshot as native
@@ -287,10 +359,10 @@ class OfficialSnapshotBoundaryTests(unittest.TestCase):
             raw = root/'agent'; raw.mkdir()
             outside = root/'host'; outside.write_text('HARMLESS_HOST_ONLY_SENTINEL')
             (raw/'payload').symlink_to(outside)
-            with runtime.protected_runtimes({}, {}), patch.object(native, '_walk_candidates') as walk:
+            with runtime.protected_runtimes({}, {}), patch.object(native.tarfile, 'open') as archive:
                 with self.assertRaises(runtime.swebench_smoke.AgentArtifactError):
                     native.Snapshot.from_directory(raw, env={})
-                walk.assert_not_called()
+                archive.assert_not_called()
 
 
 if __name__ == '__main__':

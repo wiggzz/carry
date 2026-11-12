@@ -56,6 +56,19 @@ class ArtifactPublication(unittest.TestCase):
                 with self.assertRaises(swe.AgentArtifactError):swe.publish_agent_artifacts(raw,out)
             self.assertFalse(any(sentinel.read_bytes() in p.read_bytes() for p in out.rglob('*') if p.is_file()))
 
+    def test_selected_publication_refuses_links_and_byte_overflow(self):
+        for kind in ('link', 'byte_overflow'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root=pathlib.Path(tmp);raw=root/'raw';raw.mkdir();out=root/'published'
+                sentinel=root/'host-only';sentinel.write_text('HARMLESS_HOST_ONLY_SENTINEL')
+                if kind=='link':(raw/'selected').symlink_to(sentinel)
+                else:(raw/'selected').write_bytes(b'owned bytes exceed a tiny declared bound')
+                with mock.patch.object(swe,'AGENT_ARTIFACT_TOTAL_BYTES',4):
+                    with self.assertRaises(swe.AgentArtifactError):
+                        swe.publish_agent_artifacts(raw,out,paths=[pathlib.Path('selected')])
+                self.assertEqual(list(out.rglob('*')),[])
+                self.assertEqual(sentinel.read_text(),'HARMLESS_HOST_ONLY_SENTINEL')
+
     def test_early_budget_rejection_after_failed_worker_keeps_raw_tree_private(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=pathlib.Path(tmp);out=root/'published';out.mkdir();sentinel=root/'host-only';sentinel.write_text('HARMLESS_HOST_ONLY_SENTINEL')
