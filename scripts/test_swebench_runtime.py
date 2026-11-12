@@ -134,6 +134,7 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
         previous_leases = json.loads(budget_state.read_text())['history']
         with fixture.FixtureNetwork(scb_prepared['fixture_provider_image']) as network, \
              patch.dict(os.environ, {'BENCHMARK_BUDGET_STATE': str(budget_state)}), \
+             patch.object(lane.swe, 'start_agent_network', wraps=lane.swe.start_agent_network) as networks, \
              patch.object(lane, 'preflight', side_effect=lambda c,p: lane.comparison.build_plan(c)), \
              patch.object(lane.swe, 'materialize', side_effect=materialize), \
              patch.object(lane.swe, 'run_official_evaluation', side_effect=evaluate), contextlib.redirect_stdout(io.StringIO()):
@@ -142,8 +143,9 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
         authority = json.loads(budget_state.read_text())
         self.assertIsNone(authority['active'])
         self.assertEqual(authority['history'][:len(previous_leases)], previous_leases)
+        self.assertEqual(len(networks.call_args_list), len(lane.comparison.build_plan(contract)['slots']))
         self.assertEqual([lease['identity'] for lease in authority['history'][len(previous_leases):]],
-                         [slot['namespace'] for slot in lane.comparison.build_plan(contract)['slots']])
+                         [call.kwargs['identity'] for call in networks.call_args_list])
         (work/'provider-synthetic.log').write_text(network.provider_log)
         report = json.loads((work/'paired/report.json').read_text())
         self.assertTrue(report['comparison_valid'], (work/'paired/records.jsonl').read_text())
