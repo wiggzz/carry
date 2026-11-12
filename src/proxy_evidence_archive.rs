@@ -108,7 +108,6 @@ fn generation<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Clone, Debug)]
 pub(super) struct Access {
-    directory: PathBuf,
     policy: FilePolicy,
     owner: String,
     namespace: String,
@@ -146,7 +145,7 @@ impl Access {
             }
             Some(_) => return Err(unavailable()),
         };
-        Ok(self.directory.join(format!(
+        Ok(self.policy.directory().join(format!(
             ".request-evidence-{}-{}{suffix}.jsonl",
             self.owner,
             hash(&self.namespace)
@@ -207,8 +206,8 @@ impl Access {
             last = read as u64;
             observe(&line, &record.event)?;
             #[cfg(test)]
-            if self.directory.join(".numeric-read-fault").exists() {
-                std::fs::remove_file(self.directory.join(".numeric-read-fault"))?;
+            if self.policy.directory().join(".numeric-read-fault").exists() {
+                std::fs::remove_file(self.policy.directory().join(".numeric-read-fault"))?;
                 return Err(unavailable());
             }
         }
@@ -246,8 +245,14 @@ fn encode(mark: &mut Watermark, event: &Observation) -> std::io::Result<Vec<u8>>
 
 fn write_numeric(access: &Access, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
-    if !bytes.is_empty() && access.directory.join(".numeric-write-fault").exists() {
-        std::fs::remove_file(access.directory.join(".numeric-write-fault"))?;
+    if !bytes.is_empty()
+        && access
+            .policy
+            .directory()
+            .join(".numeric-write-fault")
+            .exists()
+    {
+        std::fs::remove_file(access.policy.directory().join(".numeric-write-fault"))?;
         file.write_all(&bytes[..bytes.len() / 2])?;
         file.sync_all()?;
         return Err(std::io::Error::other("injected partial numeric write"));
@@ -371,7 +376,6 @@ impl RequestEvidence {
             |mark| mark.namespace.clone(),
         );
         self.archive_access = Some(Access {
-            directory: policy.directory().to_owned(),
             policy: policy.clone(),
             owner: owner.into(),
             namespace,
@@ -601,7 +605,7 @@ impl RequestEvidence {
             }
         }
         publication.admit_file(
-            &access.directory,
+            access.policy.directory(),
             desired.bytes.saturating_sub(existing_bytes),
         )?;
         let mut mark = base.clone();
@@ -613,7 +617,7 @@ impl RequestEvidence {
             write_numeric(access, &mut file, &line[reused..])?;
         }
         file.sync_all()?;
-        File::open(&access.directory)?.sync_all()?;
+        File::open(access.policy.directory())?.sync_all()?;
         self.finish_numeric(mark);
         Ok(())
     }
@@ -656,8 +660,8 @@ impl RequestEvidence {
         }
         // The temporary fork contains the entire committed prefix as well as
         // its new suffix. Admit that full peak before creating/copying it.
-        publication.admit_file(&access.directory, desired.bytes)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(&access.directory)?;
+        publication.admit_file(access.policy.directory(), desired.bytes)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(access.policy.directory())?;
         access.scan(base, |line, _| {
             write_numeric(access, temporary.as_file_mut(), line)
         })?;
@@ -674,7 +678,7 @@ impl RequestEvidence {
             }
             Err(error) => return Err(error.error),
         }
-        File::open(&access.directory)?.sync_all()?;
+        File::open(access.policy.directory())?.sync_all()?;
         self.finish_numeric(desired);
         Ok(())
     }

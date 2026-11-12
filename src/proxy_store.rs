@@ -50,17 +50,12 @@ impl Policy {
 
 pub(super) struct Store {
     pub(super) connection: Connection,
-    max_record: usize,
+    policy: Policy,
     physical_record_bound: u64,
     publish_record_bound: bool,
-    max_nodes: usize,
     at: u64,
-    age: u64,
     pins: HashSet<String>,
-    accounting_age: u64,
-    directory: PathBuf,
     retired: std::cell::RefCell<Vec<String>>,
-    disk_limit: u64,
     projected_bytes: std::cell::Cell<u64>,
     reserved_bytes: std::cell::Cell<u64>,
     pending: std::cell::RefCell<BTreeMap<(String, String), Pending>>,
@@ -440,13 +435,13 @@ impl Store {
     ) -> std::io::Result<()> {
         // Explicit files share the SQL record bound used to promise paid
         // settlement capacity, including the full coexisting staged file.
-        if bytes > self.max_record as u64 {
+        if bytes > self.policy.max_record as u64 {
             return Err(full());
         }
         self.admit_file(directory, bytes.saturating_sub(reusable))
     }
     pub(super) fn admit_file(&self, directory: &Path, additional: u64) -> std::io::Result<()> {
-        if directory != self.directory.as_path() {
+        if directory != self.policy.directory.as_path() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "physical write owner directory mismatch",
@@ -456,8 +451,8 @@ impl Store {
         // Keep the connected footprint and the very same paid/maintenance
         // promises used by transaction admission until the writer is finished.
         admit_extent(
-            &self.directory,
-            self.disk_limit,
+            &self.policy.directory,
+            self.policy.disk_limit,
             self.reserved_bytes.get(),
             additional,
         )
@@ -468,18 +463,18 @@ impl Store {
         let charge = write_charge(bytes);
         let next = self.projected_bytes.get().saturating_add(charge);
         let reserved = self.reserved_bytes.get();
-        if next.saturating_add(reserved) > self.disk_limit {
+        if next.saturating_add(reserved) > self.policy.disk_limit {
             #[cfg(test)]
             eprintln!(
                 "retention-capacity: bytes={bytes} projected={} next={next} reserved={reserved} limit={} physical={:?}",
                 self.projected_bytes.get(),
-                self.disk_limit,
-                disk_bytes(&self.directory, 0)
+                self.policy.disk_limit,
+                disk_bytes(&self.policy.directory, 0)
             );
             return Err(full());
         }
         #[cfg(unix)]
-        if free_bytes(&self.directory)?
+        if free_bytes(&self.policy.directory)?
             < charge
                 .saturating_add(reserved)
                 .saturating_add(16 * 1024 * 1024)
@@ -602,12 +597,10 @@ impl Store {
         let physical_record_bound = retained_bound.max(policy.max_record as u64);
         Ok(Self {
             connection,
-            max_record: policy.max_record,
+            policy: policy.clone(),
             physical_record_bound,
             publish_record_bound: recorded != Some(physical_record_bound),
-            max_nodes: policy.max_nodes,
             at: now(),
-            age: policy.age,
             reserved_bytes: std::cell::Cell::new(protected_bytes(
                 policy.max_record as u64,
                 physical_record_bound,
@@ -615,10 +608,7 @@ impl Store {
                 policy.disk_limit,
             )),
             pins,
-            accounting_age: policy.accounting_age,
-            directory: policy.directory.clone(),
             retired: Default::default(),
-            disk_limit: policy.disk_limit,
             projected_bytes: Default::default(),
             pending: Default::default(),
             pending_bytes: Default::default(),
@@ -641,7 +631,7 @@ impl Store {
             .connection
             .query_row(
                 "SELECT length(data), CASE WHEN length(data)<=?3 THEN data ELSE NULL END FROM records WHERE kind=?1 AND key=?2",
-                params![kind, key, self.max_record as i64],
+                params![kind, key, self.policy.max_record as i64],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -649,7 +639,7 @@ impl Store {
         let Some((length, data)) = bytes else {
             return Ok(None);
         };
-        if length > self.max_record {
+        if length > self.policy.max_record {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 "retained history record exceeds working-set bound",
@@ -676,7 +666,7 @@ impl Store {
             .optional()
             .map_err(error)?;
         Ok(row.is_some_and(|(at, owner)| {
-            self.pins.contains(&owner) || at > self.at || self.at - at < self.age
+            self.pins.contains(&owner) || at > self.at || self.at - at < self.policy.age
         }))
     }
     pub(super) fn contains(&self, kind: &str, key: &str) -> std::io::Result<bool> {
@@ -704,7 +694,7 @@ impl Store {
         owner: &str,
     ) -> std::io::Result<()> {
         let bytes = serde_json::to_vec(value)?;
-        if bytes.len() > self.max_record {
+        if bytes.len() > self.policy.max_record {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 "history record exceeds working-set bound",
@@ -723,7 +713,7 @@ impl Store {
             .get()
             .saturating_sub(old)
             .saturating_add(bytes.len() + owner.len() + key.0.len() + key.1.len());
-        if next > self.max_record.saturating_mul(8) {
+        if next > self.policy.max_record.saturating_mul(8) {
             return Err(full());
         }
         self.pending_bytes.set(next);
@@ -741,7 +731,7 @@ impl Store {
         self.replaced_tips.borrow_mut().insert(owner.into());
     }
     pub(super) fn insert(&self, namespace: &str, input: &[Value]) -> std::io::Result<Vec<String>> {
-        if input.len() > self.max_nodes {
+        if input.len() > self.policy.max_nodes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 "history path exceeds working-set bound",
@@ -774,7 +764,7 @@ impl Store {
         let mut values = Vec::new();
         let mut bytes = 0usize;
         while key != namespace {
-            if values.len() >= self.max_nodes {
+            if values.len() >= self.policy.max_nodes {
                 return Err(std::io::Error::other(
                     "history ancestry exceeds working-set bound",
                 ));
@@ -783,7 +773,7 @@ impl Store {
                 .get("nodes", &key)?
                 .ok_or_else(|| std::io::Error::other("history ancestry unavailable"))?;
             bytes = bytes.saturating_add(serde_json::to_vec(&node)?.len());
-            if bytes > self.max_record {
+            if bytes > self.policy.max_record {
                 return Err(std::io::Error::other("history ancestry exceeds byte bound"));
             }
             values.push(node["value"].clone());
@@ -902,7 +892,7 @@ impl Store {
         }
         self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM records INDEXED BY records_owner WHERE kind='accounting' AND owner=?1 AND at>=?2)",
-            params![id, self.at.saturating_sub(self.accounting_age)],
+            params![id, self.at.saturating_sub(self.policy.accounting_age)],
             |row| row.get(0),
         ).map_err(error)
     }
@@ -927,8 +917,8 @@ impl Store {
             .map_err(error)?;
         let mut rows = statement
             .query(params![
-                self.max_record as u64,
-                self.at.saturating_sub(self.accounting_age)
+                self.policy.max_record as u64,
+                self.at.saturating_sub(self.policy.accounting_age)
             ])
             .map_err(error)?;
         let mut totals = crate::proxy_savings::DashboardTotals::default();
@@ -938,7 +928,7 @@ impl Store {
             if self.live("owners", &owner)? {
                 continue;
             }
-            if row.get::<_, usize>(0).map_err(error)? > self.max_record {
+            if row.get::<_, usize>(0).map_err(error)? > self.policy.max_record {
                 return Err(full());
             }
             let data: Vec<u8> = row.get(1).map_err(error)?;
@@ -960,7 +950,7 @@ impl Store {
         Ok((totals, usage))
     }
     pub(super) fn accounting_window(&self, start: u64, end: u64) -> std::io::Result<Value> {
-        let cutoff = self.at.saturating_sub(self.accounting_age);
+        let cutoff = self.at.saturating_sub(self.policy.accounting_age);
         // records_owner provides bounded disk-backed owner ordering. Sequence
         // keys order immutable observations, including same-second revisions.
         let mut statement = self.connection.prepare(
@@ -968,11 +958,11 @@ impl Store {
              FROM records INDEXED BY records_owner WHERE kind='accounting' AND at>=?2 ORDER BY owner,key"
         ).map_err(error)?;
         let mut rows = statement
-            .query(params![self.max_record as u64, cutoff])
+            .query(params![self.policy.max_record as u64, cutoff])
             .map_err(error)?;
         let mut window = accounting::Window::new(start, end, cutoff);
         while let Some(row) = rows.next().map_err(error)? {
-            if row.get::<_, usize>(3).map_err(error)? > self.max_record {
+            if row.get::<_, usize>(3).map_err(error)? > self.policy.max_record {
                 return Err(full());
             }
             let owner: String = row.get(0).map_err(error)?;
@@ -992,8 +982,8 @@ impl Store {
         let mut statement=self.connection.prepare("SELECT key,at,length(data),CASE WHEN length(data)<=?1 THEN data ELSE NULL END FROM records WHERE kind='accounting' AND at>=?2 AND (at>?3 OR (at=?3 AND key>?4)) ORDER BY at,key LIMIT ?5").map_err(error)?;
         let mut rows = statement
             .query(params![
-                self.max_record as u64,
-                self.at.saturating_sub(self.accounting_age),
+                self.policy.max_record as u64,
+                self.at.saturating_sub(self.policy.accounting_age),
                 after_at,
                 after_key,
                 (limit + 1) as u64
@@ -1005,13 +995,13 @@ impl Store {
         let mut more = false;
         while let Some(row) = rows.next().map_err(error)? {
             let length: usize = row.get(2).map_err(error)?;
-            if length > self.max_record {
+            if length > self.policy.max_record {
                 return Err(std::io::Error::other(
                     "accounting record exceeds working-set bound",
                 ));
             }
             if records.len() == limit
-                || (!records.is_empty() && bytes.saturating_add(length) > self.max_record)
+                || (!records.is_empty() && bytes.saturating_add(length) > self.policy.max_record)
             {
                 more = true;
                 break;
@@ -1024,7 +1014,7 @@ impl Store {
             );
         }
         Ok(
-            json!({"records":records,"has_more":more,"next":if more{next}else{None},"basis":"immutable cumulative observations; select one observation per owner and time, never sum snapshots", "accounting_retention_secs":self.accounting_age,"raw_history_retention_secs":self.age}),
+            json!({"records":records,"has_more":more,"next":if more{next}else{None},"basis":"immutable cumulative observations; select one observation per owner and time, never sum snapshots", "accounting_retention_secs":self.policy.accounting_age,"raw_history_retention_secs":self.policy.age}),
         )
     }
     fn expire(&self, kind: &str, cutoff: u64, budget: &mut u64) -> std::io::Result<Vec<String>> {
@@ -1079,21 +1069,21 @@ impl Store {
                 .map_err(error)?;
         }
         let mut changed = false;
-        if let Some(cutoff) = self.at.checked_sub(self.age) {
+        if let Some(cutoff) = self.at.checked_sub(self.policy.age) {
             *self.retired.borrow_mut() = self.expire("snapshots", cutoff, budget)?;
             changed |= !self.retired.borrow().is_empty();
             for kind in ["tips", "transcripts", "reviews", "dispatches", "nodes"] {
                 changed |= !self.expire(kind, cutoff, budget)?.is_empty();
             }
         }
-        if let Some(cutoff) = self.at.checked_sub(self.accounting_age) {
+        if let Some(cutoff) = self.at.checked_sub(self.policy.accounting_age) {
             changed |= !self.expire("accounting", cutoff, budget)?.is_empty();
             changed |= !self.expire("accounted", cutoff, budget)?.is_empty();
         }
         Ok(changed)
     }
     fn maintain(&self) -> std::io::Result<bool> {
-        let allowance = maintenance_reserve(self.physical_record_bound, self.disk_limit);
+        let allowance = maintenance_reserve(self.physical_record_bound, self.policy.disk_limit);
         let reserved = self.reserved_bytes.get();
         // Spend maintenance's promise only; every paid owner keeps its full
         // settlement reserve. Restore the normal reservation even on failure.
@@ -1137,7 +1127,7 @@ impl Store {
             self.reserved_bytes.set(
                 self.reserved_bytes
                     .get()
-                    .saturating_sub(settlement_reserve(self.max_record as u64)),
+                    .saturating_sub(settlement_reserve(self.policy.max_record as u64)),
             );
         }
         self.settlement.set(true);
@@ -1145,7 +1135,7 @@ impl Store {
     }
     fn start(&self) -> std::io::Result<()> {
         self.projected_bytes
-            .set(disk_bytes(&self.directory, 0)?.saturating_add(65536));
+            .set(disk_bytes(&self.policy.directory, 0)?.saturating_add(65536));
         self.charge(0)?;
         self.connection
             .execute_batch("BEGIN IMMEDIATE")
@@ -1179,11 +1169,11 @@ impl Store {
         // Bound each call to eight batches (64 vacuum pages, eight row batches
         // per kind); continued pressure returns backpressure, not unbounded GC.
         for pass in 0..=8 {
-            let physical = disk_bytes(&self.directory, 0)?;
+            let physical = disk_bytes(&self.policy.directory, 0)?;
             if physical
                 .saturating_add(demand)
                 .saturating_add(self.reserved_bytes.get())
-                <= self.disk_limit
+                <= self.policy.disk_limit
             {
                 break;
             }
@@ -1191,7 +1181,7 @@ impl Store {
                 return Err(full());
             }
             let changed = self.maintain()?;
-            if !changed && disk_bytes(&self.directory, 0)? >= physical {
+            if !changed && disk_bytes(&self.policy.directory, 0)? >= physical {
                 return Err(full());
             }
         }
@@ -1216,7 +1206,7 @@ impl Store {
         self.connection.execute_batch("COMMIT").map_err(error)?;
         for id in self.retired.take() {
             if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                let _ = std::fs::remove_file(self.directory.join(format!("{id}.json")));
+                let _ = std::fs::remove_file(self.policy.directory.join(format!("{id}.json")));
             }
         }
         Ok(())
