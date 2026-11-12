@@ -854,10 +854,10 @@ async fn run_loop(
         RunLogger::create_with_events(&config.session_dir, events.clone())?
     };
     if let Some(reason) = trace_recovery {
-        logger.raw_event_silent("trace_recovery", json!({"reason": reason}))?;
+        logger.event_silent("trace_recovery", json!({"reason": reason}))?;
     }
     if let Some(context) = config.resume_context.as_ref() {
-        logger.raw_event(
+        logger.event(
             "session_resumed",
             json!({
                 "cwd": config.cwd,
@@ -880,7 +880,7 @@ async fn run_loop(
             ),
         )?;
     } else {
-        logger.raw_event(
+        logger.event(
             "run_started",
             json!({
                 "cwd": config.cwd,
@@ -908,13 +908,13 @@ async fn run_loop(
     });
     if resumed && !config.prompt.trim().is_empty() {
         let id = context_state.add_user(config.prompt.clone());
-        logger.raw_event(
+        logger.event(
             "human_message",
             human_message_data(id, &config.prompt, initial_submission_id.as_deref()),
             &format!("  prompt [{id}] submitted"),
         )?;
     } else if !resumed {
-        logger.raw_event(
+        logger.event(
             "human_message",
             human_message_data(1, &config.prompt, initial_submission_id.as_deref()),
             "  prompt [1] submitted",
@@ -946,7 +946,7 @@ async fn run_loop(
         if let Some(max_steps) = config.max_steps
             && turn_step >= max_steps
         {
-            logger.raw_event(
+            logger.event(
                 "run_failed",
                 json!({"reason": "max_steps", "max_steps": max_steps}),
                 &format!("stopped after reaching {max_steps} steps"),
@@ -999,7 +999,7 @@ async fn run_loop(
         );
         protected_until_request.clear();
         let request_started = Instant::now();
-        logger.raw_event_silent(
+        logger.event_silent(
             "model_request",
             json!({
                 "step": step_index,
@@ -1064,13 +1064,13 @@ async fn run_loop(
                 {
                     let usage = crate::openai::extract_usage(&response.raw);
                     metrics.record(&usage, response.latency_ms, response.response_retries);
-                    logger.raw_event_silent("model_response", json!({
+                    logger.event_silent("model_response", json!({
                         "step": step_index, "raw": response.raw, "usage": usage,
                         "latency_ms": response.latency_ms, "response_retries": response.response_retries,
                         "action_valid": false
                     }))?;
                 }
-                logger.raw_event(
+                logger.event(
                     "model_error",
                     json!({
                         "step": step_index,
@@ -1102,7 +1102,7 @@ async fn run_loop(
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         sent_model_request = true;
         cache.observe_receipt(&reply.raw["usage"]);
-        logger.raw_event(
+        logger.event(
             "model_response",
             json!({
                 "step": step_index,
@@ -1138,7 +1138,7 @@ async fn run_loop(
         match reply.step.action.kind {
             ActionKind::Shell => {
                 if let Some(message) = reply.step.action.message.as_deref() {
-                    logger.raw_event(
+                    logger.event(
                         "assistant_message",
                         json!({"step": step_index, "message": message}),
                         &format!("  {message}"),
@@ -1146,7 +1146,7 @@ async fn run_loop(
                 }
                 let command = reply.step.action.command.as_deref().unwrap();
                 let call_id = format!("tool-{step_index}");
-                logger.raw_event(
+                logger.event(
                     "shell_started",
                     json!({"step": step_index, "call_id": call_id, "command": command}),
                     &format!("  $ {command}"),
@@ -1166,7 +1166,7 @@ async fn run_loop(
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;
                 let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                logger.raw_event(
+                logger.event(
                     "shell_finished",
                     json!({"result": &result, "context_id": item_id}),
                     &terminal_shell_result(&result),
@@ -1190,7 +1190,7 @@ async fn run_loop(
                     &config,
                     item_id,
                 )?;
-                logger.raw_event_silent(
+                logger.event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
@@ -1245,12 +1245,12 @@ async fn run_loop(
                         item_id,
                     )?;
                 }
-                logger.raw_event_silent(
+                logger.event_silent(
                     "context_signals",
                     json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
                 )?;
                 persist_context_checkpoint(&config, &context_state)?;
-                logger.raw_event(
+                logger.event(
                     if input.is_some() {
                         "turn_finished"
                     } else {
@@ -1328,7 +1328,7 @@ async fn finish_shutdown(
     logger: &mut RunLogger,
     started: Instant,
 ) -> Result<RunOutcome> {
-    logger.raw_event(
+    logger.event(
         "run_failed",
         json!({"reason": "deadline_shutdown", "usage_recorded": metrics.usage}),
         "  deadline reached; stopped without starting more work",
@@ -1388,7 +1388,7 @@ fn append_user_message(
     } else {
         format!("  prompt [{id}] submitted")
     };
-    logger.raw_event(
+    logger.event(
         "human_message",
         human_message_data(id, &message, submission_id.as_deref()),
         &terminal,
@@ -1496,7 +1496,7 @@ fn maybe_attach_keep_lease_review(
     }
     let review = state.attach_due_keep_lease_review_to(host_id);
     if !review.item_ids.is_empty() {
-        logger.raw_event_silent(
+        logger.event_silent(
             "retention_revalidation_requested",
             json!({
                 "item_ids": review.item_ids,
@@ -1524,7 +1524,7 @@ fn maybe_compact(
     let after = crate::savings::token_units(&json!(state.input_items()));
     cache.mark_compaction(&change.invalidated_generations);
     metrics.record_compaction();
-    logger.raw_event(
+    logger.event(
         "context_compacted",
         json!({
             "trigger": trigger,
@@ -1550,7 +1550,7 @@ fn maybe_compact(
 
 fn log_assistant_output_text(logger: &mut RunLogger, output: &Value, step: usize) -> Result<()> {
     for message in assistant_output_text(output) {
-        logger.raw_event(
+        logger.event(
             "assistant_message",
             json!({"step": step, "message": message}),
             &format!("  {message}"),

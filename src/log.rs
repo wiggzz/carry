@@ -95,11 +95,11 @@ impl RunLogger {
         })
     }
 
-    pub fn event<T: Serialize>(&mut self, event: &str, data: &T, human: &str) -> Result<()> {
-        self.write_event(event, data, Some(human))
+    pub fn event<T: Serialize>(&mut self, event: &str, data: T, human: &str) -> Result<()> {
+        self.write_event(event, &data, Some(human))
     }
-    pub fn event_silent<T: Serialize>(&mut self, event: &str, data: &T) -> Result<()> {
-        self.write_event(event, data, None)
+    pub fn event_silent<T: Serialize>(&mut self, event: &str, data: T) -> Result<()> {
+        self.write_event(event, &data, None)
     }
 
     fn write_event<T: Serialize>(
@@ -125,12 +125,6 @@ impl RunLogger {
         }
         Ok(())
     }
-    pub fn raw_event(&mut self, event: &str, data: Value, human: &str) -> Result<()> {
-        self.event(event, &data, human)
-    }
-    pub fn raw_event_silent(&mut self, event: &str, data: Value) -> Result<()> {
-        self.event_silent(event, &data)
-    }
 }
 fn open(path: impl AsRef<Path>) -> Result<File> {
     OpenOptions::new()
@@ -145,6 +139,79 @@ fn append(path: impl AsRef<Path>) -> Result<File> {
         .append(true)
         .open(path.as_ref())
         .with_context(|| format!("failed to append log: {}", path.as_ref().display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_sinks_preserve_payloads_sequence_and_resume_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, mut receiver) = broadcast::channel(8);
+        let payload = json!({"nested":{"answer":42},"text":"é 🦀"});
+        let mut logger =
+            RunLogger::create_with_events(directory.path(), Some(events.clone())).unwrap();
+        logger
+            .event("visible", payload.clone(), "human output")
+            .unwrap();
+        logger.event_silent("silent", payload.clone()).unwrap();
+        drop(logger);
+        let mut logger = RunLogger::resume_with_events(directory.path(), Some(events)).unwrap();
+        logger.event_silent("resumed", payload.clone()).unwrap();
+        drop(logger);
+
+        let trace = std::fs::read_to_string(directory.path().join("trace.jsonl")).unwrap();
+        let records = trace
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["seq"], index + 1);
+            assert_eq!(record["run_id"], records[0]["run_id"]);
+            assert_eq!(record["schema_version"], 1);
+            assert_eq!(record["data"], payload);
+            assert_eq!(receiver.try_recv().unwrap(), *record);
+        }
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["visible", "silent", "resumed"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("trace.log")).unwrap(),
+            "human output\n"
+        );
+    }
+
+    #[test]
+    fn recovery_segment_appends_without_rewriting_an_invalid_trace() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("trace.jsonl"), "broken\n").unwrap();
+        std::fs::write(directory.path().join("trace.log"), "old output\n").unwrap();
+        assert!(RunLogger::resume_with_events(directory.path(), None).is_err());
+        let (events, mut receiver) = broadcast::channel(1);
+        let mut logger =
+            RunLogger::recovery_segment_with_events(directory.path(), Some(events)).unwrap();
+        logger
+            .event("recovered", json!({"reason":"invalid trace"}), "new output")
+            .unwrap();
+        drop(logger);
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event["seq"], 1);
+        assert!(event["run_id"].as_str().unwrap().contains("-recovered-"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("trace.jsonl")).unwrap(),
+            format!("broken\n{event}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("trace.log")).unwrap(),
+            "old output\nnew output\n"
+        );
+    }
 }
 
 fn now_ms() -> u128 {
