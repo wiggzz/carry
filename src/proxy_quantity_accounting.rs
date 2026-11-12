@@ -40,28 +40,10 @@ impl InputMeasurements {
     }
 
     fn fully_measured(&self, changed: &[&Item]) -> bool {
-        let mut used = vec![false; changed.len()];
-        for block in self.blocks.iter().rev() {
-            if block.items.is_empty() || block.items.len() > changed.len() {
-                continue;
-            }
-            if let Some(start) =
-                changed
-                    .windows(block.items.len())
-                    .enumerate()
-                    .find_map(|(start, items)| {
-                        (!used[start..start + items.len()].iter().any(|b| *b)
-                            && items
-                                .iter()
-                                .zip(&block.items)
-                                .all(|(item, id)| item.identity == *id))
-                        .then_some(start)
-                    })
-            {
-                used[start..start + block.items.len()].fill(true);
-            }
-        }
-        used.into_iter().all(|b| b)
+        self.measured_changes(changed)
+            .1
+            .into_iter()
+            .all(|used| used)
     }
 
     // All compatible retained native increments contribute; an initial native
@@ -142,11 +124,6 @@ impl InputMeasurements {
         if self.reasoning_conflict || self.contract != expected {
             return None;
         }
-        let blocks: Vec<_> = self
-            .blocks
-            .iter()
-            .map(|block| (block, &block.allocation))
-            .collect();
         // A complete inherited native prefix is also one residual cohort.
         // Account for fixed overhead/protected items and complete measured
         // blocks first. No ciphertext length or planner-specific weighting.
@@ -161,85 +138,67 @@ impl InputMeasurements {
             });
         let mut pool_residual = 0u64;
         let mut pool_count = 0u64;
-        for (_, allocation) in &blocks {
-            if let Some(allocation) = allocation {
-                pool_residual = pool_residual.checked_add(allocation.residual)?;
-                pool_count = pool_count.checked_add(allocation.opaque_items)?;
-            }
+        for allocation in self
+            .blocks
+            .iter()
+            .filter_map(|block| block.allocation.as_ref())
+        {
+            pool_residual = pool_residual.checked_add(allocation.residual)?;
+            pool_count = pool_count.checked_add(allocation.opaque_items)?;
         }
         if let Some((_, allocation)) = &inherited {
             pool_residual = pool_residual.checked_add(allocation.residual)?;
             pool_count = pool_count.checked_add(allocation.opaque_items)?;
         }
-        let changed_quantity =
-            |changed: &[&Item]| -> Option<(i128, u64)> {
-                let mut used = vec![false; changed.len()];
-                let mut quantity = 0i128;
-                let mut estimated = 0u64;
-                // Whole measured blocks win over all member allocations.
-                for (block, _) in blocks.iter().rev() {
-                    if block.items.is_empty() || block.items.len() > changed.len() {
-                        continue;
-                    }
-                    if let Some(start) = changed.windows(block.items.len()).enumerate().find_map(
-                        |(start, window)| {
-                            (!used[start..start + window.len()].iter().any(|b| *b)
-                                && window
-                                    .iter()
-                                    .zip(&block.items)
-                                    .all(|(item, id)| item.identity == *id))
-                            .then_some(start)
-                        },
-                    ) {
-                        used[start..start + block.items.len()].fill(true);
-                        quantity = quantity.checked_add(block.input as i128)?;
-                    }
+        let changed_quantity = |changed: &[&Item]| -> Option<(i128, u64)> {
+            // Whole measured blocks win over all member allocations.
+            let (mut quantity, used) = self.measured_changes(changed);
+            let mut estimated = 0u64;
+            for (item, used) in changed.iter().zip(used) {
+                if used {
+                    continue;
                 }
-                for (item, used) in changed.iter().zip(used) {
-                    if used {
-                        continue;
-                    }
-                    let value = *available.get(&item.identity)?;
-                    if !item.opaque {
-                        quantity = quantity.checked_add(self.text_tokens(value, true)? as i128)?;
-                        continue;
-                    }
-                    if !accounting_reasoning(value) {
-                        return None;
-                    }
-                    let mut native_allocated = None;
-                    for (block, allocation) in &blocks {
-                        if let Some(allocation) = allocation {
-                            for (index, id) in block.items.iter().enumerate() {
-                                if id == &item.identity {
-                                    let n = *allocation.tokens.get(index)?;
-                                    if native_allocated.is_some_and(|prior| prior != n) {
-                                        return None;
-                                    }
-                                    native_allocated = Some(n);
+                let value = *available.get(&item.identity)?;
+                if !item.opaque {
+                    quantity = quantity.checked_add(self.text_tokens(value, true)? as i128)?;
+                    continue;
+                }
+                if !accounting_reasoning(value) {
+                    return None;
+                }
+                let mut native_allocated = None;
+                for block in &self.blocks {
+                    if let Some(allocation) = &block.allocation {
+                        for (index, id) in block.items.iter().enumerate() {
+                            if id == &item.identity {
+                                let n = *allocation.tokens.get(index)?;
+                                if native_allocated.is_some_and(|prior| prior != n) {
+                                    return None;
                                 }
+                                native_allocated = Some(n);
                             }
                         }
                     }
-                    if native_allocated.is_none()
-                        && let Some((ids, allocation)) = &inherited
-                    {
-                        native_allocated = ids
-                            .iter()
-                            .position(|id| id == &item.identity)
-                            .and_then(|index| allocation.tokens.get(index).copied());
-                    }
-                    let count = match native_allocated {
-                        Some(n) => n,
-                        None => self
-                            .text_tokens(value, true)?
-                            .checked_add(pool_residual.checked_div(pool_count)?)?,
-                    };
-                    quantity = quantity.checked_add(count as i128)?;
-                    estimated = estimated.checked_add(1)?;
                 }
-                Some((quantity, estimated))
-            };
+                if native_allocated.is_none()
+                    && let Some((ids, allocation)) = &inherited
+                {
+                    native_allocated = ids
+                        .iter()
+                        .position(|id| id == &item.identity)
+                        .and_then(|index| allocation.tokens.get(index).copied());
+                }
+                let count = match native_allocated {
+                    Some(n) => n,
+                    None => self
+                        .text_tokens(value, true)?
+                        .checked_add(pool_residual.checked_div(pool_count)?)?,
+                };
+                quantity = quantity.checked_add(count as i128)?;
+                estimated = estimated.checked_add(1)?;
+            }
+            Some((quantity, estimated))
+        };
         let (removed, removed_estimated) = changed_quantity(&removed)?;
         let (added, added_estimated) = changed_quantity(&added)?;
         Some(RestorationEstimate {

@@ -327,6 +327,35 @@ impl InputMeasurements {
         self.anchor = Some(Anchor { prompt, input, at });
     }
 
+    /// Claim disjoint occurrences newest-first, consuming each native block at
+    /// most once. Strict quantities and neutral allocations share this boundary.
+    fn measured_changes(&self, changed: &[&Item]) -> (i128, Vec<bool>) {
+        let mut used = vec![false; changed.len()];
+        let mut quantity = 0i128;
+        for block in self.blocks.iter().rev() {
+            if block.items.is_empty() || block.items.len() > changed.len() {
+                continue;
+            }
+            let start =
+                changed
+                    .windows(block.items.len())
+                    .enumerate()
+                    .find_map(|(start, items)| {
+                        (!used[start..start + items.len()].iter().any(|used| *used)
+                            && items
+                                .iter()
+                                .zip(&block.items)
+                                .all(|(item, id)| item.identity == *id))
+                        .then_some(start)
+                    });
+            if let Some(start) = start {
+                used[start..start + block.items.len()].fill(true);
+                quantity += block.input as i128;
+            }
+        }
+        (quantity, used)
+    }
+
     fn changed_quantity(
         &self,
         changed: &[&Item],
@@ -334,33 +363,12 @@ impl InputMeasurements {
         measured: bool,
         allow_count: bool,
     ) -> Option<(i128, bool)> {
-        let mut used = vec![false; changed.len()];
-        let mut quantity = 0i128;
-        let mut used_measurement = false;
-        if measured {
-            for block in self.blocks.iter().rev() {
-                if block.items.is_empty() || block.items.len() > changed.len() {
-                    continue;
-                }
-                let start =
-                    changed
-                        .windows(block.items.len())
-                        .enumerate()
-                        .find_map(|(start, items)| {
-                            (!used[start..start + items.len()].iter().any(|used| *used)
-                                && items
-                                    .iter()
-                                    .zip(&block.items)
-                                    .all(|(item, id)| item.identity == *id))
-                            .then_some(start)
-                        });
-                if let Some(start) = start {
-                    used[start..start + block.items.len()].fill(true);
-                    quantity += block.input as i128;
-                    used_measurement = true;
-                }
-            }
-        }
+        let (mut quantity, used) = if measured {
+            self.measured_changes(changed)
+        } else {
+            (0, vec![false; changed.len()])
+        };
+        let used_measurement = used.iter().any(|used| *used);
         // Decide unknown before invoking any text tokenizer.
         if changed
             .iter()
