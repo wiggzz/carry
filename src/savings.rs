@@ -718,7 +718,7 @@ pub(crate) fn prompt_projection(body: &Value) -> Option<(String, String, u64)> {
 }
 /// Fixed instruction roles and the current user suffix overlap: select their
 /// union before tokenizing, rather than adding two independently sized slices.
-fn retained_prompt_tokens(body: &Value, current_turn: bool) -> Option<u64> {
+fn retained_prompt_projection(body: &Value, current_turn: bool) -> Option<Value> {
     let input = crate::openai::semantic_prompt_input(body["input"].as_array()?);
     let current = input.iter().rposition(|item| item["role"] == "user");
     let retained: Vec<_> = input
@@ -731,17 +731,23 @@ fn retained_prompt_tokens(body: &Value, current_turn: bool) -> Option<u64> {
         .map(|(_, item)| item)
         .collect();
     let overhead = prompt_overhead(body);
-    Some(token_units(&json!({"overhead":overhead,"input":retained})))
+    Some(json!({"overhead":overhead,"input":retained}))
+}
+
+/// Content-address this small protected projection in the existing quantity
+/// owner's text memo; unchanged large instructions need no second tokenization.
+pub(crate) fn fixed_prompt_projection(body: &Value) -> Option<Value> {
+    retained_prompt_projection(body, false)
 }
 
 /// Initialization may retire history, never fixed overhead or the current turn.
 pub(crate) fn protected_prompt_tokens(body: &Value) -> Option<u64> {
-    retained_prompt_tokens(body, true)
+    retained_prompt_projection(body, true).map(|value| token_units(&value))
 }
 
 /// The same fixed floor survives every later hypothetical summary.
 pub(crate) fn fixed_prompt_tokens(body: &Value) -> Option<u64> {
-    retained_prompt_tokens(body, false)
+    fixed_prompt_projection(body).map(|value| token_units(&value))
 }
 
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {

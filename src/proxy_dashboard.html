@@ -97,7 +97,7 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 :focus-visible { outline:3px solid #2b79ad; outline-offset:4px; }
 [hidden] { display:none !important; }
 @media(max-width:800px) { .shell{padding:24px 18px 40px} .session{grid-template-columns:repeat(2,minmax(0,1fr));padding:18px 16px 0;gap:16px} .session-identity{grid-column:1/-1} .session-costs{padding-left:0;border-left:0} .token-metrics{grid-template-columns:repeat(2,minmax(0,1fr))} .token-metric:nth-child(3){border-left:0;border-top:1px solid #22232a25} .token-metric:nth-child(4){border-top:1px solid #22232a25} .section-head{align-items:start;flex-direction:column;gap:4px} }
-@media(max-width:480px) { header{align-items:start;flex-direction:column;gap:12px} .header-status{text-align:left} .cards{gap:12px} .card{padding:14px 12px;box-shadow:3px 3px 0 var(--ink)} .value{letter-spacing:-.8px;font-size:23px} .session .value{font-size:20px} .memories{margin-left:0} }
+@media(max-width:480px) { header{align-items:start;flex-direction:column;gap:12px} .header-status{text-align:left} .cards{grid-template-columns:minmax(0,1fr);gap:12px} .card{padding:14px 12px;box-shadow:3px 3px 0 var(--ink)} .value{letter-spacing:-.8px;font-size:23px} .session .value{font-size:20px} .memories{margin-left:0} }
 @media(prefers-reduced-motion:no-preference) { button:hover{transform:translate(-1px,-1px)} }
 
 /* Inspector panels keep values and cache meters within their own lane. */
@@ -139,8 +139,12 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 <section aria-label="Cost overview"><p class="eyebrow">The big picture</p><div class="cards" id="cards"></div>
 <div class="overview-foot"><span>API-equivalent costs, not subscription bills. Savings are modeled, not measured.</span><span id="estimate-coverage"></span></div>
 <p id="observed-cost-summary" class="warning"></p><div id="usage-strip"></div></section>
+<section aria-labelledby="accounting-heading"><div class="section-head"><h2 id="accounting-heading">Monthly accounting</h2><p class="section-note">UTC observation months · independent of raw session details</p></div>
+<form id="accounting-form"><label for="accounting-month">Month (UTC)</label> <input id="accounting-month" type="month" required> <button id="accounting-load" type="submit">Load month</button></form>
+<p id="accounting-status" role="status" class="section-note">Choose a month to read retained numeric accounting. No opening balances are inferred.</p><div id="accounting-cards" class="cards"></div></section>
 <section aria-labelledby="conversations-heading"><div class="section-head"><h2 id="conversations-heading">By Session</h2><p class="section-note">One row per history · stable ID order · primary tokens below</p></div><div id="sessions" class="session-grid"></div></section>
 <details id="background-traffic" class="inspector"><summary id="background-summary">Client background requests</summary><div id="background-sessions" class="session-grid"></div></details>
+<nav aria-label="Session detail pages"><button type="button" id="first-sessions" disabled>First page</button> <button type="button" id="next-sessions" disabled>Next page</button><p id="session-page-note" class="section-note"></p></nav>
 <details id="estimate-details" class="inspector"><summary>Under the hood · costs, usage &amp; configuration</summary>
 <h3>Comparison window</h3><div id="cost-cards"></div><p id="accounting-detail"></p><p id="assumptions"></p>
 <h3>Provider-reported totals · primary + reviewer</h3><div class="scroll" tabindex="0" role="region" aria-label="Recorded usage by lane"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input</th><th>Cached input</th><th>Cache share / coverage</th><th>Cache writes</th><th>Output</th><th>Observed cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
@@ -150,15 +154,15 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 'use strict';
 let token=new URLSearchParams(location.hash.slice(1)).get('token')||'';
 if(location.hash)history.replaceState(null,'',location.pathname+location.search);
-let busy=false;
-const expandedDiagnostics=new Set();
+let busy=false,pageAfter='',nextPageAfter=null;
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?'—':Number(n).toLocaleString();
 const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x?.[key])||0),0);
 const count=(n,one,many=one+'s')=>fmt(n)+' '+(Number(n)===1?one:many);
 const money=n=>n==null?'—':'$'+Number(n).toFixed(6);
 const pricedSubtotal=ledgers=>ledgers.some(l=>l.cost_usd!=null)?sum(ledgers,'cost_usd'):null;
-const savingsText=e=>e?.savings==null?'—':money(e.savings)+(e.savings_percent!=null?' ('+Number(e.savings_percent).toFixed(1)+'%)':'');
+const headlineEstimate=e=>e&&Object.prototype.hasOwnProperty.call(e,'whole_window')?e.whole_window:e;
+const savingsText=e=>{e=headlineEstimate(e);return e?.savings==null?'—':money(e.savings)+(e.savings_percent!=null?' ('+Number(e.savings_percent).toFixed(1)+'%)':'')};
 const backgroundTypes=new Set(['background']);
 const sourceNames={conversation:'Conversation',agent:'Agent',background:'Client background'};
 function sourceLabel(s){return sourceNames[s.client?.kind]||'Unclassified'}
@@ -239,8 +243,7 @@ function transcriptView(s){
  });return detail;
 }
 function disclosure(key,label,className){
- const detail=document.createElement('details');detail.id='disclosure:'+key;detail.className=className;detail.open=expandedDiagnostics.has(key);
- detail.addEventListener('toggle',()=>{if(detail.isConnected){if(detail.open)expandedDiagnostics.add(key);else expandedDiagnostics.delete(key)}});
+ const detail=document.createElement('details');detail.id='disclosure:'+key;detail.className=className;detail.open=false;
  const summary=document.createElement('summary');summary.textContent=label;detail.append(summary);return detail;
 }
 // Retain keyed rows and native disclosures instead of remounting the live tree.
@@ -275,7 +278,7 @@ function contextOverview(c){
  const el=document.createElement('div');el.className='context-overview';
  const heading=document.createElement('div');heading.className='context-heading';
  note(heading,'Context · '+fmt(c.history_items)+' source items','label');note(heading,'Item share, not token share','context-basis');el.append(heading);
- const states=[['removable','Removable',c.removable_items],['protected','Protected',c.protected_items],['unreviewed','Unreviewed',c.unreviewed_items]];
+ const states=[['removable','Removable',c.removable_items],['protected','Protected',c.protected_items],['unreviewed','Unclassified',c.unreviewed_items]];
  const known=states.every(([, ,n])=>n!=null),total=known?states.reduce((a,[,,n])=>a+n,0):null;
  const current=document.createElement('div');current.className='context-current';
  const currentHeading=document.createElement('div');currentHeading.className='context-current-heading';
@@ -289,24 +292,43 @@ function contextOverview(c){
  if(total>0)for(const [state,label,n] of states){if(!n)continue;const segment=document.createElement('span');segment.className='context-segment';segment.setAttribute('data-state',state);segment.style.width=(100*n/total)+'%';segment.title=label+': '+fmt(n)+' items ('+(100*n/total).toFixed(1)+'% of current context)';bar.append(segment)}
  current.append(bar);el.append(current);
  const legend=document.createElement('div');legend.className='context-legend';
- for(const [state,label,n] of states){const key=document.createElement('span');key.className='context-key';key.setAttribute('data-state-label',state);key.textContent=fmt(n)+' '+label.toLowerCase();key.title=state==='removable'?'Still included, but authorized for omission.':state==='protected'?'Still included and protected.':'Still included without a current reviewer decision.';legend.append(key)}
+ for(const [state,label,n] of states){const key=document.createElement('span');key.className='context-key';key.setAttribute('data-state-label',state);key.textContent=fmt(n)+' '+label.toLowerCase();key.title=state==='removable'?'Still included, but authorized for omission.':state==='protected'?'Still included and protected.':'Still included; not marked removable or protected. Review history is not inferred.';legend.append(key)}
  const memories=document.createElement('span');memories.className='memories';memories.textContent=fmt(c.memories)+' memories';memories.title='Stored memories; separate from source items and excluded from the bar.';legend.append(memories);el.append(legend);return el;
 }
 function tokenMetrics(s){
  const wrap=document.createElement('div');wrap.className='token-metrics';const d=s.last_primary_dispatch;
- const values=[['Raw context · est.',fmt(d?.canonical_input_tokens),'Restored source · local estimate'],['Sent input · est.',fmt(d?.outgoing_input_tokens),'Last dispatch · local estimate'],['Last request · provider',fmt(d?.receipt_input_tokens)+' / '+fmt(d?.receipt_output_tokens),'Input / output tokens'+(d?.outcome?' · '+d.outcome:'')],['Session total · provider',fmt(s.primary?.input_tokens)+' / '+fmt(s.primary?.output_tokens),'Input / output · primary only']];
+ const values=[['Raw context · est.',fmt(d?.canonical_input_tokens),'Restored source · estimate'],['Sent input · est.',fmt(d?.outgoing_input_tokens),'Last dispatch · estimate'],['Last request · provider',fmt(d?.receipt_input_tokens)+' / '+fmt(d?.receipt_output_tokens),'Input / output tokens'+(d?.outcome?' · '+d.outcome:'')],['Session total · provider',fmt(s.primary?.input_tokens)+' / '+fmt(s.primary?.output_tokens),'Input / output · primary only']];
  for(const [label,value,caption] of values){const block=document.createElement('div');block.className='token-metric';note(block,label,'label');note(block,value,'token-value');note(block,caption,'token-note');wrap.append(block)}
  return wrap;
 }
 function coverageChips(e){
  const chips=[];
- if(e?.excluded_unpriced_calls)chips.push(fmt(e.excluded_unpriced_calls)+' comparison calls excluded');
+ const q=e?.quantity_evidence;
+ if(q?.estimated_priced_calls)chips.push(fmt(q.estimated_priced_calls)+' calls use estimated quantities');
+ if(q?.unavailable_quantity_calls)chips.push(fmt(q.unavailable_quantity_calls)+' calls lack quantity evidence');
+ if(q?.comparison_scope==='matched_subset_not_whole_session')chips.push(Object.prototype.hasOwnProperty.call(e,'whole_window')?'Strict quantity reference is partial (diagnostic)':'Matched subtotal · not whole session');
+ if(e?.excluded_unpriced_calls)chips.push(fmt(e.excluded_unpriced_calls)+(Object.prototype.hasOwnProperty.call(e,'whole_window')?' calls outside strict reference':' comparison calls excluded'));
  if(e?.excluded_failed_calls)chips.push(fmt(e.excluded_failed_calls)+' failed calls excluded');
- if(e?.legacy_sessions)chips.push(fmt(e.legacy_sessions)+' legacy sessions excluded');
+ if(e?.coverage?.prior_untracked_calls)chips.push(fmt(e.coverage.prior_untracked_calls)+' prior attempts lack complete outcome/history evidence');
+ if(e?.legacy_sessions)chips.push(fmt(e.legacy_sessions)+(Object.prototype.hasOwnProperty.call(e,'whole_window')?' legacy diagnostic sessions':' legacy sessions excluded'));
  if(e?.in_flight_sessions)chips.push('In-flight costs pending');
  if(e?.legacy_cache_policy_sessions||e?.mixed_cache_policy_sessions)chips.push('Legacy / mixed cache assumptions');
  if(e?.unavailable_primary_cost_calls||e?.unavailable_reviewer_cost_calls)chips.push('Comparison costs missing: '+fmt(e.unavailable_primary_cost_calls||0)+' primary / '+fmt(e.unavailable_reviewer_cost_calls||0)+' reviewer');
  return chips;
+}
+function comparisonScopeNote(root,e){
+ if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
+  const w=e.whole_window;
+  const subset=e.whole_window_scope==='available_session_windows_only';
+  note(root,w?(subset?'Complete session windows · '+fmt(e.whole_window_included_sessions)+' histories included · '+fmt(e.whole_window_unavailable_sessions)+' excluded':'Whole accounting window · successful completions only')+' · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
+  if(w&&(w.trajectory?.initial_compactions??e.initial_compactions)>0)note(root,'Traditional starts after a free initial compaction','comparison-scope card-note');
+  return;
+ }
+ const q=e?.quantity_evidence,scope=q?.comparison_scope;
+ const total=q?.total_primary_responses??e?.coverage?.primary_responses;
+ const label=scope==='matched_subset_not_whole_session'?'Matched subtotal · not whole session':scope==='matched_completed_primary_window'?'Matched completed primary window':'Comparison scope unavailable';
+ const coverage=e?.matched_primary_responses!=null&&total!=null?' · '+fmt(e.matched_primary_responses)+' / '+fmt(total)+' primary responses matched':'';
+ note(root,label+coverage,'comparison-scope card-note');
 }
 function renderSession(s){
  const el=document.createElement('article');el.className='session';el.id='history:'+s.id;
@@ -317,10 +339,10 @@ function renderSession(s){
  const heading=document.createElement('h3');heading.textContent=s.title||'Untitled session';heading.title=s.id;identity.append(heading);
  note(identity,sessionMeta(s),'session-meta');
  identity.append(requestRecency(s));
- note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':''):''),'request-counts');el.append(identity);
- const ledgers=[s.primary||{},s.shadow||{}],missing=sum(ledgers,'unavailable_cost_calls'),e=s.cost_estimate;
- const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · saved usage','card-note');el.append(costs);
- const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(e?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,e?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');el.append(saved);
+ note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,s.rewrites.prior_unknown?'recorded rewrite':'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':'')+(s.rewrites.prior_unknown?' · earlier history unknown':''):''),'request-counts');el.append(identity);
+ const ledgers=[s.primary||{},s.shadow||{}],missing=sum(ledgers,'unavailable_cost_calls'),e=s.cost_estimate,h=headlineEstimate(e);
+ const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · all paid attempts','card-note');el.append(costs);
+ const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(h?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,h?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');comparisonScopeNote(saved,e);el.append(saved);
  el.append(contextOverview(s.context||{}),tokenMetrics(s));
  const alerts=[];
  if(missing)alerts.push(fmt(missing)+' unpriced calls');
@@ -333,20 +355,26 @@ function renderSession(s){
  const p=s.planner||{};
  const overview=document.createElement('div');overview.className='inspection-overview';
  inspectionMetric(overview,'Last plan',actionLabel(p.selected_action||p.candidates?.find(c=>c.candidate_id===p.selected_candidate_id)?.action),p.forced?'Capacity override':p.mode&&p.mode!=='unknown'?p.mode.replaceAll('_',' '):null);
- inspectionMetric(overview,'Carry · modeled',money(e?.carry_cost));inspectionMetric(overview,'Traditional · modeled',money(e?.traditional_cost));inspectionMetric(overview,'Compared responses',fmt(e?.matched_primary_responses),'Matched primary responses');details.append(overview);
+ inspectionMetric(overview,'Carry · whole window',money(h?.carry_cost));inspectionMetric(overview,'Traditional · whole window',money(h?.traditional_cost));inspectionMetric(overview,'Compared responses',fmt(e?.matched_primary_responses),'Matched primary responses');details.append(overview);
  const coverage=coverageChips(e);
  if(e?.accounting_basis==='legacy_json_v1'||e?.legacy_estimate)coverage.push('Legacy JSON estimate');
- if(e?.savings==null)coverage.push('Comparison unavailable');
+ if(h?.savings==null)coverage.push('Comparison unavailable');
  if(coverage.length){const tags=document.createElement('div');tags.className='inspection-tags';for(const item of coverage)note(tags,item,'inspection-badge');details.append(tags)}
  if(s.last_failure){const failure=document.createElement('div');failure.className='inspection-failure';note(failure,'Last incomplete request','label');note(failure,s.last_failure.reason||'Reason not recorded','inspection-caption');details.append(failure)}
  details.append(laneSummary(s),candidateTable(p,s.id));
- if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);details.append(accounting)}
+ if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);if(e.quantity_evidence){inspectionMetric(accounting,'Quantity estimates',e.quantity_evidence.version===1?'Receipt blocks + native-increment residual allocations':'Legacy receipt quantities','No calibrated interval; same outputs and tool sequence assumed');inspectionMetric(accounting,'Historical quantity policy',e.quantity_evidence.historical_policy_scope,fmt(e.quantity_evidence.legacy_priced_calls||0)+' legacy priced calls · no retrospective repricing')}details.append(accounting)}
+ if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
+ const whole=disclosure('whole:'+s.id,'Whole-window estimate assumptions','whole-window-assumptions');
+ inspectionMetric(whole,'Historical inference',e.whole_window?.assumption?.replaceAll('_',' ')||'Actual money/window unavailable', 'Continuous request-by-request traditional trajectory; successful completed outcomes only, failed attempts excluded symmetrically. At most one free initial compaction for an already oversized first tracked input; subsequent summaries are charged. Same outputs and tool sequence; conditional cache and explicit quantity estimates. Observed cost separately includes all paid attempts. Not measured or causal savings; no calibrated interval.');
+ inspectionMetric(whole,'Strict matched diagnostics',money(e.carry_cost)+' Carry / '+money(e.traditional_cost)+' traditional','Original subset evidence; not the headline');details.append(whole);
+ }
  details.append(transcriptView(s));el.append(details);return el;
 }
-async function refresh(){
+async function refresh(after=pageAfter){
  if(busy)return;busy=true;
+ $('first-sessions').disabled=true;$('next-sessions').disabled=true;
  try{
-  const res=await fetch('/carry/dashboard/stats',{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
+  const res=await fetch('/carry/dashboard/stats'+(after?'?after_id='+encodeURIComponent(after):''),{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
   if(!res.ok)throw Error(res.status===401?'Scoped proxy token required.':'Stats unavailable (HTTP '+res.status+').');
   const data=await res.json(),sessions=data.sessions;
   const live=new Set(sessions.map(s=>s.id));
@@ -354,25 +382,26 @@ async function refresh(){
   const focusedElement=document.activeElement,roots=[$('sessions'),$('background-sessions')];
   const histories=new Map(roots.flatMap(descendants).filter(n=>n.className==='session').map(node=>[node.id,{node}]));
   $('status').textContent='Updated '+new Date().toLocaleTimeString()+' · refreshes every 2s';$('status').className=data.unavailable_sessions?'warning':'';$('login').hidden=true;
-  $('activity-summary').textContent=count(sessions.filter(s=>s.processing||s.background_review_pending).length,'active session')+' · '+count(sessions.length,'history','histories');
-  const primary=sessions.map(s=>s.primary||{}),shadow=sessions.map(s=>s.shadow||{}),all=[...primary,...shadow];
-  const unpriced=sum(all,'unavailable_cost_calls'),unreadable=data.unavailable_sessions||0,partial=unpriced>0||unreadable>0;
-  const estimate=data.cost_estimate||{};
+  $('activity-summary').textContent=count(sessions.filter(s=>s.processing||s.background_review_pending).length,'active session')+' · '+count(sessions.length,'history','histories')+' on this page';
+  const primary=[data.usage.primary],shadow=[data.usage.reviewer],all=[...primary,...shadow];
+  const unpriced=sum(all,'unavailable_cost_calls'),unreadable=data.usage.unavailable_owners||0,partial=unpriced>0||unreadable>0;
+  const estimate=data.cost_estimate||{},headline=headlineEstimate(estimate);
   $('cards').replaceChildren(card(partial?'Priced subtotal':'Observed cost',money(pricedSubtotal(all))),card('Estimated savings',savingsText(estimate)));
-  note($('cards').children[0],'Primary + reviewer · saved usage','card-note');
-  note($('cards').children[1],estimate.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');
-  if(estimate.savings<0)$('cards').children[1].className='card loss';
-  $('estimate-coverage').textContent=fmt(estimate.included_sessions||0)+' comparable · '+fmt(estimate.excluded_sessions||0)+' excluded';
+  note($('cards').children[0],'Primary + reviewer · all paid attempts','card-note');
+  note($('cards').children[1],headline?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');
+  comparisonScopeNote($('cards').children[1],estimate);
+  if(headline?.savings<0)$('cards').children[1].className='card loss';
+  $('estimate-coverage').textContent=estimate.whole_window_scope==='available_session_windows_only'?fmt(estimate.whole_window_included_sessions)+' complete histories · '+fmt(estimate.whole_window_unavailable_sessions)+' excluded':Object.prototype.hasOwnProperty.call(estimate,'whole_window')?(headline?fmt(headline.inferred_primary_responses)+' inferred calls · full cost window':fmt(estimate.whole_window_unavailable_sessions||0)+' windows with incomplete observed money'):fmt(estimate.included_sessions||0)+' comparable · '+fmt(estimate.excluded_sessions||0)+' excluded';
   const warnings=[];
   if(unpriced)warnings.push(count(unpriced,'unpriced call'));
   if(unreadable)warnings.push(count(unreadable,'unreadable checkpoint'));
   $('observed-cost-summary').textContent=warnings.length?warnings.join(' · ')+' · total incomplete':'';$('observed-cost-summary').hidden=!warnings.length;
   $('usage-strip').replaceChildren();
   for(const text of [count(sum(primary,'calls'),'primary call'),count(sum(shadow,'calls'),'reviewer call'),fmt(sum(all,'input_tokens'))+' input tokens',fmt(sum(all,'output_tokens'))+' output tokens',...coverageChips(estimate)])note($('usage-strip'),text,'chip');
-  $('cost-cards').replaceChildren(card('With Carry',money(estimate.carry_cost)),card('Traditional',money(estimate.traditional_cost)),card('Calls excluded from comparison',fmt(estimate.excluded_unpriced_calls||0)));
+  $('cost-cards').replaceChildren(card('With Carry',money(headline?.carry_cost)),card('Traditional',money(headline?.traditional_cost)),card('Strict-evidence exclusions (diagnostic)',fmt(estimate.excluded_unpriced_calls||0)));
   $('accounting-detail').textContent=fmt(estimate.matched_primary_responses)+' matched primary responses · completed calls only';
   const scenario=data.cost_scenario;
-  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
+  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill. Quantities may be estimated; no calibrated interval. Same outputs and tool sequence assumed. Traditional is replayed chronologically from frozen request observations; explicitly inferred quantities are identified separately. Missing successful money or historical evidence leaves the comparison unavailable. Summary/cache effects use the saved scenario; historical money is not repriced. Not measured or causal savings.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
   $('config').textContent='Mode '+(data.mode||'—')+' · '+(data.auth||'—')+' auth · reviewer '+(data.classifier_model||'—')+' / '+(data.classifier_effort||'—')+' · cache '+(data.reviewer_cache_mode||'—');
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const calls=sum(ledgers,'calls'),missing=sum(ledgers,'unavailable_cost_calls');
@@ -387,9 +416,37 @@ async function refresh(){
   $('background-summary').textContent='Client background · '+count(background.length,'session');$('background-traffic').hidden=!background.length;
   if(focusedElement&&document.activeElement!==focusedElement&&roots.some(root=>root.contains(focusedElement)))focusedElement.focus({preventScroll:true});
   $('raw').textContent=JSON.stringify(data,null,2);
+  pageAfter=after;nextPageAfter=data.session_page?.has_more?data.session_page.next_after:null;
+  $('session-page-note').textContent=(pageAfter?'Later session page':'First session page')+' · details only; cost and usage totals cover retained accounting across all pages.';
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
- finally{busy=false}
+ finally{busy=false;$('first-sessions').disabled=!pageAfter;$('next-sessions').disabled=!nextPageAfter}
 }
+let accountingBusy=false;
+async function loadAccounting(event){
+ event.preventDefault();if(accountingBusy)return;
+ const month=$('accounting-month').value;
+ $('accounting-cards').replaceChildren();
+ if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)||Number(month.slice(0,4))<1971){$('accounting-status').textContent='Choose a valid UTC month after 1970.';return}
+ const [year,index]=month.split('-').map(Number),start=Date.UTC(year,index-1,1)/1000-1,end=Date.UTC(year,index,1)/1000-1;
+ accountingBusy=true;$('accounting-load').disabled=true;$('accounting-status').textContent='Loading '+month+' UTC observation accounting…';
+ try{
+  const res=await fetch('/carry/dashboard/accounting?start_at='+start+'&end_at='+end,{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
+  if(!res.ok)throw Error('Accounting unavailable (HTTP '+res.status+').');
+  const w=(await res.json()).window;
+  if(!w||w.start_at!==start||w.end_at!==end)throw Error('Accounting response window mismatch.');
+  const coverage=w.coverage,comparison=w.comparison,lanes=[w.usage.primary,w.usage.reviewer];
+  const unpriced=sum(lanes,'unavailable_cost_calls'),partial=unpriced>0||w.usage.unavailable_owners>0;
+  $('accounting-cards').replaceChildren(
+   card(partial?'Native priced subtotal':'Native observed cost',money(coverage.included_owners?pricedSubtotal(lanes):null)),
+   card('Modeled Carry',money(comparison.carry_cost)),card('Modeled traditional',money(comparison.traditional_cost)),card('Modeled savings',savingsText(comparison)));
+  $('accounting-status').textContent=month+' UTC · observation-time closing minus opening per owner, not provider billing dates. Native coverage '+fmt(coverage.included_owners)+' / '+fmt(coverage.observed_owners)+' owners · '+fmt(sum(lanes,'calls'))+' attempts · '+fmt(unpriced)+' unpriced calls · '+fmt(w.completed_requests)+' completed / '+fmt(w.failed_primaries)+' failed primaries. '+fmt(coverage.missing_opening_owners)+' missing openings · '+fmt(coverage.incompatible_owners)+' incompatible · '+fmt(coverage.ambiguous_clock_owners)+' clock-ambiguous. Modeled successful comparison: '+fmt(comparison.included_owners)+' included · '+fmt(comparison.unavailable_owners)+' unavailable owners · '+fmt(comparison.primary_responses)+' responses · '+fmt(comparison.inferred_primary_responses)+' inferred. '+(w.retention_truncated?'Requested start precedes retained accounting; retention-truncated window. ':'')+'Native subtotals and modeled comparisons have independent populations. Savings are estimates, not measured or causal; missing evidence is not zero.';
+ }catch(err){$('accounting-cards').replaceChildren();$('accounting-status').textContent=month+' UTC · '+err.message+' No historical totals displayed.'}
+ finally{accountingBusy=false;$('accounting-load').disabled=false}
+}
+$('accounting-month').value=new Date().toISOString().slice(0,7);
+$('accounting-form').addEventListener('submit',loadAccounting);
+$('first-sessions').addEventListener('click',()=>refresh(''));
+$('next-sessions').addEventListener('click',()=>{if(nextPageAfter)return refresh(nextPageAfter)});
 $('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();refresh()});
 refresh();setInterval(()=>{if(!document.hidden)refresh()},2000);
 </script>

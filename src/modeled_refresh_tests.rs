@@ -76,7 +76,11 @@ fn modeled_refresh_coordinator(report: bool) {
         assert_eq!(after.summary_cost, 0.0);
         assert_eq!(n.summary_cost, 0.0);
         let paid = input as f64 * 2.0 / 1e6;
-        assert!((after.observed_primary_cost - before.observed_primary_cost - paid).abs() < 1e-12);
+        assert!(
+            (after.observed_primary_cost.unwrap() - before.observed_primary_cost.unwrap() - paid)
+                .abs()
+                < 1e-12
+        );
         assert!((n.observed_cost - prior.observed_cost - paid).abs() < 1e-12);
         assert!((after.carry_cost - before.carry_cost - paid).abs() < 1e-12);
         assert!((n.carry_cost - prior.carry_cost - paid).abs() < 1e-12);

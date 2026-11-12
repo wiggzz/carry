@@ -36,9 +36,25 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
         SpendingAuthority.create(budget_state, cap_usd='10', cloud_reserve_usd='0',
             cloud_bound={'evidence_kind': 'synthetic-fixture', 'rate_usd_per_hour': '0',
                          'maximum_seconds': 3600, 'cleanup_owner': 'owned-hosted-no-cloud-fixture'})
+        frozen_copies = []
+        publish = runtime.swebench_smoke.publish_agent_artifacts
+        def publish_while_frozen(source, destination, **kwargs):
+            if Path(destination).parent.name.startswith('scb-owned-snapshot-'):
+                ids = subprocess.check_output(['docker', 'ps', '-q', '--filter', 'name=carry-scb-'], text=True).split()
+                for identity in ids:
+                    self.assertEqual(subprocess.check_output(
+                        ['docker', 'inspect', '--format', '{{.State.Paused}}', identity], text=True).strip(), 'true')
+                frozen_copies.append(ids)
+            return publish(source, destination, **kwargs)
         with fixture.FixtureNetwork(self.provider) as network, \
-             patch.dict(os.environ, {'BENCHMARK_BUDGET_STATE': str(budget_state)}):
+             patch.dict(os.environ, {'BENCHMARK_BUDGET_STATE': str(budget_state)}), \
+             patch.object(runtime.swebench_smoke, 'publish_agent_artifacts', side_effect=publish_while_frozen):
             report = comparison.dispatch(run_plan, contract, prepared, self.root/'paired', runtime.run_slot, budget_usd=10.0)
+        self.assertTrue(any(frozen_copies), 'no actual agent freeze was exercised')
+        authority = json.loads(budget_state.read_text())
+        self.assertIsNone(authority['active'])
+        self.assertEqual([lease['identity'] for lease in authority['history']],
+                         [slot['namespace'] for slot in run_plan['slots']])
         (self.root/'provider-synthetic.log').write_text(network.provider_log)
         rows = [json.loads(line) for line in (self.root/'paired'/'records.jsonl').read_text().splitlines()]
         self.assertEqual(len(rows), run_plan['expected_records'])
@@ -207,6 +223,74 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
         self.assertEqual(summary['primary']['completed_requests'], 3)
         self.assertEqual([e['event'] for e in rows[0]['events'] if e.get('actor') == 'shadow'], ['started', 'completed'])
         self.assertFalse([e for e in rows[1]['events'] if e.get('actor') == 'shadow'])
+
+
+@unittest.skipUnless(os.environ.get('CARRY_SCB_HOSTED_FIXTURE') == '1', 'pinned official SCB source required')
+class OfficialSnapshotBoundaryTests(unittest.TestCase):
+    def test_actual_snapshot_never_reopens_an_agent_parent_after_discovery(self):
+        from slop_code.execution import snapshot as native
+        original = native.Snapshot.__dict__['from_directory']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root/'agent'; (raw/'sub').mkdir(parents=True)
+            (raw/'sub/payload').write_bytes(b'agent solution')
+            outside = root/'host'; outside.mkdir()
+            sentinel = b'HARMLESS_HOST_ONLY_SENTINEL'
+            (outside/'payload').write_bytes(sentinel)
+            walk = native._walk_candidates
+            def replace_parent_after_discovery(cwd, *args, **kwargs):
+                result = walk(cwd, *args, **kwargs)
+                (raw/'sub').rename(raw/'previous')
+                (raw/'sub').symlink_to(outside, target_is_directory=True)
+                return result
+            with runtime.protected_runtimes({}, {}), \
+                 patch.object(native, '_walk_candidates', side_effect=replace_parent_after_discovery):
+                captured = native.Snapshot.from_directory(raw, env={})
+                contents = captured.extract_contents()
+                self.assertNotIn(sentinel, contents.values())
+                self.assertEqual(contents[Path('sub/payload')], b'agent solution')
+                self.assertEqual(captured.path, raw)
+                self.assertFalse(captured.archive.is_relative_to(raw))
+            self.assertIs(native.Snapshot.__dict__['from_directory'], original)
+
+    def test_snapshot_failure_resumes_every_successfully_frozen_runtime(self):
+        from slop_code.execution import runtime as registry, snapshot as native
+        from slop_code.execution.docker_runtime.streaming import DockerStreamingRuntime
+        for failure in ('freeze', 'copy'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(DockerStreamingRuntime, '__init__', return_value=None), \
+                 patch.object(DockerStreamingRuntime, 'cleanup'), \
+                 patch.object(runtime.swebench_smoke, 'force_remove_container'), \
+                 patch.object(runtime.swebench_smoke, 'publish_agent_artifacts') as publish, \
+                 patch.object(native, '_walk_candidates') as walk, runtime.protected_runtimes({}, {}):
+                agents = [registry.STREAMING_RUNTIME_REGISTRY['docker']() for _ in range(2)]
+                for agent in agents:
+                    agent._container = Mock()
+                if failure == 'freeze':
+                    agents[1]._container.pause.side_effect = RuntimeError('owned freeze refused')
+                else:
+                    publish.side_effect = runtime.swebench_smoke.AgentArtifactError('owned copy refused')
+                with self.assertRaisesRegex((RuntimeError, runtime.swebench_smoke.AgentArtifactError), 'owned .* refused'):
+                    native.Snapshot.from_directory(Path(directory), env={})
+                agents[0]._container.unpause.assert_called_once()
+                if failure == 'freeze':
+                    agents[1]._container.unpause.assert_not_called()
+                    publish.assert_not_called()
+                else:
+                    agents[1]._container.unpause.assert_called_once()
+                walk.assert_not_called()
+
+    def test_actual_snapshot_rejects_existing_links_before_native_archive(self):
+        from slop_code.execution import snapshot as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root/'agent'; raw.mkdir()
+            outside = root/'host'; outside.write_text('HARMLESS_HOST_ONLY_SENTINEL')
+            (raw/'payload').symlink_to(outside)
+            with runtime.protected_runtimes({}, {}), patch.object(native, '_walk_candidates') as walk:
+                with self.assertRaises(runtime.swebench_smoke.AgentArtifactError):
+                    native.Snapshot.from_directory(raw, env={})
+                walk.assert_not_called()
 
 
 if __name__ == '__main__':

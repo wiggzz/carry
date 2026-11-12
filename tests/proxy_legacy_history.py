@@ -1,14 +1,27 @@
 """Current history through real explicit and canonical-index Session loaders.
 
 Synthetic native totals, loopback-only providers and private state. Explicitly
-absent modeled write events cannot gain warmth from an observation timestamp.
+expired dispatch evidence cannot gain warmth from restart or dashboard polling.
 """
 import copy
 import http.client
+from history_store import read_index, write_index
 import json
 import unittest
 
 import proxy_state_regressions as support
+
+
+def expire_dispatches(target):
+    """Age real synthetic dispatches together, not a removed prediction cache.
+
+    Relative chronology, native usage, frozen rates and settled money are intact.
+    Replaying old requests is identical; the next real dispatch is cold once.
+    """
+    for observation in target["request_evidence"]["observations"]:
+        if "Primary" in observation:
+            observation["Primary"]["facts"]["at"] -= 7200
+    return target
 
 
 class OwnerProxy(support.Proxy):
@@ -87,11 +100,8 @@ class LegacyHistoryLoads(unittest.TestCase):
             before = snapshot(proxy)
             saved = proxy.saved()
             proxy.close()
-        trajectory = saved["cost_trajectory"]
         self.assertEqual(saved["history_shared"], shared)
-        self.assertEqual(trajectory["retired"], 280000)
-        self.assertEqual(trajectory["summary"], 1000)
-        self.assertEqual(trajectory["last_traditional_input"], 21300)
+        self.assertEqual(saved["primary_input"]["anchor"]["input"], 300300)
         self.assertEqual(before.get("initial_compactions", 0), int(initialized))
         self.assertEqual(before["traditional_compactions"], int(not initialized))
         self.assertEqual(before["summary_cost"] > 0, not initialized)
@@ -102,23 +112,20 @@ class LegacyHistoryLoads(unittest.TestCase):
         paid_before = sum(n * (4 if n > 272000 else 2) / 1e6 for n in inputs[:seed_count])
         self.assertAlmostEqual(before["observed_primary_cost"], paid_before, places=12)
 
-        # Keep the current schema and exact cursor. Explicitly discard only
-        # hypothetical write evidence to exercise cold-once/rewarm behavior.
+        # Keep the current evidence and age its dispatch clock to exercise
+        # cold-once/rewarm behavior without injecting prediction state.
         # Shared snapshots, not mirrors, are the authoritative load target.
         checkpoint = next(self.harness.state.glob("*.json"))
         owner = checkpoint.stem
-        def without_cache(target):
-            target["cost_trajectory"]["receipts"].pop("modeled_cache", None)
-            return target
-        staged = without_cache(copy.deepcopy(saved))
+        staged = expire_dispatches(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
         index_path = self.harness.state / "history.index"
-        index = json.loads(index_path.read_text())
+        index = read_index(index_path)
         if shared:
             self.assertIn(owner, index["snapshots"])
-            index["snapshots"][owner] = without_cache(index["snapshots"][owner])
-            self.assertEqual(index["snapshots"][owner]["cost_trajectory"], staged["cost_trajectory"])
-            index_path.write_text(json.dumps(index))
+            index["snapshots"][owner] = expire_dispatches(index["snapshots"][owner])
+            self.assertEqual(index["snapshots"][owner]["request_evidence"], staged["request_evidence"])
+            write_index(index_path, index)
         self.evidence.update(shared=shared, initialized=initialized,
                              before=before, staged=staged, owner=owner,
                              staged_index=index if shared else None)
@@ -165,20 +172,20 @@ class LegacyHistoryLoads(unittest.TestCase):
 
         expected_comparison = before["traditional_cost"]
         for step, (after, state) in enumerate(zip(snapshots, states)):
-            t = state["cost_trajectory"]
             with self.subTest(step=step, shared=shared):
                 self.assertEqual(after.get("initial_compactions", 0), int(initialized),
                                  "CURRENT_SESSION_HISTORY: load must not grant another initialization")
                 self.assertEqual(after["traditional_compactions"], int(not initialized))
                 self.assertEqual(after["summary_cost"], before["summary_cost"])
-                self.assertEqual((t["retired"], t["summary"]), (280000, 1000))
                 incoming = 21400 + step * 100
                 # Complete history proof is not cache-write evidence. The
                 # first eventless continuation must be cold; the next
                 # has a genuinely new modeled event from that continuation.
                 expected_comparison += (incoming * 2.5 if step == 0 else
                                         21400 * .1 + 100 * 2.5) / 1e6
-                self.assertEqual(t["last_traditional_input"], incoming)
+                self.assertEqual(state["primary_input"]["anchor"]["input"], inputs[seed_count + step])
+                old = staged["request_evidence"]["observations"]
+                self.assertEqual(state["request_evidence"]["observations"][:len(old)], old)
                 self.assertEqual(after["matched_primary_responses"],
                                  before["matched_primary_responses"] + step + 1)
                 self.assertEqual(after["excluded_unpriced_calls"], 0)

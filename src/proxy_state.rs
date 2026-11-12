@@ -7,6 +7,47 @@ use serde_json::{Value, json};
 
 use carry::core::{UsageLedger, prefix_compatible};
 
+/// Read-only accounting projection of the current checkpoint. It deliberately
+/// has no canonical source, memories or planner state. Only dashboard reads use
+/// the reconstructed numeric Session; it is never saved as checkpoint authority.
+/// Current proof is revalidated by the normal loader, not an older observation.
+#[derive(Deserialize)]
+pub(super) struct AccountingView {
+    version: u32,
+    #[serde(default)]
+    history_namespace: Option<String>,
+    #[serde(default)]
+    history_shared: bool,
+    #[serde(default)]
+    history_frontier: Option<String>,
+    primary: UsageLedger,
+    shadow: UsageLedger,
+    completed_requests: u64,
+    #[serde(default)]
+    request_evidence: Option<crate::proxy_savings::RequestEvidence>,
+    #[serde(default)]
+    primary_pending: bool,
+    #[serde(default)]
+    background_review_pending: bool,
+}
+impl AccountingView {
+    pub(super) fn into_session(self) -> Session {
+        Session {
+            version: self.version,
+            history_namespace: self.history_namespace,
+            history_shared: self.history_shared,
+            history_frontier: self.history_frontier,
+            primary: self.primary,
+            shadow: self.shadow,
+            completed_requests: self.completed_requests,
+            request_evidence: self.request_evidence,
+            primary_pending: self.primary_pending,
+            background_review_pending: self.background_review_pending,
+            ..Session::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Item {
     pub id: u64,
@@ -160,13 +201,6 @@ pub(super) struct ReviewAdmission {
     pub reminder_cursor: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(super) struct RewriteCount {
-    pub dispatched: u64,
-    pub forced: u64,
-    pub prior_unknown: bool,
-}
-
 /// Bounded numeric-only observation; never stores another raw prompt copy.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct DispatchMeasurement {
@@ -194,8 +228,7 @@ pub(super) struct Session {
     pub last_primary_dispatch: Option<DispatchMeasurement>,
     #[serde(default)]
     pub last_reviewer_dispatch: Option<DispatchMeasurement>,
-    #[serde(default)]
-    pub rewrites: Option<RewriteCount>,
+
     pub version: u32,
     #[serde(default)]
     pub title: Option<String>,
@@ -236,7 +269,7 @@ pub(super) struct Session {
     #[serde(skip)]
     pub upstream_cache: Vec<CacheEvidence>,
     #[serde(default)]
-    pub cost_trajectory: Option<crate::proxy_savings::Trajectory>,
+    pub request_evidence: Option<crate::proxy_savings::RequestEvidence>,
     /// Provider input quantities survive monetary/comparison omissions. Only
     /// hashes and numeric measured batches are retained, never another prompt.
     #[serde(default)]
@@ -269,6 +302,11 @@ pub(super) struct Session {
     pub review_epoch: u64,
     #[serde(default)]
     pub primary_pending: bool,
+    /// Admitted terminal growth, not money or a second accounting authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_settlement_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_settlement_bytes: Option<u64>,
     #[serde(default)]
     pub background_review_pending: bool,
     #[serde(default)]
@@ -486,7 +524,7 @@ impl Session {
         self.review_epoch = self.review_epoch.saturating_add(1);
         self.primary_input = Default::default();
         self.reviewer_input = Default::default();
-        if let Some(trajectory) = &mut self.cost_trajectory {
+        if let Some(trajectory) = &mut self.request_evidence {
             trajectory.reset_epoch();
         }
         self.bootstrap_review_pending = false;

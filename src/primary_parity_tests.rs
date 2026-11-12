@@ -21,7 +21,9 @@ fn modeled_cache_read_does_not_extend_original_write_lifetime_across_restart() {
     // Start with a known cold shared receipt, then diverge the next request.
     let request = body();
     for (index, (at, cached)) in [(100, 0), (106, 2000), (107, 0)].into_iter().enumerate() {
-        if index == 1 { t.projected(100, 100, true); }
+        if index == 1 {
+            t.projected(100, 100, true);
+        }
         let before = t.snapshot();
         t.primary_resolved(
             &request,
@@ -40,7 +42,9 @@ fn modeled_cache_read_does_not_extend_original_write_lifetime_across_restart() {
         assert_eq!(after.summary_cost, 0.0);
         let actual = (2000 - cached) as f64 * 2.5 / 1e6 + cached as f64 * 0.1 / 1e6;
         assert!(
-            (after.observed_primary_cost - before.observed_primary_cost - actual).abs() < 1e-12
+            (after.observed_primary_cost.unwrap() - before.observed_primary_cost.unwrap() - actual)
+                .abs()
+                < 1e-12
         );
         let forecast =
             scenario_input_cost_resolved("gpt-6.1-sol", 2000, cached, Some(1024), Some(&resolved))
@@ -99,10 +103,16 @@ fn modeled_cache_append_and_new_policy_cannot_extend_old_prefix_deadline() {
         let forecast =
             scenario_input_cost_resolved("gpt-6.1-sol", input, cached, Some(1024), Some(&resolved))
                 .unwrap();
-        let forecast = if index == 0 { input as f64 * 2.0 / 1e6 } else { forecast };
+        let forecast = if index == 0 {
+            input as f64 * 2.0 / 1e6
+        } else {
+            forecast
+        };
         assert!((after.traditional_cost - before.traditional_cost - forecast).abs() < 1e-12);
         assert!(
-            (after.observed_primary_cost - before.observed_primary_cost - input as f64 * 2.0 / 1e6)
+            (after.observed_primary_cost.unwrap()
+                - before.observed_primary_cost.unwrap()
+                - input as f64 * 2.0 / 1e6)
                 .abs()
                 < 1e-12
         );
@@ -169,7 +179,9 @@ fn modeled_cache_equivalent_options_keep_warmth_in_both_quantity_adapters() {
         assert_eq!(after.summary_cost, 0.0);
         let actual = input as f64 * 2.0 / 1e6;
         assert!(
-            (after.observed_primary_cost - before.observed_primary_cost - actual).abs() < 1e-12
+            (after.observed_primary_cost.unwrap() - before.observed_primary_cost.unwrap() - actual)
+                .abs()
+                < 1e-12
         );
         assert!((n.observed_cost - native_before.observed_cost - actual).abs() < 1e-12);
         let expected = input as f64 * 0.1 / 1e6;
@@ -187,10 +199,8 @@ fn modeled_cache_equivalent_options_keep_warmth_in_both_quantity_adapters() {
 // diverge after the initial known-cold request; observed receipts stay independent.
 fn modeled_write_pressure_costs(native_adapter: bool) {
     let mut live = Trajectory::default();
-    let mut events = vec![
-        json!({"event":"run_started","data":{"model":"gpt-6.1-sol",
-            "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024}}),
-    ];
+    let mut events = vec![json!({"event":"run_started","data":{"model":"gpt-6.1-sol",
+            "cache_ttl_seconds":1800,"implicit_cache_minimum_prefix_tokens":1024}})];
     let mut native = crate::savings::Trajectory::default();
     for event in &events {
         native.record(event);
@@ -248,14 +258,18 @@ fn modeled_write_pressure_costs(native_adapter: bool) {
         assert_eq!(live.history.last_traditional_input, input);
         let actual = input as f64 * 2.0 / 1e6;
         assert!(
-            (after.observed_primary_cost - before.observed_primary_cost - actual).abs() < 1e-12
+            (after.observed_primary_cost.unwrap() - before.observed_primary_cost.unwrap() - actual)
+                .abs()
+                < 1e-12
         );
         assert!((after.carry_cost - before.carry_cost - actual).abs() < 1e-12);
         assert!((n.observed_cost - native_before.observed_cost - actual).abs() < 1e-12);
         assert!((n.carry_cost - native_before.carry_cost - actual).abs() < 1e-12);
         // Every write is at100 with lifetime1800. No expiry, native hit, cache
         // policy change or summary can justify making this prefix cold.
-        let expected = if step == 0 { input as f64 * 2.0 / 1e6 } else {
+        let expected = if step == 0 {
+            input as f64 * 2.0 / 1e6
+        } else {
             (previous_input as f64 * 0.1 + (input - previous_input) as f64 * 2.5) / 1e6
         };
         let delta = if native_adapter {
@@ -313,7 +327,8 @@ fn modeled_retention_unknown_costs(native_adapter: bool) {
     for step in 0..132_u64 {
         if step == 1 {
             live.projected(100, 100, true);
-            native.record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
+            native
+                .record(&json!({"event":"context_compacted","data":{"compaction_token_delta":0}}));
         }
         if step > 0 {
             request["input"]
@@ -342,14 +357,16 @@ fn modeled_retention_unknown_costs(native_adapter: bool) {
         );
         paid += input as f64 * 2.0 / 1e6;
         if step <= 128 {
-            forecast += if step == 0 { input as f64 * 2.0 / 1e6 } else {
+            forecast += if step == 0 {
+                input as f64 * 2.0 / 1e6
+            } else {
                 (previous as f64 * 0.1 + (input - previous) as f64 * 2.5) / 1e6
             };
         }
         let l = live.snapshot();
         let n = native.snapshot();
         // Exact actual expense remains known even when the alternative does not.
-        assert!((l.observed_primary_cost - paid).abs() < 1e-12);
+        assert!((l.observed_primary_cost.unwrap() - paid).abs() < 1e-12);
         assert!((n.observed_cost - paid).abs() < 1e-12);
         assert_eq!(l.coverage.primary_responses, step + 1);
         assert_eq!(n.coverage.responses, step as usize + 1);
@@ -540,7 +557,7 @@ fn native_and_proxy_share_noop_money_and_keep_divergence_after_later_noop() {
                 let live = proxy.snapshot();
                 assert!(local.priced && local.observed_priced && live.priced);
                 assert_eq!(live.excluded_unpriced_calls, 0);
-                assert!((local.observed_cost - live.observed_primary_cost).abs() < 1e-12);
+                assert!((local.observed_cost - live.observed_primary_cost.unwrap()).abs() < 1e-12);
                 assert!((local.carry_cost - live.carry_cost).abs() < 1e-12);
                 assert!(
                     (local.pi_cost - live.traditional_cost).abs() < 1e-12,

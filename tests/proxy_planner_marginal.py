@@ -5,6 +5,7 @@ capability; not evidence of provider residency. No live state or paid calls.
 """
 import contextlib
 import copy
+from history_store import read_index, write_index
 import json
 import itertools
 import os
@@ -93,7 +94,7 @@ class PlannerMarginalBaseline(unittest.TestCase):
                 observations.append({"n": n, "last_plan": copy.deepcopy(saved["last_plan"]),
                                      "last_submitted_ids": saved["last_submitted_ids"]})
                 if n == 4:
-                    captured["warm_cache"] = json.loads((state / "history.index").read_text()).get("upstream_cache", [])
+                    captured["warm_cache"] = read_index(state / "history.index").get("upstream_cache", [])
                 if n == 1:
                     # The ordinary loopback route is correctly unknown. Attest
                     # only this disposable route, in BOTH authority locations.
@@ -106,10 +107,10 @@ class PlannerMarginalBaseline(unittest.TestCase):
                     snap["model_resolution"]["primary"]["cache"] = capability
                     checkpoint.write_text(json.dumps(snap))
                     index_path = state / "history.index"
-                    index = json.loads(index_path.read_text())
+                    index = read_index(index_path)
                     for owner in index["snapshots"].values():
                         owner["model_resolution"]["primary"]["cache"] = capability
-                    index_path.write_text(json.dumps(index))
+                    write_index(index_path, index)
                     proxy = Proxy(state, fixture, options)
                     self.stack.callback(proxy.close)
                     self.assertEqual(proxy.saved()["model_resolution"]["primary"]["cache"], capability)
@@ -191,7 +192,8 @@ class PlannerMarginalBaseline(unittest.TestCase):
                 self.assertEqual(saved["primary"]["input_tokens"], before["primary"]["input_tokens"] + 60000)
             captured.update(primaries=copy.deepcopy(fixture.primaries), decision_checkpoint=decision,
                             reviews=copy.deepcopy(fixture.reviews),
-                            fixture_errors=copy.deepcopy(fixture.errors), final_checkpoint=saved)
+                            fixture_errors=copy.deepcopy(fixture.errors), final_checkpoint=saved,
+                            final_stats=proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0])
             self.assertEqual(fixture.errors, [])
             self.assertEqual(len(fixture.primaries), 9 if followups else (7 if audit_guard else 5))
             calls = len(fixture.primaries)

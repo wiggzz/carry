@@ -1,6 +1,7 @@
 """Synthetic actual-binary dashboard contract; no provider or live state access."""
 import contextlib
 import copy
+from history_store import read_index, write_index
 import json
 import os
 from pathlib import Path
@@ -58,7 +59,7 @@ class DashboardDispatchContract(unittest.TestCase):
                 self.assertEqual(proxy.send(source)[0], 200)
                 owner = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["id"]
                 authority_path = root / ("history.index" if shared else owner + ".json")
-                saved = json.loads(authority_path.read_bytes())
+                saved = read_index(authority_path)
                 for version in (0, 3, 999):
                     authority = copy.deepcopy(saved)
                     session = authority["snapshots"][owner] if shared else authority
@@ -67,7 +68,7 @@ class DashboardDispatchContract(unittest.TestCase):
                     # not semantic authority, even if stale facts are injected.
                     session["memories"] = [{"id": 1, "source_ids": [1], "text": "STALE_NOT_CURRENT"}]
                     frozen = json.dumps(authority).encode()
-                    authority_path.write_bytes(frozen)
+                    write_index(authority_path, authority) if shared else authority_path.write_bytes(frozen)
                     code, stats = proxy.request("GET", "/carry/dashboard/stats")
                     self.assertEqual(code, 200)
                     transcript_code, transcript = proxy.request("GET", "/carry/dashboard/transcript/" + owner)
@@ -81,7 +82,8 @@ class DashboardDispatchContract(unittest.TestCase):
                         self.assertEqual(stats["unavailable_sessions"], 1)
                         self.assertEqual(stats["sessions"], [])
                         self.assertNotEqual(transcript_code, 200)
-                    self.assertEqual(authority_path.read_bytes(), frozen)
+                    self.assertEqual(read_index(authority_path), authority)
+                    if not shared: self.assertEqual(authority_path.read_bytes(), frozen)
                 self.assertEqual(fixture.errors, [])
 
     def test_pruned_or_unreadable_authority_cannot_resurrect_false_diagnostic_mirror(self):
@@ -101,7 +103,7 @@ class DashboardDispatchContract(unittest.TestCase):
             mirror_bytes = json.dumps(false_authority).encode()
             mirror.write_bytes(mirror_bytes)
             index_path = root / "history.index"
-            expired = json.loads(index_path.read_bytes())
+            expired = read_index(index_path)
             for reference in expired["tips"].values():
                 reference["at"] = 0
             empty = {key: {} if isinstance(value, dict) else value for key, value in expired.items()}
@@ -110,7 +112,7 @@ class DashboardDispatchContract(unittest.TestCase):
                     if authority is None:
                         index_path.unlink()
                     else:
-                        index_path.write_bytes(authority)
+                        write_index(index_path, json.loads(authority)) if authority.startswith(b"{") else index_path.write_bytes(authority)
                     code, stats = proxy.request("GET", "/carry/dashboard/stats")
                     self.assertEqual(code, 200)
                     self.assertEqual(stats["sessions"], [])
@@ -119,7 +121,7 @@ class DashboardDispatchContract(unittest.TestCase):
                     if authority is None:
                         self.assertFalse(index_path.exists())
                     else:
-                        self.assertEqual(index_path.read_bytes(), authority)
+                        self.assertEqual(read_index(index_path), json.loads(authority)) if authority.startswith(b"{") else self.assertEqual(index_path.read_bytes(), authority)
                     self.assertEqual(mirror.read_bytes(), mirror_bytes)
             self.assertEqual(fixture.errors, [])
 
@@ -165,7 +167,10 @@ class DashboardDispatchContract(unittest.TestCase):
             root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
             fixture = Fixture(lambda body, n: (200, completed()), lambda body, n: (200, advice_response({"protected": [], "removable": [], "memories": []})))
             stack.callback(fixture.close)
-            proxy = ImplicitProxy(root, fixture, mode="audit", wait_reviews=False)
+            # This fixture corrupts authority on purpose. Join the legitimate
+            # background publisher first so it cannot repair the injected bytes
+            # between corruption and the read-only fail-closed assertions.
+            proxy = ImplicitProxy(root, fixture, mode="audit", wait_reviews=True)
             stack.callback(proxy.close)
             source = [{"role": "user", "content": "Authoritative owned shared source."}]
             self.assertEqual(proxy.send(source)[0], 200)
@@ -192,12 +197,18 @@ class DashboardDispatchContract(unittest.TestCase):
                     self.assertEqual(transcript["canonical_input"], source)
                     self.assertEqual((root / "history.index").read_bytes(), index)
             mirror.write_bytes(saved)
+            # A WAL is committed authority too. With the publisher joined and
+            # no outstanding readers, invalidate the entire SQLite generation,
+            # not only a main file recoverable from its still-valid WAL pages.
+            for suffix in ("-wal", "-shm"):
+                (root / ("history.index" + suffix)).unlink(missing_ok=True)
             (root / "history.index").write_bytes(b"invalid actual authority")
             code, after = proxy.request("GET", "/carry/dashboard/stats")
             self.assertEqual(code, 200)
             self.assertEqual(after["unavailable_sessions"], 1)
             self.assertEqual(after["sessions"], [])
             self.assertNotEqual(proxy.request("GET", "/carry/dashboard/transcript/" + owner["id"])[0], 200)
+            self.assertEqual((root / "history.index").read_bytes(), b"invalid actual authority")
             self.assertEqual(fixture.errors, [])
 
     def test_private_dashboard_transcript_needs_no_separate_login(self):
@@ -418,15 +429,26 @@ class DashboardDispatchContract(unittest.TestCase):
             source = [{"role": "user", "content": "Shared root"}, {"role": "user", "content": "Sibling A"}]
             self.assertEqual(proxy.send(source)[0], 200)
             proxy.close()
+            def without_selection_history(saved):
+                # Supported old evidence has successful receipts but no
+                # applied-selection facts. Do not reconstruct them from sizes
+                # or accept the obsolete accumulated counter as proof.
+                saved["rewrites"] = {"dispatched": 99, "forced": 99, "prior_unknown": False}
+                evidence = saved["request_evidence"]
+                evidence["observations"] = [o for o in evidence["observations"]
+                                            if not isinstance(o, dict) or "Dispatch" not in o]
+                for key in ("archive", "numeric_pending", "numeric_primary_items"):
+                    evidence.pop(key, None)
+                return saved
             for checkpoint in root.glob("*.json"):
                 saved = json.loads(checkpoint.read_text())
-                saved.pop("rewrites", None)
+                without_selection_history(saved)
                 checkpoint.write_text(json.dumps(saved))
             index_path = root / "history.index"
-            index = json.loads(index_path.read_text())
+            index = read_index(index_path)
             for saved in index["snapshots"].values():
-                saved.pop("rewrites", None)
-            index_path.write_text(json.dumps(index))
+                without_selection_history(saved)
+            write_index(index_path, index)
             proxy = ImplicitProxy(root, fixture, wait_reviews=False)
             stack.callback(proxy.close)
             self.assertEqual(proxy.send(source)[0], 200)
@@ -442,6 +464,117 @@ class DashboardDispatchContract(unittest.TestCase):
             self.assertFalse(fork["rewrites"]["prior_unknown"])
             self.assertEqual(fork["completed_requests"], 1)
             self.assertNotEqual(fork["last_primary_dispatch"]["request_id"], old["last_primary_dispatch"]["request_id"])
+            self.assertEqual(fixture.errors, [])
+
+    def test_topline_compares_available_whole_session_windows_with_explicit_exclusions(self):
+        for unknown_first in (False, True):
+            with self.subTest(unknown_first=unknown_first), contextlib.ExitStack() as stack:
+                root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+                def primary(body, n):
+                    response = completed(response_id=f"resp_scope_{n}", input_tokens=1000)
+                    if (n == 1) == unknown_first:
+                        response.pop("usage")
+                    return 200, response
+                fixture = Fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+                stack.callback(fixture.close)
+                options = ["--review-min-primary-tokens", "1000000", "--review-every-requests", "100"]
+                proxy = ImplicitProxy(root, fixture, options, wait_reviews=False)
+                stack.callback(proxy.close)
+                for label in ("first unrelated history", "second unrelated history"):
+                    self.assertEqual(proxy.send([{"role": "user", "content": label}])[0], 200)
+                stats = proxy.request("GET", "/carry/dashboard/stats")[1]
+                self.assertEqual(len(stats["sessions"]), 2)
+                known = [s for s in stats["sessions"] if s["cost_estimate"]["whole_window"] is not None]
+                unknown = [s for s in stats["sessions"] if s["cost_estimate"]["whole_window"] is None]
+                self.assertEqual(len(known), 1)
+                self.assertEqual(len(unknown), 1)
+                self.assertEqual(known[0]["primary"]["calls"], 1)
+                self.assertEqual(unknown[0]["primary"]["unavailable_cost_calls"], 1)
+                self.assertEqual(len(fixture.primaries), 2)
+                self.assertEqual(fixture.errors, [])
+                if directory := os.environ.get("CARRY_TEST_EVIDENCE_DIR"):
+                    Path(directory, f"comparison-scope-{unknown_first}.json").write_text(json.dumps(stats, indent=2))
+                total = stats["cost_estimate"]
+                self.assertIsNotNone(total["whole_window"],
+                                     "an unavailable peer must not erase complete session-window estimates")
+                self.assertEqual(total["whole_window_included_sessions"], 1)
+                self.assertEqual(total["whole_window_unavailable_sessions"], 1)
+                self.assertEqual(total["whole_window_scope"], "available_session_windows_only")
+                for field in ("carry_cost", "traditional_cost", "savings", "savings_percent"):
+                    self.assertAlmostEqual(total["whole_window"][field],
+                                           known[0]["cost_estimate"]["whole_window"][field], places=12)
+                proxy.close()
+                proxy = ImplicitProxy(root, fixture, options, wait_reviews=False)
+                stack.callback(proxy.close)
+                restarted = proxy.request("GET", "/carry/dashboard/stats")[1]["cost_estimate"]
+                self.assertEqual(restarted, total)
+
+    def test_opaque_cleanup_counts_selection_even_when_dispatch_size_is_unknown(self):
+        with contextlib.ExitStack() as stack:
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            opaque = [{"type": "reasoning", "id": f"rs_selection_{i}", "summary": [],
+                       "encrypted_content": f"synthetic-selection-{i}/" * 100} for i in range(2)]
+
+            def primary(body, n):
+                tokens = 3000 + sum(len(i.get("content", "")) // 3
+                                    for i in body["input"]) + min(n - 1, 2) * 1000
+                return 200, completed(opaque[n - 1:n] if n <= 2 else [],
+                                      response_id=f"resp_selection_{n}", input_tokens=tokens)
+
+            fixture = Fixture(primary, lambda body, n: (200, advice_response(
+                {"protected": [], "removable": [2] if n == 1 else [], "memories": []})))
+            stack.callback(fixture.close)
+            options = ["--primary-context-tokens", "1000000", "--payoff-requests", "5",
+                       "--classifier-cache-policy", "disabled"]
+            proxy = Proxy(root, fixture, options)
+            stack.callback(proxy.close)
+            seed = [{"role": "user", "content": "Preserve the goal"},
+                    {"role": "assistant", "content": "obsolete source " * 3000},
+                    {"role": "user", "content": "Continue"}]
+            self.assertEqual(proxy.send(seed)[0], 200)
+            history = seed + [opaque[0], {"role": "user", "content": "Next"}]
+            self.assertEqual(proxy.send(history)[0], 200)
+            history += [opaque[1], {"role": "user", "content": "Next again"}]
+            self.assertEqual(proxy.send(history)[0], 200)
+            row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+            self.assertNotIn(seed[1], fixture.primaries[-1]["input"])
+            self.assertIn(opaque[1], fixture.primaries[-1]["input"])
+            self.assertIsNotNone(row["last_primary_dispatch"]["outgoing_input_tokens"])
+            self.assertEqual(row["last_primary_dispatch"]["continuation_input_tokens"],
+                             row["planner"]["primary_estimated_tokens"])
+            self.assertGreater(row["last_primary_dispatch"]["continuation_input_tokens"],
+                               row["last_primary_dispatch"]["outgoing_input_tokens"])
+            self.assertGreater(row["context"]["removed_items"], 0)
+            self.assertEqual(row["primary"]["calls"], 3)
+            self.assertEqual(fixture.errors, [])
+            if directory := os.environ.get("CARRY_TEST_EVIDENCE_DIR"):
+                Path(directory, "opaque-selection.json").write_text(json.dumps(
+                    {"row": row, "wires": fixture.primaries}, indent=2))
+            self.assertEqual(row["rewrites"]["dispatched"], 1,
+                             "a newly dispatched cleanup exists independently of token sizing")
+            self.assertFalse(row["rewrites"]["prior_unknown"])
+            # A newly appended image has no comparable native allocation or
+            # reasoning-growth forecast. Unknown sizes must remain unknown,
+            # without erasing an already dispatched, still-applied cleanup.
+            history.append({"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,synthetic"}]})
+            self.assertEqual(proxy.send(history)[0], 200)
+            row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+            self.assertNotIn(seed[1], fixture.primaries[-1]["input"])
+            self.assertIsNone(row["last_primary_dispatch"]["outgoing_input_tokens"])
+            self.assertIsNone(row["last_primary_dispatch"]["continuation_input_tokens"])
+            self.assertEqual(row["rewrites"]["dispatched"], 1)
+            self.assertEqual(row["primary"]["calls"], 4)
+            before = copy.deepcopy(row["primary"])
+            proxy.close()
+            proxy = Proxy(root, fixture, options)
+            stack.callback(proxy.close)
+            for _ in range(2):
+                self.assertEqual(proxy.send(history)[0], 200)
+                row = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]
+                self.assertEqual(row["rewrites"]["dispatched"], 1,
+                                 "repeated applied omissions are not another cleanup")
+            self.assertEqual(row["primary"]["calls"], before["calls"] + 2)
             self.assertEqual(fixture.errors, [])
 
     def test_forced_shrink_is_counted_at_failed_attempted_dispatch(self):
@@ -463,14 +596,16 @@ class DashboardDispatchContract(unittest.TestCase):
             seed = [{"role": "user", "content": "Keep goal"}, {"role": "assistant", "content": "obsolete material " * 1200}, {"role": "user", "content": "Current task"}]
             self.assertEqual(proxy.send(seed, max_output_tokens=1)[0], 200)
             self.assertEqual(proxy.send(seed, max_output_tokens=1)[0], 200)
-            self.assertEqual(proxy.saved()["rewrites"]["dispatched"], 0)
+            self.assertEqual(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["rewrites"]["dispatched"], 0)
             growth = seed + [{"role": "user", "content": "additional source " * 1200}]
             status, result = proxy.send(growth, max_output_tokens=1)
             self.assertEqual(status, 500, result)
             saved = proxy.saved()
             self.assertTrue(saved["last_plan"]["forced"])
-            self.assertEqual(saved["rewrites"]["dispatched"], 1)
-            self.assertEqual(saved["rewrites"]["forced"], 1)
+            rewrites = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["rewrites"]
+            self.assertNotIn("rewrites", saved, "counts must be derived, not a competing saved truth")
+            self.assertEqual(rewrites["dispatched"], 1)
+            self.assertEqual(rewrites["forced"], 1)
             self.assertEqual(saved["last_primary_dispatch"]["outcome"], "failed")
             self.assertLess(saved["last_primary_dispatch"]["outgoing_input_tokens"], saved["last_primary_dispatch"]["continuation_input_tokens"])
             self.assertEqual(fixture.errors, [])
@@ -504,7 +639,7 @@ class DashboardDispatchContract(unittest.TestCase):
             for _ in range(5):
                 status, result = proxy.send(history)
                 self.assertEqual(status, 200, result)
-                counts.append(proxy.saved()["rewrites"]["dispatched"])
+                counts.append(proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["rewrites"]["dispatched"])
             self.assertEqual(counts, [0, 0, 1, 2, 2])
             self.assertNotIn(history[1], fixture.primaries[-1]["input"])
             self.assertNotIn(history[3], fixture.primaries[-1]["input"])
@@ -514,7 +649,8 @@ class DashboardDispatchContract(unittest.TestCase):
             self.assertEqual(proxy.send(history)[0], 200)
             self.assertEqual(fixture.primaries[-1]["input"], history)
             restored = proxy.saved()
-            self.assertEqual(restored["rewrites"]["dispatched"], 2, "restoring source is not a shrink")
+            rewrites = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["rewrites"]
+            self.assertEqual(rewrites["dispatched"], 2, "restoring source is not a cleanup")
             self.assertEqual(fixture.errors, [])
             if directory := os.environ.get("CARRY_TEST_EVIDENCE_DIR"):
                 Path(directory, "second-shrink-restoration.json").write_text(json.dumps({"counts": counts, "restored": restored}, indent=2))
@@ -525,10 +661,11 @@ class DashboardDispatchContract(unittest.TestCase):
         try:
             evidence = tracer.run_arm("dashboard_rewrites", False, restart=True, followups=True)
             state = evidence["final_checkpoint"]
-            self.assertIsInstance(state.get("rewrites"), dict, "filtered requests are not a distinct rewrite counter")
-            self.assertEqual(state["rewrites"]["dispatched"], 1, "initial shrink only; repeated projection, restart and append add no rewrite")
-            self.assertEqual(state["rewrites"]["forced"], 0)
-            self.assertFalse(state["rewrites"]["prior_unknown"])
+            rewrites = evidence["final_stats"]["rewrites"]
+            self.assertNotIn("rewrites", state, "filtered requests are not a second saved counter")
+            self.assertEqual(rewrites["dispatched"], 1, "initial cleanup only; repeated projection, restart and append add none")
+            self.assertEqual(rewrites["forced"], 0)
+            self.assertFalse(rewrites["prior_unknown"])
             self.assertEqual(state["last_reviewer_dispatch"]["lane"], "reviewer")
             self.assertEqual(state["last_reviewer_dispatch"]["outcome"], "completed")
             self.assertGreater(state["last_reviewer_dispatch"]["outgoing_input_tokens"], 0)

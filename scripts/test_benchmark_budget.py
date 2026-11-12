@@ -89,11 +89,12 @@ class DispatchBudgetTests(unittest.TestCase):
                 owner.settle(second, journal)
             self.assertEqual(json.loads(state.read_text())['active'], second)
 
-    def test_network_wires_same_escrow_and_primary_backhaul_before_provider_calls(self):
+    def test_scoped_network_wires_same_escrow_and_primary_backhaul_before_provider_calls(self):
         import os
         import subprocess
         from unittest.mock import patch
         from scripts import swebench_smoke as worker
+        from scripts.slopcodebench_runtime import scoped_env
         from scripts.benchmark_budget import SpendingAuthority
         for mode in ('disabled', 'compact'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
@@ -111,7 +112,9 @@ class DispatchBudgetTests(unittest.TestCase):
                 with patch.dict(os.environ, {'CARRY_PROXY_MODE': mode, 'BENCHMARK_HARNESS': 'codex',
                         'BENCHMARK_TRUSTED_DIRECT': '1' if mode == 'disabled' else '0',
                         'OPENAI_API_KEY': 'fixture-secret', 'BENCHMARK_BUDGET_STATE': str(state)}), \
-                        patch.object(worker.proxy_benchmark, 'read_metrics', return_value={'mode': mode}):
+                        patch.object(worker.proxy_benchmark, 'read_metrics', return_value={'mode': mode}), \
+                        scoped_env({'CARRY_PROXY_MODE': mode, 'BENCHMARK_HARNESS': 'codex',
+                                    'BENCHMARK_TRUSTED_DIRECT': '1' if mode == 'disabled' else '0'}):
                     network = worker.start_agent_network(identity='owned-budget-'+mode,
                         proxy_image='sha256:'+'1'*64, carry_image='sha256:'+'2'*64,
                         proxy_script=Path(worker.__file__).with_name('openai_proxy.js'),
@@ -129,6 +132,29 @@ class DispatchBudgetTests(unittest.TestCase):
                     with self.assertRaises((ValueError, FileNotFoundError)):
                         worker.cleanup_agent_network(network, execute=execute)
                     self.assertIsNotNone(json.loads(state.read_text())['active'])
+
+    def test_scoped_network_rejects_missing_or_corrupt_authority_before_docker(self):
+        import os
+        from unittest.mock import Mock, patch
+        from scripts import swebench_smoke as worker
+        from scripts.slopcodebench_runtime import scoped_env
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)/'authority'
+            for payload in (None, 'not json'):
+                with self.subTest(payload=payload):
+                    if payload is not None:
+                        state.write_text(payload)
+                    execute = Mock()
+                    with patch.dict(os.environ, {'BENCHMARK_BUDGET_STATE': str(state),
+                            'OPENAI_API_KEY': 'synthetic-no-provider'}), \
+                         scoped_env({'CARRY_PROXY_MODE': 'disabled', 'BENCHMARK_TRUSTED_DIRECT': '1'}):
+                        with self.assertRaises((FileNotFoundError, ValueError)):
+                            worker.start_agent_network(identity='owned-invalid-authority',
+                                proxy_image='sha256:'+'1'*64,
+                                proxy_script=Path(worker.__file__).with_name('openai_proxy.js'),
+                                state_dir=Path(directory)/'capture', execute=execute,
+                                expected_primary_model='gpt-6-luna')
+                    execute.assert_not_called()
 
     def test_paid_dispatch_without_shared_authority_never_calls_runner(self):
         from unittest.mock import patch

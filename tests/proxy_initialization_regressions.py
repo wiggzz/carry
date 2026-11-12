@@ -12,6 +12,11 @@ import unittest
 import proxy_state_regressions as support
 
 
+def comparison_snapshot(proxy):
+    return {'result': support.cost_estimate(proxy),
+            'request_evidence': copy.deepcopy(proxy.saved()['request_evidence'])}
+
+
 class InitializationRegressions(unittest.TestCase):
     def setUp(self):
         self.harness = support.StateRegressions()
@@ -49,12 +54,12 @@ class InitializationRegressions(unittest.TestCase):
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
             self.harness.stack.callback(proxy.close)
             if snapshots:
-                self.assertEqual(proxy.saved()["cost_trajectory"], snapshots[-1],
+                self.assertEqual(comparison_snapshot(proxy), snapshots[-1],
                                  "restart preserves exact history and already settled money")
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1, **fields)[0], 200)
             expected_wires.append(copy.deepcopy(history))
             expected_options.append(copy.deepcopy(option))
-            snapshots.append(copy.deepcopy(proxy.saved()["cost_trajectory"]))
+            snapshots.append(comparison_snapshot(proxy))
             proxy.close()
         self.evidence.update(cache_options_history=snapshots, primaries=fixture.primaries,
                              initialized=initialized, reviews=fixture.reviews)
@@ -71,8 +76,7 @@ class InitializationRegressions(unittest.TestCase):
             self.assertAlmostEqual(snapshot["result"]["carry_cost"], expected, places=12)
             self.assertEqual(snapshot["result"]["excluded_unpriced_calls"], 0)
         before = snapshots[boundary - 1]
-        self.assertEqual(before["retired"], 280000)
-        self.assertEqual(before["summary"], 1000)
+        self.assertEqual(before['result']['matched_primary_responses'], boundary)
         self.assertEqual(before["result"].get("initial_compactions", 0), int(initialized))
         self.assertEqual(before["result"]["traditional_compactions"], int(not initialized))
         for index, after in enumerate(snapshots[boundary:]):
@@ -81,10 +85,13 @@ class InitializationRegressions(unittest.TestCase):
                                  "CACHE_OPTIONS_HISTORY: forecast settings cannot grant initialization")
                 self.assertEqual(after["result"]["traditional_compactions"], int(not initialized))
                 self.assertEqual(after["result"]["summary_cost"], before["result"]["summary_cost"])
-                self.assertEqual(after["retired"], 280000)
-                self.assertEqual(after["summary"], 1000)
-                self.assertEqual(after["last_traditional_input"], 21100 + index * 100,
-                                 "every appended native input token survives cache-policy changes")
+                prior = snapshots[boundary + index - 1]['result']['traditional_cost']
+                incoming = 21100 + index * 100
+                expected = ((incoming * 2.5) if index == 0 and not initialized else
+                            ((incoming - 100) * .1 + 100 * 2.5) if index < 3 else
+                            incoming * (2 if index == 3 else 2.5)) / 1e6
+                self.assertAlmostEqual(after['result']['traditional_cost'] - prior, expected,
+                                       places=12, msg='every native append survives cache-policy changes')
 
     def test_cache_options_preserve_free_initialized_history_across_restart(self):
         self.cache_options_history_control(True)
@@ -117,7 +124,7 @@ class InitializationRegressions(unittest.TestCase):
         estimate = stats["sessions"][0]["cost_estimate"]
         saved = proxy.saved()
         self.evidence.update(
-            estimate=estimate, trajectory=saved["cost_trajectory"],
+            estimate=estimate, trajectory=saved["request_evidence"],
             primaries=fixture.primaries, reviews=fixture.reviews,
             basis="synthetic native receipt; initialization tracer only",
         )
@@ -159,12 +166,12 @@ class InitializationRegressions(unittest.TestCase):
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
             self.harness.stack.callback(proxy.close)
             if index:
-                self.assertEqual(proxy.saved()["cost_trajectory"], snapshots[-1],
+                self.assertEqual(comparison_snapshot(proxy), snapshots[-1],
                                  "restart must preserve settled quantities and money")
             wires.append(copy.deepcopy(history))
             caps.append(cap)
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=cap)[0], 200)
-            snapshots.append(copy.deepcopy(proxy.saved()["cost_trajectory"]))
+            snapshots.append(comparison_snapshot(proxy))
             proxy.close()
         self.evidence.update(history_contract_snapshots=snapshots, primaries=fixture.primaries,
                              reviews=fixture.reviews, initialized=initialized, change_cap=change_cap,
@@ -180,9 +187,7 @@ class InitializationRegressions(unittest.TestCase):
             self.assertAlmostEqual(snapshot["result"]["carry_cost"], expected_paid, places=12)
             self.assertEqual(snapshot["result"]["excluded_unpriced_calls"], 0)
         before = snapshots[changed_at - 1]
-        self.assertEqual(before["retired"], 280000)
-        self.assertEqual(before["summary"], 1000)
-        self.assertEqual(before["last_traditional_input"], 21200)
+        self.assertEqual(before['result']['matched_primary_responses'], changed_at)
         self.assertEqual(before["result"]["traditional_compactions"], int(not initialized))
         self.assertEqual(before["result"]["summary_cost"] > 0.0, not initialized)
         if initialized:
@@ -198,10 +203,10 @@ class InitializationRegressions(unittest.TestCase):
                 self.assertEqual(after["result"].get("initial_compactions", 0),
                                  before["result"].get("initial_compactions", 0),
                                  "fitting output allowance cannot grant another free initialization")
-                self.assertEqual(after["retired"], 280000)
-                self.assertEqual(after["summary"], 1000)
-                self.assertEqual(after["last_traditional_input"], 21300 + offset * 100,
-                                 "all accumulated growth must survive the allowance change")
+                prior = snapshots[changed_at + offset - 1]['result']['traditional_cost']
+                self.assertAlmostEqual(after['result']['traditional_cost'] - prior,
+                                       ((21200 + offset * 100) * .1 + 100 * 2.5) / 1e6,
+                                       places=12, msg='all native growth survives allowance changes')
 
     def test_history_contract_unchanged_output_preserves_paid_growth(self):
         self.output_allowance_history_control(initialized=False, change_cap=False)
@@ -229,59 +234,37 @@ class InitializationRegressions(unittest.TestCase):
                 msg="first primary must use retained recent content plus replacement summary, cold",
             )
 
-    def test_legacy_initialization_upgrade_preserves_recorded_money(self):
-        import json
-
+    def test_current_evidence_restart_preserves_recorded_money_then_charges_summary(self):
         def primary(_body, n):
-            response = support.completed(response_id=f"legacy-initialization186-{n}")
-            response["usage"] = {"input_tokens": 10000 if n == 1 else 300000,
-                                 "output_tokens": 0,
-                                 "input_tokens_details": {"cached_tokens": 0}}
+            response = support.completed(response_id=f'current-initialization-{n}')
+            response['usage'] = {'input_tokens':10000 if n == 1 else 300000,
+                                 'output_tokens':0, 'input_tokens_details':{'cached_tokens':0}}
             return 200, response
-
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
-        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-
+        fixture = self.harness.fixture(primary, lambda *_: self.fail('unexpected reviewer'))
         def start():
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
-                                  extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
+            proxy = support.Proxy(self.harness.state, fixture, mode='audit',
+                extra_env={'CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS':'1000000'})
             self.harness.stack.callback(proxy.close)
             return proxy
-
         proxy = start()
-        history = [{"role": "user", "content": "owned legacy money fixture"}]
-        self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
+        history = [{'role':'user','content':'owned current money fixture'}]
+        self.assertEqual(proxy.send(history, model='gpt-6.1-sol')[0], 200)
+        historical = comparison_snapshot(proxy)
+        paid = copy.deepcopy(proxy.saved()['primary'])
         proxy.close()
-        checkpoint = next(self.harness.state.glob("*.json"))
-        saved = json.loads(checkpoint.read_text())
-        # Owned synthetic checkpoint: remove only the new estimand fields,
-        # retaining all historical receipts, native pricing and session state.
-        trajectory = saved["cost_trajectory"]
-        trajectory["receipts"].pop("initialization_policy_version", None)
-        trajectory["receipts"].pop("history_anchor", None)
-        for key in ["initialization_policy", "initial_compactions", "legacy_initialization_segment"]:
-            trajectory["result"].pop(key, None)
-        historical = copy.deepcopy(trajectory["result"])
-        checkpoint.write_text(json.dumps(saved))
         proxy = start()
-        self.assertEqual(proxy.saved()["cost_trajectory"]["result"]["traditional_cost"],
-                         historical["traditional_cost"])
-        history.append({"role": "assistant", "content": "new unrecognized input"})
-        self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
-        status, stats = proxy.request("GET", "/carry/dashboard/stats")
-        self.assertEqual(status, 200)
-        estimate = stats["sessions"][0]["cost_estimate"]
-        self.evidence.update(historical=historical, estimate=estimate, final=proxy.saved(),
+        self.assertEqual(comparison_snapshot(proxy), historical)
+        self.assertEqual(proxy.saved()['primary'], paid)
+        history.append({'role':'assistant','content':'new recognized input'})
+        self.assertEqual(proxy.send(history, model='gpt-6.1-sol')[0], 200)
+        estimate = support.cost_estimate(proxy)
+        self.evidence.update(historical=historical, estimate=estimate, saved=proxy.saved(),
                              primaries=fixture.primaries, reviews=fixture.reviews)
-        self.assertAlmostEqual(estimate["observed_primary_cost"], 1.22, places=12)
-        self.assertAlmostEqual(estimate["traditional_cost"] - historical["traditional_cost"],
-                               0.0525, places=12)
-        self.assertEqual(estimate["summary_cost"], historical["summary_cost"])
-        self.assertEqual(estimate["initial_compactions"], 1)
-        self.assertEqual(estimate["initialization_policy"], "mixed_legacy_and_free_pre_window_v1")
-        boundary = estimate["legacy_initialization_segment"]
-        for key in ["carry_cost", "traditional_cost", "summary_cost", "traditional_compactions"]:
-            self.assertEqual(boundary[key], historical[key])
+        self.assertAlmostEqual(estimate['observed_primary_cost'], 1.22, places=12)
+        self.assertEqual(estimate['initial_compactions'], 0)
+        self.assertEqual(estimate['traditional_compactions'], 1)
+        self.assertGreater(estimate['summary_cost'], 0)
+        self.assertEqual(fixture.reviews, [])
 
 
     def test_large_wire_initialization_survives_restart_retry_and_later_paid_compaction(self):
@@ -366,7 +349,7 @@ class InitializationRegressions(unittest.TestCase):
         initialized = proxy.saved()
         proxy.close()
         proxy = start()
-        self.assertEqual(proxy.saved()["cost_trajectory"], initialized["cost_trajectory"],
+        self.assertEqual(proxy.saved()["request_evidence"], initialized["request_evidence"],
                          "restart must load the exact successful comparison before any new request")
         history.append({"role": "user", "content": "append after restart"})
         self.assertEqual(send(proxy, history)[0], 200)
@@ -437,18 +420,18 @@ class InitializationRegressions(unittest.TestCase):
         history = [{"role": "assistant", "content": "owned synthetic receipt tracer"},
                    {"role": "user", "content": "current"}]
         self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
-        first = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        first = comparison_snapshot(proxy)
         appended = history + [{"role": "user", "content": "append"}]
         self.assertEqual(proxy.send(appended, model="gpt-6.1-sol", max_output_tokens=1)[0], 429)
-        failed = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        failed = comparison_snapshot(proxy)
         proxy.close()
         proxy = start()
-        restarted = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        restarted = comparison_snapshot(proxy)
         self.assertEqual(proxy.send(appended, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
-        retry = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        retry = comparison_snapshot(proxy)
         self.assertEqual(proxy.send(appended, model="gpt-6.1-sol", max_output_tokens=1,
                                     instructions="changed fixed settings")[0], 200)
-        changed = copy.deepcopy(proxy.saved()["cost_trajectory"])
+        changed = comparison_snapshot(proxy)
         self.evidence.update(first=first, failed=failed, restarted=restarted, retry=retry,
                              changed=changed, primaries=fixture.primaries, reviews=fixture.reviews,
                              basis="synthetic receipt accounting; explicit owner restart and settings fence")
@@ -460,24 +443,53 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(failed["result"]["traditional_cost"], first["result"]["traditional_cost"])
         self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
         self.assertEqual(first["result"]["initial_compactions"], 1)
-        self.assertIsNotNone(first["history_continuity"])
-        self.assertIsNone(failed["receipts"]["anchor"])
-        self.assertTrue(first["receipts"]["modeled_cache"]["writes"],
-                        "successful initialized history established a modeled write")
-        self.assertEqual(failed["receipts"]["modeled_cache"], first["receipts"]["modeled_cache"],
-                         "failed primary neither evicts nor renews existing hypothetical cache coverage")
-        self.assertEqual(failed["history_continuity"], first["history_continuity"])
+        original = first['request_evidence']['observations']
+        observations = failed['request_evidence']['observations']
+        self.assertEqual(observations[:len(original)], original,
+                         'failure preserves successful initialization facts and native cursor/contract')
+        appended = observations[len(original):]
+        self.assertEqual(len(appended), 2, 'one dispatch followed by one failed terminal')
+        self.assertEqual(set(appended[0]), {'Dispatch'})
+        dispatch = appended[0]['Dispatch']
+        self.assertTrue(dispatch['request_id'])
+        self.assertEqual(dispatch['selection'], dispatch['continuation'])
+        self.assertEqual(dispatch['omitted_members'], 0)
+        self.assertEqual(dispatch['newly_omitted_members'], 0)
+        self.assertIs(dispatch['forced'], False)
+        self.assertEqual(dispatch['input_reduction_estimate'], 0)
+        self.assertEqual(appended[1], 'FailedPrimary')
         self.assertEqual(restarted, failed, "restart preserves the failed-attempt boundary")
         self.assertEqual(retry["result"]["initial_compactions"], 1,
                          "a failed request cannot repeat free initialization")
         self.assertAlmostEqual(retry["result"]["traditional_cost"] - first["result"]["traditional_cost"],
                                (21000 * 0.1 + 100 * 2.5) / 1e6, places=12)
-        self.assertEqual(changed["result"]["initial_compactions"], 2,
-                         "genuinely unrecognized changed settings require a new prospective assumption")
+        # Only the first tracked oversized success may initialize for free.
+        # A settings fence makes the matched branch cold/unrecognized, so its
+        # full input is charged and the later summary is paid, not a new start.
+        self.assertEqual(changed["result"]["initial_compactions"], 1)
+        keep_recent, summary = 20000, 1000
+        changed_input = inputs[-1]
+        paid_summary = ((changed_input - keep_recent) * 2 + summary * 10) / 1e6
         self.assertAlmostEqual(changed["result"]["traditional_cost"] - retry["result"]["traditional_cost"],
-                               0.0525, places=12)
-        self.assertEqual(changed["result"]["summary_cost"], 0.0)
-        self.assertEqual(changed["result"]["traditional_compactions"], 0)
+                               changed_input * 2.5 / 1e6 + paid_summary, places=12)
+        self.assertAlmostEqual(changed["result"]["summary_cost"], paid_summary, places=12)
+        self.assertEqual(changed["result"]["traditional_compactions"], 1)
+
+        # Independent chronological oracle: preserve retired history through
+        # failure/restart/settings, reuse the warm retry prefix, then cool only
+        # the cache at the settings change. This branch never repeats history.
+        retained = keep_recent + summary
+        retry_growth = inputs[2] - inputs[0]
+        changed_growth = inputs[3] - inputs[2]
+        expected = [retained * 2.5 / 1e6] * 3
+        expected.append(expected[-1] + (retained * 0.1 + retry_growth * 2.5) / 1e6)
+        expected.append(expected[-1] + (retained + retry_growth + changed_growth) * 2.5 / 1e6)
+        for snapshot, cost in zip((first, failed, restarted, retry, changed), expected):
+            trajectory = snapshot["result"]["whole_window"]["trajectory"]
+            self.assertAlmostEqual(trajectory["traditional_cost"], cost, places=12)
+            self.assertEqual(trajectory["initial_compactions"], 1)
+            self.assertEqual(trajectory["traditional_compactions"], 0)
+            self.assertEqual(trajectory["summary_cost"], 0.0)
 
     def initialized_policy_restart_control(self, *, migrate):
         import json
@@ -511,11 +523,11 @@ class InitializationRegressions(unittest.TestCase):
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
             self.harness.stack.callback(proxy.close)
             if index:
-                self.assertEqual(proxy.saved()["cost_trajectory"], snapshots[-1],
+                self.assertEqual(comparison_snapshot(proxy), snapshots[-1],
                                  "restart must not rewrite prior trajectory or money")
             wires.append(copy.deepcopy(history))
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
-            snapshots.append(copy.deepcopy(proxy.saved()["cost_trajectory"]))
+            snapshots.append(comparison_snapshot(proxy))
             proxy.close()
         self.evidence.update(policy_snapshots=snapshots, primaries=fixture.primaries,
                              reviews=fixture.reviews, migrate=migrate,
@@ -523,9 +535,7 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), 5)
         self.assertEqual(fixture.reviews, [])
         first = snapshots[0]
-        self.assertIsNotNone(first["history_continuity"])
-        self.assertEqual(first["retired"], 280000)
-        self.assertEqual(first["summary"], 1000)
+        self.assertEqual(first['result']['matched_primary_responses'], 1)
         self.assertEqual(first["result"]["initial_compactions"], 1)
         self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
         for index, snapshot in enumerate(snapshots):
@@ -541,8 +551,7 @@ class InitializationRegressions(unittest.TestCase):
             with self.subTest(boundary="initialization is not repeated", request=index + 1):
                 self.assertEqual(result["initial_compactions"], 1,
                                  "policy-only cache coldness must not erase known traditional history")
-                self.assertEqual(snapshot["retired"], 280000)
-                self.assertEqual(snapshot["summary"], 1000)
+                self.assertEqual(snapshot['result']['matched_primary_responses'], index + 1)
         # The history is warm before migration. A policy change is cold once,
         # but retains every appended token rather than freely compacting again.
         for index in range(1, 5):
@@ -560,8 +569,8 @@ class InitializationRegressions(unittest.TestCase):
             self.assertEqual(boundaries[0]["next_version"], 3)
             for key in ["carry_cost", "traditional_cost", "summary_cost", "traditional_compactions"]:
                 self.assertEqual(boundaries[0]["cumulative"][key], snapshots[2]["result"][key])
-            self.assertEqual(snapshots[2]["history_continuity"]["contract"],
-                             snapshots[3]["history_continuity"]["contract"],
+            self.assertEqual(next(o['Primary']['facts']['contract'] for o in snapshots[2]['request_evidence']['observations'] if isinstance(o, dict) and 'Primary' in o),
+                             snapshots[3]['request_evidence']['observations'][-1]['Primary']['facts']['contract'],
                              "cache policy must not rekey traditional history")
         self.assertEqual(snapshots[4]["result"].get("cache_policy_boundaries", []), boundaries)
 
@@ -809,7 +818,10 @@ class InitializationRegressions(unittest.TestCase):
         self.assertEqual(fixture.reviews, [])
         self.assertAlmostEqual(estimate["observed_primary_cost"], 0.12, places=12)
         self.assertEqual(saved["primary"]["calls"], 1)
-        self.assertEqual(saved["cost_trajectory"]["result"]["summary_cost"], 0.0)
+        if estimate['matched_primary_responses']:
+            self.assertEqual(estimate['summary_cost'], 0.0)
+        else:
+            self.assertIsNone(estimate['summary_cost'])
         self.assertEqual(estimate["traditional_compactions"], 0)
         return estimate
 
@@ -867,7 +879,10 @@ class InitializationRegressions(unittest.TestCase):
         resolution = saved["model_resolution"]["primary"]
         self.assertEqual(resolution["capacity_tokens"], 50000)
         self.assertEqual(resolution["ordinary"]["output_reserve"], 16384 if reserve is None else reserve)
-        self.assertEqual(saved["cost_trajectory"]["result"]["summary_cost"], 0.0)
+        if estimate['matched_primary_responses']:
+            self.assertEqual(estimate['summary_cost'], 0.0)
+        else:
+            self.assertIsNone(estimate['summary_cost'])
         self.assertEqual(estimate["traditional_compactions"], 0)
         return estimate
 
@@ -913,7 +928,7 @@ class InitializationRegressions(unittest.TestCase):
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
         estimate = stats["sessions"][0]["cost_estimate"]
-        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["request_evidence"],
                              primaries=fixture.primaries, reviews=fixture.reviews,
                              basis="synthetic image receipt; no projected-image allocation")
         self.assertEqual(len(fixture.primaries), 1)
@@ -923,7 +938,10 @@ class InitializationRegressions(unittest.TestCase):
         self.assertAlmostEqual(estimate["observed_primary_cost"], 0.402, places=12)
         self.assertEqual(proxy.saved()["primary"]["calls"], 1)
         self.assertEqual(estimate["traditional_compactions"], 0)
-        self.assertEqual(self.evidence["trajectory"]["result"]["summary_cost"], 0.0)
+        if estimate['matched_primary_responses']:
+            self.assertEqual(estimate['summary_cost'], 0.0)
+        else:
+            self.assertIsNone(estimate['summary_cost'])
         return estimate
 
     def test_unchanged_image_with_small_output_remains_priceable(self):
@@ -964,7 +982,7 @@ class InitializationRegressions(unittest.TestCase):
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
         estimate = stats["sessions"][0]["cost_estimate"]
-        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["request_evidence"],
                              primaries=fixture.primaries, reviews=fixture.reviews,
                              basis="input alone fits; requested output triggers fitting initialization")
         self.assertEqual(fixture.primaries[0]["input"], history)
@@ -998,7 +1016,7 @@ class InitializationRegressions(unittest.TestCase):
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
         estimate = stats["sessions"][0]["cost_estimate"]
-        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["request_evidence"],
                              primaries=fixture.primaries, reviews=fixture.reviews,
                              basis="output reservation versus protected current input; synthetic receipt")
         self.assertEqual(len(fixture.primaries), 1)
@@ -1030,7 +1048,7 @@ class InitializationRegressions(unittest.TestCase):
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
         estimate = stats["sessions"][0]["cost_estimate"]
-        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["request_evidence"],
                              primaries=fixture.primaries, reviews=fixture.reviews,
                              basis="large protected current user request; synthetic receipt")
         self.assertEqual(fixture.primaries[0]["input"], history)
@@ -1063,7 +1081,7 @@ class InitializationRegressions(unittest.TestCase):
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
         estimate = stats["sessions"][0]["cost_estimate"]
-        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["request_evidence"],
                              primaries=fixture.primaries, reviews=fixture.reviews,
                              basis="fixed tools exceed economic budget; synthetic receipt")
         self.assertEqual(fixture.primaries[0]["tools"], tools)
@@ -1095,7 +1113,7 @@ class InitializationRegressions(unittest.TestCase):
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
         estimate = stats["sessions"][0]["cost_estimate"]
-        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["cost_trajectory"],
+        self.evidence.update(estimate=estimate, trajectory=proxy.saved()["request_evidence"],
                              primaries=fixture.primaries, reviews=fixture.reviews)
         self.assertEqual(fixture.primaries[0]["instructions"], instructions)
         self.assertEqual(fixture.primaries[0]["input"], history)

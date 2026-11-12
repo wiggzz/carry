@@ -131,6 +131,7 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
         # Reuse the same authority already consumed by SCB, never a new lane allowance.
         budget_state = root/'synthetic-combined-budget.json'
         self.assertTrue(budget_state.is_file())
+        previous_leases = json.loads(budget_state.read_text())['history']
         with fixture.FixtureNetwork(scb_prepared['fixture_provider_image']) as network, \
              patch.dict(os.environ, {'BENCHMARK_BUDGET_STATE': str(budget_state)}), \
              patch.object(lane, 'preflight', side_effect=lambda c,p: lane.comparison.build_plan(c)), \
@@ -138,6 +139,11 @@ ENTRYPOINT ["python3", "/opt/swebench-harness/bin/adapter"]
              patch.object(lane.swe, 'run_official_evaluation', side_effect=evaluate), contextlib.redirect_stdout(io.StringIO()):
             lane.main(['--contract', str(config), '--prepared', str(prepared_file), '--run', '--allow-paid',
                        '--output', str(work/'paired'), '--budget-usd', '10'])
+        authority = json.loads(budget_state.read_text())
+        self.assertIsNone(authority['active'])
+        self.assertEqual(authority['history'][:len(previous_leases)], previous_leases)
+        self.assertEqual([lease['identity'] for lease in authority['history'][len(previous_leases):]],
+                         [slot['namespace'] for slot in lane.comparison.build_plan(contract)['slots']])
         (work/'provider-synthetic.log').write_text(network.provider_log)
         report = json.loads((work/'paired/report.json').read_text())
         self.assertTrue(report['comparison_valid'], (work/'paired/records.jsonl').read_text())

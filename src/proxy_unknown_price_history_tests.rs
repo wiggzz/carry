@@ -80,10 +80,16 @@ fn history_through_tariff_gap(initialized: bool, unknown: bool) {
         // independent history oracle, including after the restarted continuation.
         let actual_increment = if step == 0 { 0.0 } else { 300400.0 * 4.0 / 1e6 };
         assert!(
-            (after.observed_primary_cost - before.observed_primary_cost - actual_increment).abs()
+            (after.observed_primary_cost.unwrap()
+                - before.observed_primary_cost.unwrap()
+                - actual_increment)
+                .abs()
                 < 1e-12
         );
-        assert_eq!(after.observed_reviewer_cost, before.observed_reviewer_cost);
+        assert_eq!(
+            after.observed_reviewer_cost.unwrap(),
+            before.observed_reviewer_cost.unwrap()
+        );
         assert_eq!(after.reviewer_cost, before.reviewer_cost);
         assert_eq!(
             after.coverage.reviewer_responses,

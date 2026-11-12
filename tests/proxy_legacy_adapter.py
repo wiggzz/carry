@@ -7,6 +7,7 @@ pre-initialization baseline too; that execution is not candidate verification.
 """
 import base64
 import copy
+from history_store import read_index, write_index
 import json
 import unittest
 
@@ -92,10 +93,7 @@ class LegacyAdapterLoads(unittest.TestCase):
             proxy = start()
             before, saved = send(proxy)
             proxy.close()
-        t = saved["cost_trajectory"]
         self.assertEqual(saved["history_shared"], shared)
-        self.assertEqual((t["retired"], t["summary"], t["last_traditional_input"]),
-                         (280000, 1000, 21100))
         self.assertEqual(before.get("initial_compactions", 0), 0)
         self.assertEqual(before["traditional_compactions"], 1)
         self.assertGreater(before["summary_cost"], 0)
@@ -107,31 +105,28 @@ class LegacyAdapterLoads(unittest.TestCase):
         paid_before = sum(n * (4 if n > 272000 else 2) / 1e6 for n in inputs[:3])
         self.assertAlmostEqual(before["observed_primary_cost"], paid_before, places=12)
 
-        # Current cursor proof comes from real adapted dispatch. Remove only
-        # modeled cache evidence; never rewrite the cursor or infer a write.
+        # Age actual adapted dispatches uniformly. No mutable modeled-cache
+        # projection exists now; restart itself must never renew these events.
         checkpoint = next(self.harness.state.glob("*.json"))
         owner = checkpoint.stem
         def without_cache(target):
-            trajectory = target["cost_trajectory"]
-            trajectory["receipts"].pop("modeled_cache", None)
-            self.assertEqual(trajectory["history_continuity"]["cursor"]["items"],
-                             len(expected_wires[-1]["input"]))
-            self.assertEqual(trajectory["history_continuity"]["cursor"]["input"], inputs[2])
+            facts = [o["Primary"]["facts"] for o in target["request_evidence"]["observations"] if "Primary" in o]
+            self.assertEqual(facts[-1]["native"]["input_tokens"], inputs[2])
             # Operational quantity evidence belongs to the final dispatched
             # wire, independently of the traditional-cost cursor/cache.
             measured = target["primary_input"]["anchor"]
             self.assertEqual(measured["input"], inputs[2])
             self.assertEqual(measured["prompt"]["item_count"], len(expected_wires[-1]["input"]))
-            return target
+            return legacy.expire_dispatches(target)
         staged = without_cache(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
         index_path = self.harness.state / "history.index"
-        index = json.loads(index_path.read_text())
+        index = read_index(index_path)
         if shared:
             self.assertIn(owner, index["snapshots"])
             index["snapshots"][owner] = without_cache(index["snapshots"][owner])
-            self.assertEqual(index["snapshots"][owner]["cost_trajectory"], staged["cost_trajectory"])
-            index_path.write_text(json.dumps(index))
+            self.assertEqual(index["snapshots"][owner]["request_evidence"], staged["request_evidence"])
+            write_index(index_path, index)
         self.evidence.update(shared=shared, controls=controls, folded=folded,
                              before=before, staged=staged, owner=owner,
                              staged_index=index if shared else None)
@@ -171,14 +166,13 @@ class LegacyAdapterLoads(unittest.TestCase):
         self.assertEqual(fixture.errors, [])
 
         for step, (after, state) in enumerate(zip(snapshots, states)):
-            trajectory = state["cost_trajectory"]
             with self.subTest(step=step, shared=shared, controls=controls, folded=folded):
                 self.assertEqual(after["matched_primary_responses"], 4 + step,
                                  "CURRENT_ADAPTED_WIRE: unchanged native growth must remain comparable")
                 self.assertEqual(after["excluded_unpriced_calls"], 0)
-                self.assertEqual((trajectory["retired"], trajectory["summary"],
-                                  trajectory["last_traditional_input"]),
-                                 (280000, 1000, 21200 + step * 100))
+                old = staged["request_evidence"]["observations"]
+                self.assertEqual(state["request_evidence"]["observations"][:len(old)], old)
+                self.assertEqual(state["primary_input"]["anchor"]["input"], inputs[3 + step])
                 self.assertEqual(after.get("initial_compactions", 0), 0)
                 self.assertEqual(after["traditional_compactions"], 1)
                 self.assertEqual(after["summary_cost"], before["summary_cost"])

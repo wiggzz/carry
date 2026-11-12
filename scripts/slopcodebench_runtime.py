@@ -4,7 +4,7 @@
 No catalog bootstrap, image builds/pulls, provider credentials in agent containers,
 custom scorer, or replacement checkpoint loop. Invoke through slopcodebench.py.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import functools
 import hashlib
 import json
@@ -123,12 +123,18 @@ def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True
 
 @contextmanager
 def scoped_env(values):
+    """Isolate slot settings without replacing the controller's spend authority."""
     before = dict(os.environ)
     try:
         for key in list(os.environ):
             if key.startswith(('CARRY_PROXY_', 'BENCHMARK_')):
                 os.environ.pop(key)
         os.environ.update(values)
+        # Both native lanes construct their gateway inside this scope. Its
+        # validated controller-owned authority is not a per-slot setting.
+        os.environ.pop('BENCHMARK_BUDGET_STATE', None)
+        if 'BENCHMARK_BUDGET_STATE' in before:
+            os.environ['BENCHMARK_BUDGET_STATE'] = before['BENCHMARK_BUDGET_STATE']
         yield
     finally:
         os.environ.clear()
@@ -182,11 +188,14 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
     from slop_code.execution.docker_runtime.exec import DockerExecRuntime
     from slop_code.agent_runner.agents.utils import HOME_PATH
     from slop_code.agent_runner.agents.codex.agent import CodexAgent
+    from slop_code.execution.snapshot import Snapshot
+    old_snapshot = Snapshot.__dict__['from_directory']
+    snapshot_from_directory = Snapshot.from_directory
     old_usage = CodexAgent._read_latest_trace_usage
     old_traces = CodexAgent._save_codex_traces
     registry._ensure_runtimes_registered()
     old_stream, old_exec = registry.STREAMING_RUNTIME_REGISTRY.copy(), registry.EXEC_RUNTIME_REGISTRY.copy()
-    with tempfile.TemporaryDirectory(prefix='scb-native-home-') as home:
+    with tempfile.TemporaryDirectory(prefix='scb-native-home-') as home, ExitStack() as snapshots:
         class ProtectedExec:
             @classmethod
             def spawn(cls, environment, **kwargs):
@@ -261,6 +270,22 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
 
         from slop_code.execution.docker_runtime.streaming import DockerStreamingRuntime
         agents = []
+        def owned_snapshot(cls, cwd, *args, **kwargs):
+            # A successful exec can leave background writers. Freeze all owned
+            # agent processes while making the existing bounded no-follow copy;
+            # upstream glob/archive code must see only host-owned regular files.
+            private = snapshots.enter_context(tempfile.TemporaryDirectory(prefix='scb-owned-snapshot-'))
+            owned = Path(private)/'workspace'
+            with ExitStack() as frozen:
+                for agent_runtime in agents:
+                    container = agent_runtime._container
+                    if container is not None:
+                        container.pause()
+                        frozen.callback(container.unpause)
+                swebench_smoke.publish_agent_artifacts(cwd, owned)
+            result = snapshot_from_directory(owned, *args, **kwargs)
+            return result.model_copy(update={'path': cwd})
+
         class AgentRuntime(DockerStreamingRuntime):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
@@ -327,6 +352,7 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
 
         registry.STREAMING_RUNTIME_REGISTRY['docker'] = AgentRuntime
         registry.EXEC_RUNTIME_REGISTRY['docker'] = EvalRuntime
+        Snapshot.from_directory = classmethod(owned_snapshot)
         CodexAgent._read_latest_trace_usage = owned_codex_trace_method(old_usage)
         CodexAgent._save_codex_traces = owned_codex_trace_method(old_traces)
         try:
@@ -340,6 +366,7 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
                     cleanup_errors.append(str(error))
             registry.STREAMING_RUNTIME_REGISTRY.clear(); registry.STREAMING_RUNTIME_REGISTRY.update(old_stream)
             registry.EXEC_RUNTIME_REGISTRY.clear(); registry.EXEC_RUNTIME_REGISTRY.update(old_exec)
+            Snapshot.from_directory = old_snapshot
             CodexAgent._read_latest_trace_usage = old_usage
             CodexAgent._save_codex_traces = old_traces
             if cleanup_errors:

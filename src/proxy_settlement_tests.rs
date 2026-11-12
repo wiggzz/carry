@@ -9,7 +9,7 @@ pub(super) fn publication_crash_barrier(service: &Service, stage: &str) {
             std::process::exit(73);
         }
         if action == "fault" && stage == "before" {
-            std::fs::create_dir(service.config.state_dir.join(".history-index.tmp")).unwrap();
+            history::fixture::publication_fault(&service.config.state_dir.join("history.index"), true);
         }
     }
 }
@@ -119,7 +119,7 @@ async fn completed_h_crash_before_after_publication_and_failed_publication_keep_
             "only durably indexed advice closes intent at the existing ingress boundary"
         );
         if stage == "fault" {
-            std::fs::remove_dir(directory.path().join(".history-index.tmp")).unwrap();
+            history::fixture::publication_fault(&directory.path().join("history.index"), false);
         }
         // A new owner can reserve the entire one-owner budget: failed publication
         // must not leak its worker pin. For crashes this also proves cold restart.
@@ -210,8 +210,8 @@ async fn failed_known_receipt_settlement_releases_live_owner_pin_without_publish
             .unwrap(),
         id
     );
-    let fault = directory.path().join(".history-index.tmp");
-    std::fs::create_dir(&fault).unwrap();
+    let fault = directory.path().join("history.index");
+    history::fixture::checkpoint_fault(&fault, true);
     drop(lock);
     tokio::time::timeout(Duration::from_secs(5), async {
         while service.background_reviews.lock().await.contains(id) {
@@ -232,7 +232,7 @@ async fn failed_known_receipt_settlement_releases_live_owner_pin_without_publish
             .is_none()
     );
     drop(history::pin(&service, "other-live-owner").unwrap());
-    std::fs::remove_dir(fault).unwrap();
+    history::fixture::checkpoint_fault(&fault, false);
     provider.abort();
 }
 
