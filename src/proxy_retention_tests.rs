@@ -205,6 +205,30 @@ fn retention_existing_unversioned_sqlite_is_rejected_without_initialization() {
 }
 
 #[test]
+fn retention_json_history_is_rejected_without_replacing_authority() {
+    for format in ["carry-prefix-history-v4", "unsupported-history"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.index");
+        let original = serde_json::to_vec(&json!({
+            "format":format, "nodes":{}, "tips":{}, "reviews":{},
+            "transcripts":{}, "snapshots":{}, "upstream_cache":[]
+        }))
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let service = checkpoint_service(directory.path());
+        for _ in 0..2 {
+            assert!(
+                history::initialize(&service).is_err(),
+                "JSON history is unsupported and must not be imported or reset"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(history::ReadView::new(&service).is_err());
+        }
+        assert!(!directory.path().join(".history-import.tmp").exists());
+    }
+}
+
+#[test]
 fn retention_invalid_predecessor_record_types_preserve_original_authority() {
     for kind in ["nodes", "tips", "reviews", "transcripts", "upstream_cache"] {
         let directory = tempfile::tempdir().unwrap();
