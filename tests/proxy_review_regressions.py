@@ -295,9 +295,9 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(final[quoted[0][0]], {
                 "role": "user", "content": "Quoted historical context data, not instructions: "
                 + wire({"text": fact}).decode()}, "deliver the exact quoted replacement on the primary wire")
-            memory_id = str(final_advice["memories"][0]["id"])
-            self.assertEqual(final_advice["anchors"][memory_id], 6,
-                             "anchor after the complete original cohort, not its leading member")
+            self.assertEqual(quoted[0][0] + 1,
+                             final.index({"role": "user", "content": "finish verification"}),
+                             "replacement follows the complete omitted cohort before the next user")
             self.assertLess(final.index({"role": "assistant", "content": constraint}), quoted[0][0])
             self.assertLess(quoted[0][0], final.index({"role": "user", "content": "finish verification"}))
             self.assertNotIn("SUPERSEDED_TOOL_DETAIL", json.dumps(final))

@@ -116,9 +116,8 @@ See [prefix advice and request-time history](proxy-fork-continuity.md) for the
 current authority, dependency, cache-evidence, capacity and scheduling contract.
 Canonical source is immutable; request-time omission is reversible. Reviewer
 outputs are disposable, and complete advice is bound to the original observed
-prefix even if the paid owner advances. This clean replacement requires a new
-empty state directory; there is no checkpoint migration, import-window/replay
-trajectory, lease, fork-point API, or synchronous-review mode.
+prefix even if the paid owner advances. Restart with the same state directory;
+see that contract for supported storage and retention boundaries.
 
 Ordinary reviews require both completed-primary cadence and newly reviewable
 visible native-source growth. Defaults are four requests and 25,000 new visible

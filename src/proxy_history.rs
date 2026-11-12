@@ -606,7 +606,6 @@ pub(super) fn hydrate(
     session.completed_review_len = 0;
     session.drop_members.clear();
     session.memories.clear();
-    session.memory_anchors.clear();
     let Some(namespace) = session.history_namespace.as_deref() else {
         return Ok(());
     };
