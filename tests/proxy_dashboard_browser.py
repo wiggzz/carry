@@ -180,15 +180,21 @@ class BrowserRetention(unittest.TestCase):
                     wait("transcriptText.size===2 && [...transcriptText.values()].every(x=>x.length>98000)")
                     self.assertTrue(evaluate("document.getElementById('cards').textContent.includes('$12.999999')"))
                     if page in [4, 39, 79, 119]:
+                        # A completed fetch does not drain queued details toggle
+                        # events. They temporarily root the detached previous
+                        # page even through GC; sample the retained working set
+                        # after that event turn, with every original bound intact.
+                        cdp('HeapProfiler.collectGarbage')
+                        pre_turn_dom = cdp('Memory.getDOMCounters')
+                        evaluate("new Promise(resolve=>setTimeout(resolve,0))")
                         cdp('HeapProfiler.collectGarbage')
                         metrics = cdp('Performance.getMetrics')
                         sample = dict(page=page + 1,
                             heap_bytes=next(m['value'] for m in metrics['metrics'] if m['name'] == 'JSHeapUsedSize'),
-                            dom=cdp('Memory.getDOMCounters'),
+                            dom=cdp('Memory.getDOMCounters'), pre_turn_dom=pre_turn_dom,
                             caches=evaluate("({text:transcriptText.size,requests:transcriptRequests.size,rows:document.querySelectorAll('.session').length})"))
-                        # Keep the original post-GC population/grader intact.
-                        # Separately locate transient detached nodes: Chrome's
-                        # DOM counter is not just the connected document tree.
+                        # Separately retain connected-tree and a second settled
+                        # GC observation; pre-turn diagnostics remain above.
                         sample['connected_nodes'] = evaluate("(()=>{const w=document.createTreeWalker(document,NodeFilter.SHOW_ALL);let n=1;while(w.nextNode())n++;return n})()")
                         evaluate("new Promise(resolve=>setTimeout(resolve,0))")
                         cdp('HeapProfiler.collectGarbage')
@@ -245,6 +251,22 @@ class BrowserRetention(unittest.TestCase):
                                     for s in samples))
                 self.assertTrue(all(s['post_turn_dom']['nodes'] <= samples[0]['post_turn_dom']['nodes'] + 100
                                     for s in samples))
+                # Prove the settled sampling boundary still detects genuinely
+                # retained detached DOM rather than concealing a working-set leak.
+                evaluate("new Promise(resolve=>setTimeout(resolve,0))")
+                cdp('HeapProfiler.collectGarbage')
+                baseline = cdp('Memory.getDOMCounters')['nodes']
+                evaluate("window.retentionNegativeControl=Array.from({length:120},()=>document.createElement('div'));undefined")
+                evaluate("new Promise(resolve=>setTimeout(resolve,0))")
+                cdp('HeapProfiler.collectGarbage')
+                retained = cdp('Memory.getDOMCounters')['nodes']
+                self.assertGreater(retained, baseline + 100)
+                evaluate("delete window.retentionNegativeControl")
+                evaluate("new Promise(resolve=>setTimeout(resolve,0))")
+                cdp('HeapProfiler.collectGarbage')
+                released = cdp('Memory.getDOMCounters')['nodes']
+                self.assertLessEqual(released, baseline + 100)
+                report['dom_retention_control'] = dict(baseline=baseline, retained=retained, released=released)
                 months = [r for r in report['requests'] if '/accounting?' in r['path']]
                 self.assertEqual(len(months), 2)
                 start = int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp()) - 1
