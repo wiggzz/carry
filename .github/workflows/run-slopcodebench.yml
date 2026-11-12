@@ -75,7 +75,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
           cargo build --locked --release --target x86_64-unknown-linux-musl
-          target/x86_64-unknown-linux-musl/release/carry --version
+          target/x86_64-unknown-linux-musl/release/carry --help >/dev/null
       - name: Install official locked runner (no secrets)
         run: |
           set -euo pipefail
@@ -84,6 +84,7 @@ jobs:
       - name: Preparation and scorer behavior tests (no model or Docker)
         env:
           SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
+          SCB_CARRY_BINARY: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/carry
         run: '"$SCB_PYTHON" -B -m unittest -v scripts.test_slopcodebench_prepare scripts.test_slopcodebench_workflow scripts.test_slopcodebench scripts.test_slopcodebench_runtime_cli'
       - name: Real native images and ALL six official offline gold evaluations (no secrets)
         timeout-minutes: 45

@@ -511,6 +511,7 @@ jobs:
       - name: Official SCB report component contract (model-free, no Docker)
         env:
           SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
+          SCB_CARRY_BINARY: ${{ github.workspace }}/.scb-carry/carry
         run: >-
           .scb-upstream/.venv/bin/python -B -m unittest -v
           scripts.test_benchmark_comparison scripts.test_slopcodebench

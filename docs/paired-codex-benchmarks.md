@@ -202,10 +202,11 @@ only, never evidence that tests or models were executed by that command.
 ## Manual hosted official SCB lane
 
 [`run-slopcodebench.yml`](../.github/workflows/run-slopcodebench.yml) is a
-**new manual-only workflow**. It must first be reviewed and merged onto the default
-branch before GitHub can register/dispatch it. Adding it does not authorize
-publication, merging, preparation, or paid execution. Existing CI workflows and
-synthetic assertions are unchanged.
+**manual-only workflow**. Use its registered workflow with an explicit candidate
+ref, then verify the accepted run's exact head and normal protected Environment
+admission. Branch dispatch does not inherently require merging first; resolve an
+actual registration rejection rather than assuming one. Registration does not
+authorize paid execution or merging.
 
 - Default `execute_paid: false` builds this source's portable Carry, installs the
   pinned runner via `uv sync --frozen --no-dev`, builds real native Codex **0.147.0**
@@ -248,10 +249,10 @@ synthetic assertions are unchanged.
 
 **Qualification still required:** local process-boundary tests are not real
 Docker, native-client, full-runner import, offline dependency, gold, protected
-Environment or Actions proof. After review/merge, first dispatch preparation-only
-and inspect all six actual gold reports and image/native provenance. A later
-separately authorized paid dispatch prepares fresh images/readiness before either
-model-bearing arm. No workflow has been dispatched by this implementation.
+Environment or Actions proof. First dispatch preparation-only and inspect all six
+actual gold reports and image/native provenance. A separately authorized paid
+dispatch prepares fresh images/readiness before either model-bearing arm. A
+successful dispatch alone establishes neither gold readiness nor a benchmark result.
 
 The hosted job has GitHub's 360-minute ceiling. This does **not** fit the
 worst-case twelve 7200-second checkpoint timeouts plus setup/evaluation. A slow

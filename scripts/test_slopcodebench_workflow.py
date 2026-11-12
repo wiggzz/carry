@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import shutil
+from unittest.mock import patch
 
 import yaml
 from scripts import slopcodebench as scb
@@ -24,11 +26,31 @@ class WorkflowShellTests(unittest.TestCase):
     def steps(self):
         return yaml.safe_load(WORKFLOW.read_text())['jobs']['official-scb']['steps']
 
-    def shell(self, name, env):
+    def shell(self, name, env, *, cwd=SOURCE):
         step = next(step for step in self.steps() if step.get('name') == name)
         return subprocess.run(['/bin/bash', '-euo', 'pipefail', '-c', step['run']],
-            cwd=SOURCE, env={**os.environ, 'SCB_PYTHON': sys.executable, **env},
+            cwd=cwd, env={**os.environ, 'SCB_PYTHON': sys.executable, **env},
             capture_output=True, text=True, timeout=10)
+
+    @unittest.skipUnless(os.environ.get('SCB_CARRY_BINARY'), 'exact built Carry binary required')
+    def test_build_probe_needs_no_credentials_and_creates_no_agent_session(self):
+        with tempfile.TemporaryDirectory(prefix='scb build probe ') as directory:
+            root = Path(directory)
+            binary = root/'target/x86_64-unknown-linux-musl/release/carry'
+            binary.parent.mkdir(parents=True)
+            shutil.copyfile(os.environ['SCB_CARRY_BINARY'], binary)
+            binary.chmod(0o555)
+            tools = root/'bin'; tools.mkdir()
+            for name in ('rustup', 'sudo', 'cargo'):
+                tool = tools/name
+                tool.write_text('#!/bin/sh\nexit 0\n')
+                tool.chmod(0o755)
+            home = root/'home'; home.mkdir()
+            with patch.dict(os.environ, {'PATH': str(tools)+':'+os.defpath,
+                                         'HOME': str(home), 'TMPDIR': str(root)}, clear=True):
+                result = self.shell('Build this exact source portable Carry (no secrets)', {}, cwd=root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(list(home.iterdir()), [], 'build probe initialized agent state')
 
     def test_output_initializer_preserves_spaced_runner_path(self):
         with tempfile.TemporaryDirectory(prefix='scb output ') as directory:
