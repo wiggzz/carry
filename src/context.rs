@@ -64,7 +64,6 @@ pub(crate) struct ContextItem {
 struct MemoryData {
     content: String,
     source_id: u64,
-    materialized: bool,
 }
 
 impl ContextItem {
@@ -88,11 +87,7 @@ impl ContextItem {
             Vec::new(),
         );
         item.bytes = content.len();
-        item.memory = Some(MemoryData {
-            content,
-            source_id,
-            materialized: false,
-        });
+        item.memory = Some(MemoryData { content, source_id });
         item
     }
 
@@ -417,9 +412,10 @@ impl ContextState {
                     }
                     annotated.push_str(&format!("\n{}", item.compact_marker()));
                     for memory in items.iter().filter(|candidate| {
-                        candidate.memory.as_ref().is_some_and(|memory| {
-                            memory.source_id == item.id && !memory.materialized
-                        })
+                        candidate
+                            .memory
+                            .as_ref()
+                            .is_some_and(|memory| memory.source_id == item.id)
                     }) {
                         annotated
                             .push_str(&format!("\n\n[memory stored]\n{}", memory.compact_marker()));
@@ -432,7 +428,7 @@ impl ContextState {
                 }
                 ContextItemKind::Memory => {
                     let memory = item.memory.as_ref().expect("memory metadata is present");
-                    if memory.materialized || !present.contains(&memory.source_id) {
+                    if !present.contains(&memory.source_id) {
                         input.push(json!({
                             "role": "assistant",
                             "content": [{
@@ -856,17 +852,8 @@ impl ContextState {
             .filter(|item| !dropped_set.contains(&item.id))
             .cloned()
             .collect::<Vec<_>>();
-        for item in &mut retained {
-            if !neutral_retained_set.contains(&item.id) {
-                item.retention = Retention::Protected;
-            }
-        }
-        if !retained
-            .iter()
-            .any(|item| item.kind == ContextItemKind::Status)
-        {
-            retained.push(ContextItem::history_status(self.next_id.saturating_add(1)));
-        }
+        let mut next_id = self.next_id;
+        Self::prepare_retained_items(&mut retained, &neutral_retained_set, &mut next_id);
         let retained_rendered = self.render_with_compatible_breakpoints(&retained);
         let retained_tokens = estimated_tokens(&retained_rendered);
         let dropped_tokens = current_tokens.saturating_sub(retained_tokens);
@@ -948,6 +935,30 @@ impl ContextState {
         }
     }
 
+    fn prepare_retained_items(
+        items: &mut Vec<ContextItem>,
+        neutral_retained: &HashSet<u64>,
+        next_id: &mut u64,
+    ) {
+        for item in items.iter_mut() {
+            item.retention = if neutral_retained.contains(&item.id) {
+                Retention::Eligible
+            } else {
+                Retention::Protected
+            };
+            if item.signal == RetentionSignal::Keep && item.retention == Retention::Protected {
+                item.signal = RetentionSignal::Neutral;
+            }
+        }
+        if !items
+            .iter()
+            .any(|item| item.kind == ContextItemKind::Status)
+        {
+            *next_id = next_id.saturating_add(1);
+            items.push(ContextItem::history_status(*next_id));
+        }
+    }
+
     pub fn compact(&mut self, plan: CompactionPlan) -> ContextChange {
         let dropped = plan.dropped.iter().copied().collect::<HashSet<_>>();
         let neutral_retained = plan
@@ -991,29 +1002,7 @@ impl ContextState {
             })
             .collect::<Vec<_>>();
         self.items.retain(|item| !dropped.contains(&item.id));
-        for item in &mut self.items {
-            if let Some(memory) = item.memory.as_mut()
-                && dropped.contains(&memory.source_id)
-            {
-                memory.materialized = true;
-            }
-            if neutral_retained.contains(&item.id) {
-                item.retention = Retention::Eligible;
-            } else {
-                item.retention = Retention::Protected;
-            }
-            if item.signal == RetentionSignal::Keep && item.retention == Retention::Protected {
-                item.signal = RetentionSignal::Neutral;
-            }
-        }
-        if !self
-            .items
-            .iter()
-            .any(|item| item.kind == ContextItemKind::Status)
-        {
-            let id = self.allocate_id();
-            self.items.push(ContextItem::history_status(id));
-        }
+        Self::prepare_retained_items(&mut self.items, &neutral_retained, &mut self.next_id);
         self.generation = self.generation.saturating_add(1);
         let protected_frontier = self.protected_frontier_id();
         if let Some(frontier) = protected_frontier {
@@ -1049,21 +1038,8 @@ impl ContextState {
         }
 
         ContextChange {
-            dropped: plan.dropped,
+            plan,
             retention_audit,
-            neutral_retained: plan.neutral_retained,
-            neutral_budget_tokens: plan.neutral_budget_tokens,
-            neutral_target_tokens: plan.neutral_target_tokens,
-            dropped_tokens: plan.dropped_tokens,
-            retained_tokens: plan.retained_tokens,
-            rewrite_tokens: plan.rewrite_tokens,
-            reused_generation: plan.reused_generation,
-            considered_generations: plan.considered_generations,
-            invalidated_generations: plan.invalidated_generations,
-            invalidated_cache_tokens: plan.invalidated_cache_tokens,
-            estimated_savings_input_units: plan.estimated_savings_input_units,
-            min_payback_percent: plan.min_payback_percent,
-            minimum_payback_input_units: plan.minimum_payback_input_units,
             generation: self.generation,
             protected_frontier: self.protected_frontier_id(),
             retained_bytes: self.retained_bytes(),
@@ -1410,21 +1386,9 @@ pub(crate) struct SignalChange {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ContextChange {
-    pub dropped: Vec<u64>,
+    #[serde(flatten)]
+    pub plan: CompactionPlan,
     pub retention_audit: Vec<RetentionAuditEntry>,
-    pub neutral_retained: Vec<NeutralRetentionDecision>,
-    pub neutral_budget_tokens: usize,
-    pub neutral_target_tokens: usize,
-    pub dropped_tokens: usize,
-    pub retained_tokens: usize,
-    pub rewrite_tokens: usize,
-    pub reused_generation: Option<u64>,
-    pub considered_generations: Vec<u64>,
-    pub invalidated_generations: Vec<u64>,
-    pub invalidated_cache_tokens: usize,
-    pub estimated_savings_input_units: f64,
-    pub min_payback_percent: u8,
-    pub minimum_payback_input_units: f64,
     pub generation: u64,
     pub protected_frontier: Option<u64>,
     pub retained_bytes: usize,
@@ -2321,6 +2285,84 @@ mod tests {
     }
 
     #[test]
+    fn compaction_preserves_plan_telemetry_and_memory_placement_across_restart() {
+        for drop_source in [false, true] {
+            let mut state = ContextState::new("initial".into());
+            let source = add_tool(&mut state);
+            let disposable = add_tool(&mut state);
+            let memories = state
+                .record_signals(&update(&[], &[], &["durable fact", "retired fact"]), source)
+                .added;
+            let mut dropped = vec![disposable, memories[1]];
+            if drop_source {
+                dropped.push(source);
+            }
+            state.record_signals(&update(&[memories[0]], &dropped, &[]), source);
+            let plan = state
+                .plan_compaction_with_neutral_budget(
+                    &[],
+                    CompactionPolicy {
+                        cache_ratios: reference_cache_ratios(),
+                        implicit_cached_tokens: 0,
+                        breakpoints: Vec::new(),
+                        payoff_requests: 1,
+                        min_payback_percent: 0,
+                    },
+                    usize::MAX,
+                )
+                .unwrap();
+            let expected_plan = serde_json::to_value(&plan).unwrap();
+            let change = state.compact(plan);
+            let event = serde_json::to_value(&change).unwrap();
+            for (key, expected) in expected_plan.as_object().unwrap() {
+                assert_eq!(&event[key], expected, "compaction event field {key}");
+            }
+            let expected = state.input_items();
+            let mut restored = ContextState::decode(&state.encode().unwrap()).unwrap();
+            assert_eq!(restored.input_items(), expected);
+            restored.add_user("next task".into());
+            let rendered = restored.input_items();
+            let materialized = rendered
+                .iter()
+                .filter(|item| {
+                    item["role"] == "assistant"
+                        && item["content"][0]["text"] == "[memory]\ndurable fact"
+                })
+                .count();
+            assert_eq!(materialized, usize::from(drop_source));
+            assert_eq!(
+                rendered
+                    .iter()
+                    .filter(|item| {
+                        item["type"] == "function_call_output"
+                            && item["call_id"] == format!("call-{source}")
+                    })
+                    .count(),
+                usize::from(!drop_source)
+            );
+            assert!(
+                !serde_json::to_string(&rendered)
+                    .unwrap()
+                    .contains("retired fact")
+            );
+            assert!(
+                restored
+                    .snapshot()
+                    .iter()
+                    .any(|item| item.id == memories[0])
+            );
+            assert!(
+                !restored
+                    .snapshot()
+                    .iter()
+                    .any(|item| item.id == memories[1])
+            );
+            let second = ContextState::decode(&restored.encode().unwrap()).unwrap();
+            assert_eq!(second.input_items(), rendered);
+        }
+    }
+
+    #[test]
     fn memory_is_an_inline_protected_handle_without_duplicating_its_content() {
         let mut state = ContextState::new("initial".into());
         let tool = add_tool(&mut state);
@@ -2613,7 +2655,7 @@ mod tests {
             .unwrap();
         let change = state.compact(plan);
 
-        assert_eq!(change.dropped, vec![dropped]);
+        assert_eq!(change.plan.dropped, vec![dropped]);
         assert!(
             state
                 .snapshot()

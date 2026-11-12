@@ -1522,7 +1522,7 @@ fn maybe_compact(
     let before = crate::savings::token_units(&json!(state.input_items()));
     let change = state.compact(plan);
     let after = crate::savings::token_units(&json!(state.input_items()));
-    cache.mark_compaction(&change.invalidated_generations);
+    cache.mark_compaction(&change.plan.invalidated_generations);
     metrics.record_compaction();
     logger.event(
         "context_compacted",
@@ -1535,14 +1535,14 @@ fn maybe_compact(
         }),
         &format!(
             "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
-            change.dropped.len(),
-            compact_number(change.dropped_tokens as u64),
-            compact_number(change.retained_tokens as u64),
-            compact_number(change.rewrite_tokens as u64),
-            change.reused_generation.map_or_else(|| "cold".to_owned(), |generation| generation.to_string()),
-            change.invalidated_generations.len(),
-            compact_number(change.invalidated_cache_tokens as u64),
-            compact_number(change.estimated_savings_input_units.round().max(0.0) as u64),
+            change.plan.dropped.len(),
+            compact_number(change.plan.dropped_tokens as u64),
+            compact_number(change.plan.retained_tokens as u64),
+            compact_number(change.plan.rewrite_tokens as u64),
+            change.plan.reused_generation.map_or_else(|| "cold".to_owned(), |generation| generation.to_string()),
+            change.plan.invalidated_generations.len(),
+            compact_number(change.plan.invalidated_cache_tokens as u64),
+            compact_number(change.plan.estimated_savings_input_units.round().max(0.0) as u64),
         ),
     )?;
     Ok(true)
