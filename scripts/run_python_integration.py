@@ -14,7 +14,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SUITES = ('proxy_transparent_history', 'proxy_noodle_regressions')
+SUITES = ('proxy_transparent_history', 'proxy_noodle_regressions', 'proxy_dashboard_browser')
 
 
 def discover():

@@ -1,6 +1,7 @@
 """Bounded numeric prefix through the real CLI; synthetic state/loopback only."""
 import copy
 import hashlib
+from history_store import read_index, write_index
 import json
 import unittest
 
@@ -78,9 +79,9 @@ class HistoricalSuccessPrefix(unittest.TestCase):
         staged['request_evidence']['prior_untracked'] = 2  # success + failed review
         checkpoint.write_text(json.dumps(staged))
         index_path = self.state / 'history.index'
-        index = json.loads(index_path.read_text())
+        index = read_index(index_path)
         index['snapshots'][owner]['request_evidence'] = staged['request_evidence']
-        index_path.write_text(json.dumps(index))
+        write_index(index_path, index)
         startup_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in (checkpoint, index_path)}
         prefix = dict(source_sha256='a' * 64, owner=owner,
@@ -146,7 +147,7 @@ class HistoricalSuccessPrefix(unittest.TestCase):
             legacy.pop('request_evidence', None)
             checkpoint.write_text(json.dumps(legacy))
             index['snapshots'][owner] = copy.deepcopy(legacy)
-            index_path.write_text(json.dumps(index))
+            write_index(index_path, index)
             candidate = copy.deepcopy(prefix)
             if case == 'unknown-success-money':
                 candidate['estimate']['unavailable_primary_cost_calls'] = 1
@@ -213,7 +214,7 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                     checkpoint = next(state.glob('*.json'))
                     owner = checkpoint.stem
                     index_path = state / 'history.index'
-                    index = json.loads(index_path.read_text())
+                    index = read_index(index_path)
                     prefix = dict(source_sha256='a' * 64, owner=owner,
                                   history_namespace=original['history_namespace'],
                                   primary_attempts=1, reviewer_attempts=0, estimate=estimate)
@@ -237,7 +238,7 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                         self.assertEqual(list(state.glob('.request-evidence-*.jsonl')), [])
                         checkpoint.write_text(json.dumps(saved))
                         index['snapshots'][owner] = copy.deepcopy(saved)
-                        index_path.write_text(json.dumps(index))
+                        write_index(index_path, index)
 
                     stage(imported)
                     # First bind is exact and the proof is persisted by a REAL
@@ -315,7 +316,7 @@ class HistoricalSuccessPrefix(unittest.TestCase):
                         final = proxy.saved()
                         record['final_primary'] = final['primary']
                         record['final_evidence'] = final['request_evidence']
-                        final_index = json.loads(index_path.read_text())
+                        final_index = read_index(index_path)
                     record['wires'] = fixture.primaries
                     # First finish all reachable accounting/authority controls,
                     # then grade NEXT request and real-process restart liveness.

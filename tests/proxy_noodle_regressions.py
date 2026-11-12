@@ -1,4 +1,5 @@
 """PR184 review regressions against the actual CLI; synthetic loopback only."""
+from history_store import read_index, write_index
 import json
 import time
 import unittest
@@ -14,6 +15,502 @@ class NoodleRegressions(unittest.TestCase):
     fixture = history_fixture.TransparentHistory.fixture
     proxy = history_fixture.TransparentHistory.proxy
 
+    def explicit_paid_pressure(self, *, pressure):
+        """Hold a real first Off receipt while preserving every promised byte."""
+        import threading
+        import http.client
+
+        held, release = threading.Event(), threading.Event()
+        def primary(_body, n):
+            if n == 1:
+                held.set()
+                self.assertTrue(release.wait(15), "release the actual held paid receipt")
+            return 200, completed(response_id=f"explicit_paid_{n}")
+
+        fixture = self.fixture(primary)
+        self.stack.callback(release.set)
+        options = ["--request-timeout-secs", "20"]
+        proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(proxy.close)
+        body = {"model": "gpt-6-luna", "input": [
+            {"role": "user", "content": "EXPLICIT_OFF_FIRST_PAID_RECEIPT"}]}
+        result = {}
+        def send():
+            try:
+                result["response"] = proxy.request("POST", "/v1/responses", body)
+            except (http.client.HTTPException, OSError) as error:
+                result["error"] = type(error).__name__
+        worker = threading.Thread(target=send, daemon=True)
+        worker.start()
+        self.assertTrue(held.wait(10), "real primary must reach upstream before pressure")
+        pending = proxy.saved()
+        self.assertTrue(pending["primary_pending"])
+        self.assertEqual(pending["primary"]["calls"], 0)
+        self.assertFalse(pending["history_shared"])
+        self.assertIsNone(pending.get("history_namespace"))
+        self.assertEqual(fixture.primaries, [body], "Off forwarding preserves the entire wire")
+        self.assertEqual(fixture.reviews, [])
+        # Default policy: one paid owner plus independent maintenance. Sparse
+        # synthetic external pressure consumes ordinary headroom, not promises.
+        max_record, disk_limit = 32 * 1024**2, 1024**3
+        charge = lambda size: size * 4 + 16384
+        paid = charge(max_record) * 2 + charge(128) * 2 + max_record * 2 + 65536
+        maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
+        before_bytes = sum(p.stat().st_size for p in self.state.rglob("*"))
+        pressure_file = self.state / "ordinary-pressure.bin"
+        if pressure:
+            extent = disk_limit - paid - maintenance - 65536 - before_bytes
+            self.assertGreater(extent, 0)
+            with pressure_file.open("wb") as file:
+                file.truncate(extent)
+            self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
+                             disk_limit - paid - maintenance - 65536)
+        schema_before_receipt = (self.state / "history.index").exists()
+        release.set()
+        worker.join(timeout=25)
+        self.assertFalse(worker.is_alive(), "held request must finish within its declared deadline")
+        settled = proxy.saved()
+        proxy.close()
+        if pressure:
+            pressure_file.unlink()
+        # A genuine process restart plus another real dispatch exercises pending
+        # recovery; inspecting only an in-memory worker would miss lost receipts.
+        restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(restarted.close)
+        self.assertEqual(restarted.request("POST", "/v1/responses", body)[0], 200)
+        cold = restarted.saved()
+        self.assertEqual(fixture.primaries, [body, body])
+        self.assertEqual(fixture.reviews, [])
+        restarted.close()
+        outcome = {"result": result, "pending": pending, "settled": settled,
+                   "restarted": cold, "primaries": fixture.primaries,
+                   "reviews": fixture.reviews, "schema_before_receipt": schema_before_receipt,
+                   "paid_promise": paid, "maintenance_promise": maintenance,
+                   "disk_limit": disk_limit, "ordinary_slack": 65536,
+                   "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
+        self.evidence[str(pressure)] = outcome
+        return outcome
+
+    def test_first_explicit_off_receipt_survives_default_limit_pressure_and_restart(self):
+        root = self.state
+        for pressure in (False, True):
+            with self.subTest(pressure=pressure):
+                self.state = root / ("pressure" if pressure else "control")
+                self.state.mkdir()
+                outcome = self.explicit_paid_pressure(pressure=pressure)
+                known = (100 * .10 + .50) / 1e6
+                # Ordinary history publication may fail closed while the paid
+                # accounting transaction succeeds. Grade native receipt facts
+                # independently of that deliberate client-delivery failure.
+                with self.subTest(phase="settled"):
+                    self.assertEqual(outcome["settled"]["primary"]["calls"], 1)
+                    self.assertEqual(outcome["settled"]["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(outcome["settled"]["primary"]["cost_usd"], known, places=12)
+                    self.assertFalse(outcome["settled"]["primary_pending"])
+                with self.subTest(phase="delivery"):
+                    if pressure:
+                        self.assertEqual(outcome["result"], {"error": "IncompleteRead"})
+                        self.assertIsNone(outcome["settled"].get("last_response_id"),
+                                          "paid facts must not publish the rejected response ancestry")
+                    else:
+                        self.assertNotIn("error", outcome["result"])
+                        self.assertEqual(outcome["result"]["response"][0], 200)
+                with self.subTest(phase="restart"):
+                    self.assertEqual(outcome["restarted"]["primary"]["calls"], 2)
+                    self.assertEqual(outcome["restarted"]["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(outcome["restarted"]["primary"]["cost_usd"], known * 2, places=12)
+                    self.assertFalse(outcome["restarted"]["primary_pending"])
+
+    def test_explicit_checkpoint_bound_refuses_oversize_before_paid_dispatch(self):
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"bounded_explicit_{n}")))
+        options = ["--history-max-bytes", "65536", "--history-disk-bytes", "8388608"]
+        proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(proxy.close)
+        small = {"model": "gpt-6-luna", "input": [
+            {"role": "user", "content": "ESTABLISHED_PAID_AUTHORITY"}]}
+        large = {"model": "gpt-6-luna", "input": [
+            {"role": "user", "content": "EXPLICIT_CHECKPOINT_BOUND_" + "x" * 1024**2}]}
+        self.assertEqual(proxy.request("POST", "/v1/responses", small)[0], 200)
+        seed = proxy.saved()
+        path, = self.state.glob("*.json")
+        seed_bytes = path.read_bytes()
+        result = proxy.request("POST", "/v1/responses", large)
+        after = proxy.saved()
+        proxy.close()
+        self.evidence["oversize"] = {"result": result, "seed": seed, "after": after,
+                                     "primaries": fixture.primaries, "reviews": fixture.reviews}
+        # A safe pre-dispatch rejection is not a successfully settled paid call.
+        # Keep it separate from the admitted-large pressure controls below.
+        with self.subTest(phase="admission"):
+            self.assertIn(result[0], (500, 507))
+            self.assertEqual(fixture.primaries, [small])
+        with self.subTest(phase="authority"):
+            self.assertEqual(path.read_bytes(), seed_bytes)
+            self.assertEqual(after["primary"], seed["primary"])
+            self.assertFalse(after["primary_pending"])
+            self.assertEqual(fixture.reviews, [])
+            self.assertEqual(list(self.state.glob(".*.tmp")), [])
+        restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+        self.stack.callback(restarted.close)
+        self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
+        cold = restarted.saved()
+        self.evidence["oversize"]["restarted"] = cold
+        self.evidence["oversize"]["primaries"] = fixture.primaries
+        with self.subTest(phase="restart"):
+            self.assertEqual(fixture.primaries, [small, small])
+            self.assertEqual(cold["primary"]["calls"], 2)
+            self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+            self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * (100 * .10 + .50) / 1e6, places=12)
+        restarted.close()
+
+    def test_admitted_large_explicit_checkpoint_settles_protected_pressure_and_restart(self):
+        self.admitted_large_explicit_checkpoint()
+
+    def test_near_bound_explicit_checkpoint_never_loses_known_paid_receipt(self):
+        root = self.state
+        self.state = root / "calibration"
+        self.state.mkdir()
+        self.admitted_large_explicit_checkpoint()
+        calibration = dict(self.evidence)
+        # Resolve a fresh configured bound BEFORE dispatch, against the actual
+        # pending representation emitted by this exact binary. No admitted
+        # record or policy changes while its receipt is held upstream.
+        bound = calibration["False"]["checkpoint_bytes"] + 16
+        self.evidence.clear()
+        self.state = root / "boundary"
+        self.state.mkdir()
+        try:
+            self.admitted_large_explicit_checkpoint(max_record=bound, near_bound=True)
+        finally:
+            self.evidence["calibration"] = calibration
+            self.state = root
+
+    def admitted_large_explicit_checkpoint(self, *, max_record=2 * 1024**2, near_bound=False):
+        import threading
+        import http.client
+
+        root = self.state
+        for pressure in (False, True):
+            with self.subTest(pressure=pressure):
+                self.state = root / ("large-pressure" if pressure else "large-control")
+                self.state.mkdir()
+                held, release = threading.Event(), threading.Event()
+                def primary(_body, n):
+                    if n == 2:
+                        held.set()
+                        self.assertTrue(release.wait(15), "release actual admitted-large receipt")
+                    return 200, completed(response_id=f"admitted_large_{n}")
+                fixture = self.fixture(primary)
+                self.stack.callback(release.set)
+                # The SAME record bound owns SQL, explicit checkpoint admission
+                # and the paid promise. This declares a legal large record; it
+                # does not raise the configured cap while the request is paid.
+                disk_limit = 64 * 1024**2
+                options = ["--request-timeout-secs", "20", "--history-max-bytes", str(max_record),
+                           "--history-disk-bytes", str(disk_limit)]
+                proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+                self.stack.callback(proxy.close)
+                small = {"model": "gpt-6-luna", "input": [
+                    {"role": "user", "content": "ESTABLISHED_PAID_AUTHORITY"}]}
+                large = {"model": "gpt-6-luna", "input": [
+                    {"role": "user", "content": "ADMITTED_LARGE_CHECKPOINT_" + "x" * 1024**2}]}
+                self.assertEqual(proxy.request("POST", "/v1/responses", small)[0], 200)
+                seed = proxy.saved()
+                self.assertTrue((self.state / "history.index").is_file())
+                known = (100 * .10 + .50) / 1e6
+                self.assertEqual(seed["primary"]["calls"], 1)
+                self.assertEqual(seed["primary"]["unavailable_cost_calls"], 0)
+                self.assertAlmostEqual(seed["primary"]["cost_usd"], known, places=12)
+                result = {}
+                finished = threading.Event()
+                seed_path, = self.state.glob("*.json")
+                seed_bytes = seed_path.read_bytes()
+                def send():
+                    try:
+                        result["response"] = proxy.request("POST", "/v1/responses", large)
+                    except (http.client.HTTPException, OSError) as error:
+                        result["error"] = type(error).__name__
+                    finally:
+                        finished.set()
+                worker = threading.Thread(target=send, daemon=True)
+                worker.start()
+                if near_bound:
+                    deadline = time.monotonic() + 10
+                    while not held.is_set() and not finished.is_set() and time.monotonic() < deadline:
+                        held.wait(.02)
+                    if finished.is_set() and not held.is_set():
+                        # Refusing an impossible settlement obligation before
+                        # billing is safe, not proof that a paid receipt settled.
+                        self.assertNotIn("error", result)
+                        self.assertIn(result["response"][0], (500, 507))
+                        self.assertEqual(fixture.primaries, [small])
+                        self.assertEqual(fixture.reviews, [])
+                        self.assertEqual(seed_path.read_bytes(), seed_bytes)
+                        self.assertEqual(list(self.state.glob(".*.tmp")), [])
+                        release.set()  # The restarted small request is now fixture arrival two.
+                        worker.join(timeout=1)
+                        self.assertFalse(worker.is_alive())
+                        proxy.close()
+                        restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+                        self.stack.callback(restarted.close)
+                        self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
+                        cold = restarted.saved()
+                        restarted.close()
+                        self.assertEqual(fixture.primaries, [small, small])
+                        self.assertEqual(cold["primary"]["calls"], 2)
+                        self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * known, places=12)
+                        self.assertFalse(cold["primary_pending"])
+                        self.evidence[str(pressure)] = {
+                            "classification": "safe_before_billing_refusal", "result": result,
+                            "seed": seed, "restarted": cold, "record_bound": max_record,
+                            "primaries": fixture.primaries, "reviews": fixture.reviews}
+                        continue
+                self.assertTrue(held.wait(10), "legal large checkpoint must reach upstream")
+                pending = proxy.saved()
+                path, = self.state.glob("*.json")
+                checkpoint_bytes = path.stat().st_size
+                self.assertGreater(checkpoint_bytes, 1024**2)
+                self.assertLessEqual(checkpoint_bytes, max_record)
+                if near_bound:
+                    self.assertLessEqual(max_record - checkpoint_bytes, 32,
+                                         "exercise actual admitted pending-record boundary")
+                self.assertFalse(pending["history_shared"])
+                self.assertIsNone(pending.get("history_namespace"))
+                self.assertTrue(pending["primary_pending"])
+                self.assertEqual(pending["primary"], seed["primary"])
+                self.assertEqual(fixture.primaries, [small, large])
+                self.assertEqual(fixture.reviews, [])
+                charge = lambda size: 4 * size + 16384
+                paid = 2 * charge(max_record) + 2 * charge(128) + 2 * max_record + 65536
+                maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
+                before = sum(p.stat().st_size for p in self.state.rglob("*"))
+                pressure_file = self.state / "ordinary-pressure.bin"
+                if pressure:
+                    extent = disk_limit - paid - maintenance - 65536 - before
+                    self.assertGreater(extent, 0)
+                    with pressure_file.open("wb") as file:
+                        file.truncate(extent)
+                    self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
+                                     disk_limit - paid - maintenance - 65536)
+                release.set()
+                worker.join(timeout=25)
+                self.assertFalse(worker.is_alive())
+                settled = proxy.saved()
+                proxy.close()
+                if pressure:
+                    pressure_file.unlink()
+                restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+                self.stack.callback(restarted.close)
+                self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
+                cold = restarted.saved()
+                restarted.close()
+                self.assertEqual(fixture.primaries, [small, large, small])
+                self.assertEqual(fixture.reviews, [])
+                self.evidence[str(pressure)] = {
+                    "result": result, "seed": seed, "pending": pending, "settled": settled,
+                    "restarted": cold, "primaries": fixture.primaries, "reviews": fixture.reviews,
+                    "checkpoint_bytes": checkpoint_bytes, "record_bound": max_record,
+                    "paid_promise": paid, "maintenance_promise": maintenance,
+                    "disk_limit": disk_limit, "ordinary_slack": 65536,
+                    "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
+                with self.subTest(phase="settled"):
+                    self.assertEqual(settled["primary"]["calls"], 2)
+                    self.assertEqual(settled["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(settled["primary"]["cost_usd"], 2 * known, places=12)
+                    self.assertFalse(settled["primary_pending"])
+                with self.subTest(phase="delivery"):
+                    if pressure:
+                        self.assertEqual(result, {"error": "IncompleteRead"})
+                        self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id"),
+                                         "paid fallback must not publish rejected new ancestry")
+                    elif near_bound and "error" in result:
+                        self.assertEqual(result, {"error": "IncompleteRead"})
+                        self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id"),
+                                         "record-bound rejection must not publish new ancestry")
+                    else:
+                        self.assertNotIn("error", result)
+                        self.assertEqual(result["response"][0], 200)
+                with self.subTest(phase="restart"):
+                    self.assertEqual(cold["primary"]["calls"], 3)
+                    self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(cold["primary"]["cost_usd"], 3 * known, places=12)
+                    self.assertFalse(cold["primary_pending"])
+        self.state = root
+
+    def test_reviewer_receipt_growth_preserves_known_money(self):
+        self.reviewer_receipt_growth()
+
+    def test_near_bound_reviewer_receipt_growth_preserves_known_money(self):
+        root = self.state
+        self.state = root / "calibration"
+        self.state.mkdir()
+        self.reviewer_receipt_growth()
+        calibration = dict(self.evidence)
+        self.evidence.clear()
+        self.state = root / "boundary"
+        self.state.mkdir()
+        try:
+            self.reviewer_receipt_growth(max_record=calibration["extension-False-pressure-False"]["snapshot_bytes"] + 16,
+                                        near_bound=True)
+        finally:
+            self.evidence["calibration"] = calibration
+            self.state = root
+
+    def reviewer_receipt_growth(self, *, max_record=256 * 1024, near_bound=False):
+        import threading
+
+        root = self.state
+        for extension in ((False,) if near_bound else (False, True)):
+            for pressure in (False, True):
+                with self.subTest(extension=extension, pressure=pressure):
+                    self.state = root / f"extension-{extension}-pressure-{pressure}"
+                    self.state.mkdir()
+                    held, release = threading.Event(), threading.Event()
+                    replies = []
+                    def reviewer(_body, _n):
+                        response = advice_response({"protected": [2], "removable": [], "memories": []})
+                        if extension:
+                            # Valid native usage remains identical. An unrelated
+                            # provider extension must not expand mandatory state
+                            # beyond what was admitted before this paid call.
+                            response["usage"]["provider_extension"] = "x" * (300 * 1024)
+                        replies.append(response)
+                        held.set()
+                        if not release.wait(15):
+                            raise AssertionError("release actual paid reviewer")
+                        return 200, response
+                    fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"reviewer_growth_{n}")), reviewer)
+                    self.stack.callback(release.set)
+                    disk_limit = 64 * 1024**2
+                    options = ["--history-max-bytes", str(max_record), "--history-disk-bytes", str(disk_limit),
+                               "--review-replayed-history", "--payoff-requests", "1",
+                               "--classifier-cache-policy", "disabled"]
+                    proxy = TransparentProxy(self.state, fixture, options, mode="audit", wait_reviews=False)
+                    self.stack.callback(proxy.close)
+                    h = [{"role": "user", "content": "REVIEWER_GROWTH_GOAL"},
+                         {"role": "assistant", "content": "REVIEWER_GROWTH_SOURCE " + "payload " * 20},
+                         {"role": "user", "content": "REVIEWER_GROWTH_TASK"}]
+                    body = {"model": "gpt-6-luna", "input": h}
+                    initial = proxy.send(h, wait=False)
+                    if near_bound and initial[0] in (500, 507) and not fixture.primaries and not fixture.reviews:
+                        self.assertEqual(list(self.state.glob(".*.tmp")), [])
+                        self.evidence[f"extension-{extension}-pressure-{pressure}"] = {
+                            "classification": "safe_before_any_billing_refusal", "result": initial,
+                            "record_bound": max_record, "primaries": fixture.primaries,
+                            "reviews": fixture.reviews}
+                        proxy.close()
+                        continue
+                    self.assertEqual(initial[0], 200)
+                    arrived = held.wait(1 if near_bound else 10)
+                    if near_bound and not arrived:
+                        self.assertTrue(proxy.reviewers_settled())
+                        safe = proxy.saved()
+                        self.assertEqual(fixture.primaries, [body])
+                        self.assertEqual(fixture.reviews, [])
+                        self.assertEqual(safe["primary"]["calls"], 1)
+                        self.assertEqual(safe["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(safe["primary"]["cost_usd"], (100 * .10 + .50) / 1e6, places=12)
+                        self.assertEqual(safe["shadow"]["calls"], 0)
+                        self.assertFalse(safe["background_review_pending"])
+                        proxy.close()
+                        restarted_options = [o for o in options if o != "--review-replayed-history"]
+                        restarted = TransparentProxy(self.state, fixture, restarted_options,
+                                                     mode="audit", wait_reviews=False)
+                        self.stack.callback(restarted.close)
+                        self.assertEqual(restarted.request("GET", "/carry/dashboard/stats")[0], 200)
+                        cold, = read_index(self.state / "history.index")["snapshots"].values()
+                        self.assertEqual(cold["primary"], safe["primary"])
+                        self.assertEqual(cold["shadow"], safe["shadow"])
+                        self.assertFalse(cold["background_review_pending"])
+                        restarted.close()
+                        self.evidence[f"extension-{extension}-pressure-{pressure}"] = {
+                            "classification": "safe_before_reviewer_billing_refusal", "settled": safe,
+                            "restarted": cold, "record_bound": max_record,
+                            "primaries": fixture.primaries, "reviews": fixture.reviews}
+                        continue
+                    self.assertTrue(arrived, "actual reviewer must dispatch before pressure")
+                    pending = proxy.saved()
+                    import sqlite3
+                    from contextlib import closing
+                    with closing(sqlite3.connect(self.state / "history.index")) as db:
+                        snapshot_bytes, = db.execute("SELECT length(data) FROM records WHERE kind='snapshots'").fetchone()
+                    self.assertLessEqual(snapshot_bytes, max_record)
+                    if near_bound:
+                        self.assertLessEqual(max_record - snapshot_bytes, 32)
+                    self.assertTrue(pending["history_shared"])
+                    self.assertTrue(pending["background_review_pending"])
+                    self.assertEqual(pending["primary"]["calls"], 1)
+                    self.assertEqual(pending["shadow"]["calls"], 0)
+                    self.assertEqual(fixture.primaries, [body])
+                    self.assertEqual(len(fixture.reviews), 1)
+                    self.assertEqual(len(replies), 1)
+                    self.assertEqual(replies[0]["usage"]["input_tokens"], 100)
+                    self.assertEqual(replies[0]["usage"]["output_tokens"], 1)
+                    charge = lambda size: 4 * size + 16384
+                    paid = 2 * charge(max_record) + 2 * charge(128) + 2 * max_record + 65536
+                    maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
+                    pressure_file = self.state / "ordinary-pressure.bin"
+                    before = sum(p.stat().st_size for p in self.state.rglob("*"))
+                    if pressure:
+                        extent = disk_limit - paid - maintenance - 65536 - before
+                        self.assertGreater(extent, 0)
+                        with pressure_file.open("wb") as file:
+                            file.truncate(extent)
+                        self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
+                                         disk_limit - paid - maintenance - 65536)
+                    release.set()
+                    deadline = time.monotonic() + 10
+                    while not any(e["event"] == "background_review_merged" for e in self.events()):
+                        self.assertLess(time.monotonic(), deadline, "actual reviewer worker must finish")
+                        time.sleep(.02)
+                    settled = proxy.saved()
+                    completed_events = self.events()
+                    index = read_index(self.state / "history.index")
+                    proxy.close()
+                    if pressure:
+                        pressure_file.unlink()
+                    restarted_options = [o for o in options if o != "--review-replayed-history"]
+                    restarted_options += ["--review-every-requests", "100"]
+                    restarted = TransparentProxy(self.state, fixture, restarted_options,
+                                                 mode="audit", wait_reviews=False)
+                    self.stack.callback(restarted.close)
+                    restart_result = restarted.send(h, wait=False)
+                    cold_index = read_index(self.state / "history.index")
+                    cold, = cold_index["snapshots"].values()
+                    restarted.close()
+                    self.assertEqual(fixture.primaries, [body] if restart_result[0] == 507 else [body, body])
+                    self.assertEqual(len(fixture.reviews), 1, "restart must not rebill reviewer")
+                    key = f"extension-{extension}-pressure-{pressure}"
+                    self.evidence[key] = {"pending": pending, "settled": settled, "restarted": cold,
+                        "primaries": fixture.primaries, "reviews": fixture.reviews, "provider_responses": replies,
+                        "restart_result": restart_result, "events": completed_events, "advice_records": index["reviews"],
+                        "record_bound": max_record, "snapshot_bytes": snapshot_bytes, "disk_limit": disk_limit,
+                        "paid_promise": paid, "maintenance_promise": maintenance,
+                        "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
+                    known = (100 * .10 + .50) / 1e6
+                    with self.subTest(phase="settled"):
+                        self.assertEqual(settled["shadow"]["calls"], 1)
+                        self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(settled["shadow"]["cost_usd"], known, places=12)
+                        self.assertEqual(settled["shadow"]["input_tokens"], 100)
+                        self.assertEqual(settled["shadow"]["output_tokens"], 1)
+                        self.assertFalse(settled["background_review_pending"])
+                    with self.subTest(phase="restart"):
+                        # A fresh primary may itself be refused before billing
+                        # at this unchanged bound; that cannot erase the already
+                        # completed reviewer's known receipt.
+                        self.assertIn(restart_result[0], (200, 507))
+                        self.assertEqual(cold["shadow"]["calls"], 1)
+                        self.assertEqual(cold["shadow"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(cold["shadow"]["cost_usd"], known, places=12)
+                        primary_calls = len(fixture.primaries)
+                        self.assertEqual(cold["primary"]["calls"], primary_calls)
+                        self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(cold["primary"]["cost_usd"], primary_calls * known, places=12)
+                        self.assertFalse(cold["background_review_pending"])
+        self.state = root
+
     def history(self):
         return [{"role": "user", "content": "NOODLE_GOAL"},
                 {"role": "assistant", "content": "NOODLE_SOURCE " + "payload " * 3000},
@@ -26,12 +523,12 @@ class NoodleRegressions(unittest.TestCase):
     def attest_cache(self):
         # Only synthetic route capability; never manufacture a native receipt.
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for snapshot in index["snapshots"].values():
             snapshot["model_resolution"]["primary"]["cache"] = {
                 "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,
                 "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
-        path.write_bytes(wire(index))
+        write_index(path, index)
 
     def snapshot(self, proxy, saved=None):
         # Join immutable request facts to their real HTTP projection, never to a
@@ -90,12 +587,12 @@ class NoodleRegressions(unittest.TestCase):
                 # pre-window initialization is due in BOTH arms before the cap
                 # decision. A fitting allowance is not a new HistoryContract.
                 path = self.state / "history.index"
-                index = json.loads(path.read_text())
+                index = read_index(path)
                 for state in index["snapshots"].values():
                     state["request_evidence"]["scenario"] = {
                         "context_window": 200 + restored // 2, "reserve":100,
                         "keep_recent":100, "summary":50}
-                path.write_bytes(wire(index))
+                write_index(path, index)
                 proxy = self.proxy(fixture, options)
                 baseline = self.snapshot(proxy, proxy.checkpoint(h)[1])
                 self.assertEqual(baseline["request_evidence"]["observations"],
@@ -466,7 +963,7 @@ class NoodleRegressions(unittest.TestCase):
         proxy = self.proxy(fixture,options)
         self.assertEqual(proxy.send(h)[0],200)
         _, failed = proxy.checkpoint(h)
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         self.assertFalse(index["reviews"])
         self.assertEqual(failed["shadow"]["calls"],1)
         self.assertEqual(failed["shadow"]["unavailable_cost_calls"],int(not rejected))
@@ -491,7 +988,7 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(accepted["shadow"]["calls"],2)
         self.assertEqual(accepted["shadow"]["input_tokens"],200 if rejected else 100)
         self.assertEqual(accepted["shadow"]["unavailable_cost_calls"],int(not rejected))
-        self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"],
+        self.assertTrue(read_index(self.state / "history.index")["reviews"],
                         "accepted empty advice is a durable semantic completion")
         proxy.close()
         proxy = self.proxy(fixture,options)

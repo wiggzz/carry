@@ -8,6 +8,7 @@ All provider endpoints are ephemeral loopback listeners; no auth files are read.
 import contextlib
 import http.client
 import http.server
+from history_store import read_index, write_index
 import json
 import math
 import os
@@ -262,7 +263,7 @@ class Proxy:
         """Read the actual completed prefix record, not the paid-owner mirror."""
         import hashlib
         state = self.saved()
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         namespace = state["history_namespace"]
         values = [item["value"] for item in state["history"]]
         if state.get("history_frontier"):

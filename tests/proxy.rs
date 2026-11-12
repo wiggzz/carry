@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "support/admission.rs"]
 mod admission;
+#[allow(dead_code)]
+mod history_store;
 #[path = "support/pr154.rs"]
 mod pr154;
 
@@ -61,6 +63,25 @@ fn state_regression(selector: &str) {
             );
         }
     }
+}
+
+#[test]
+fn durable_retention_accounting_http() {
+    let output = Command::new("python3")
+        .arg("-B")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proxy_retention.py"
+        ))
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+        .output()
+        .expect("Python must exercise the actual retention HTTP boundary");
+    assert!(
+        output.status.success(),
+        "retention HTTP fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -2493,12 +2514,54 @@ async fn fixture_with_input_tokens(advice: serde_json::Value, input_tokens: u64)
     }
 }
 
+#[test]
+fn checkpoint_polling_waits_for_schema_without_creating_authority() {
+    let state = tempfile::tempdir().unwrap();
+    let path = state.path().join("history.index");
+    assert!(checkpoint_states(state.path()).is_empty());
+    assert!(
+        !path.exists(),
+        "readiness polling must not create authority"
+    );
+    std::fs::write(&path, []).unwrap();
+    assert!(checkpoint_states(state.path()).is_empty());
+    assert!(std::fs::read(&path).unwrap().is_empty());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE unrelated(value TEXT)")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(checkpoint_states(state.path()).is_empty());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "polling must not initialize an incomplete schema"
+    );
+    let snapshot = json!({"history_shared":true,"completed_requests":1});
+    std::fs::write(
+        state.path().join("owner.json"),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        checkpoint_states(state.path()).is_empty(),
+        "a mirror cannot stand in for unpublished shared authority"
+    );
+    db.execute_batch("CREATE TABLE records(kind TEXT,key TEXT,data BLOB)")
+        .unwrap();
+    assert!(checkpoint_states(state.path()).is_empty());
+    db.execute(
+        "INSERT INTO records VALUES('snapshots','owner',?1)",
+        [serde_json::to_vec(&snapshot).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(checkpoint_states(state.path()), vec![snapshot]);
+}
+
 fn checkpoint_states(path: &std::path::Path) -> Vec<serde_json::Value> {
     // Advice becomes authority at the atomic index publication, not at its
     // earlier per-session diagnostic mirror write. Explicit legacy sessions
     // remain mirror-owned; implicit selected snapshots are index-owned.
-    let index = std::fs::read(path.join("history.index"))
-        .ok()
+    let index = history_store::read_ready_index(&path.join("history.index"))
         .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
     std::fs::read_dir(path)
         .unwrap()
@@ -4586,7 +4649,7 @@ async fn api_key_model_discovery_remains_an_authenticated_upstream_relay() {
 fn advice_for_checkpoint(path: &std::path::Path, state: &serde_json::Value) -> serde_json::Value {
     use sha2::{Digest, Sha256};
     let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path.join("history.index")).unwrap()).unwrap();
+        serde_json::from_slice(&history_store::read_index(&path.join("history.index"))).unwrap();
     let mut key = state["history_namespace"].as_str().unwrap().to_owned();
     let mut found = serde_json::Value::Null;
     for item in state["history"].as_array().unwrap() {

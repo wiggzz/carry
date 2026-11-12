@@ -5,6 +5,7 @@ all input and zero-write receipts pass through the actual loopback Carry binary.
 An unsupported hypothetical TTL stays unavailable, not a history reset.
 """
 import copy
+from history_store import read_index, write_index
 import json
 import unittest
 
@@ -48,7 +49,7 @@ class SessionHistory(unittest.TestCase):
             self.harness.stack.callback(proxy.close)
             # Real process restart may not rewrite any settled owner or index.
             for name, saved in previous_files.items():
-                self.assertEqual(json.loads((self.harness.state / name).read_text()), saved,
+                self.assertEqual(read_index(self.harness.state / name), saved,
                                  "restart must preserve frozen money and quantities")
             ttl = "12h" if change_ttl and index >= transition else "30m"
             status, response = proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1,
@@ -59,7 +60,7 @@ class SessionHistory(unittest.TestCase):
             self.assertEqual(len(stats["sessions"]), 1)
             estimates.append(copy.deepcopy(stats["sessions"][0]["cost_estimate"]))
             proxy.close()
-            index_state = json.loads((self.harness.state / "history.index").read_text())
+            index_state = read_index(self.harness.state / "history.index")
             matches = [ref for ref in index_state["transcripts"].values()
                        if ref["external_id"] == response["id"]]
             self.assertEqual(len(matches), 1, "successful wire must bind one canonical owner")

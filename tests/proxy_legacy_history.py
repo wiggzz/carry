@@ -5,6 +5,7 @@ expired dispatch evidence cannot gain warmth from restart or dashboard polling.
 """
 import copy
 import http.client
+from history_store import read_index, write_index
 import json
 import unittest
 
@@ -119,12 +120,12 @@ class LegacyHistoryLoads(unittest.TestCase):
         staged = expire_dispatches(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
         index_path = self.harness.state / "history.index"
-        index = json.loads(index_path.read_text())
+        index = read_index(index_path)
         if shared:
             self.assertIn(owner, index["snapshots"])
             index["snapshots"][owner] = expire_dispatches(index["snapshots"][owner])
             self.assertEqual(index["snapshots"][owner]["request_evidence"], staged["request_evidence"])
-            index_path.write_text(json.dumps(index))
+            write_index(index_path, index)
         self.evidence.update(shared=shared, initialized=initialized,
                              before=before, staged=staged, owner=owner,
                              staged_index=index if shared else None)

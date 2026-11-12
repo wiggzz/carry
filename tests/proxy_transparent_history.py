@@ -1,5 +1,6 @@
 """Transparent, caller-owned history matching through real loopback review."""
 import http.client
+from history_store import read_index, write_index, receipt_fault
 import json
 import time
 import unittest
@@ -20,7 +21,7 @@ class TransparentProxy(Proxy):
 
     def checkpoint(self, items):
         # The server's bounded index owns file identity; never pick the first JSON.
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         found = []
         for reference in index["tips"].values():
             path = self.state / (reference["session"] + ".json")
@@ -54,7 +55,7 @@ class TransparentProxy(Proxy):
         # Settle the exact completed response, not an unrelated/orphaned worker.
         path = self.state / "history.index"
         if path.exists():
-            index = json.loads(path.read_text())
+            index = read_index(path)
             for reference in index["transcripts"].values():
                 if reference["external_id"] == getattr(self, "response_id", None):
                     return index.get("snapshots", {}).get(reference["session"], {})
@@ -101,7 +102,7 @@ class TransparentHistory(unittest.TestCase):
                 self.assertEqual(settled["shadow"]["input_tokens"], 100 * count)
                 self.assertEqual(settled["shadow"]["output_tokens"], count)
                 self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
-                index = json.loads((self.state / "history.index").read_text())
+                index = read_index(self.state / "history.index")
                 self.assertEqual(len(index["reviews"]), int(prior), "rejection is not a semantic completion")
                 self.assertTrue(all("999" not in record["opinions"] for record in index["reviews"].values()),
                                 "unknown protection must gain no authority")
@@ -231,7 +232,7 @@ class TransparentHistory(unittest.TestCase):
         connection.close()
         deadline = time.monotonic() + 5
         while True:
-            index = json.loads((self.state / "history.index").read_text())
+            index = read_index(self.state / "history.index")
             snapshots = list(index["snapshots"].values())
             if snapshots and not snapshots[0]["primary_pending"]: break
             self.assertLess(time.monotonic(),deadline)
@@ -266,20 +267,20 @@ class TransparentHistory(unittest.TestCase):
         deadline = time.monotonic()+5
         while proxy.saved().get("primary_pending"):
             self.assertLess(time.monotonic(),deadline); time.sleep(.01)
-        fault = self.state / ".history-index.tmp"
-        fault.mkdir()
+        fault = self.state / "history.index"
+        receipt_fault(fault, True)
         fixture.release.set()
         deadline = time.monotonic()+5
         while not any('"background_review_merged"' in p.read_text() and '"receipt_durable":false' in p.read_text()
                       for p in (self.state / "diagnostics").glob("*.jsonl")):
             self.assertLess(time.monotonic(),deadline); time.sleep(.01)
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         self.assertFalse(index["reviews"])
         paid = list(index["snapshots"].values())[0]
         self.assertTrue(paid["background_review_pending"])
         self.assertEqual(paid["shadow"]["calls"],0, "uncommitted receipt is explicitly unknown, never silently known-zero")
         proxy.close()
-        fault.rmdir()
+        receipt_fault(fault, False)
         # Preserve the exact settings namespace. A bootstrap retry is a new
         # paid call, separate from the single explicitly censored orphan.
         proxy = self.proxy(fixture,options)
@@ -316,7 +317,7 @@ class TransparentHistory(unittest.TestCase):
             before = len(fixture.reviews)
             self.assertEqual(proxy.send(history)[0], 200)
             self.assertEqual(len(fixture.reviews), before + 1, "each credential control must dispatch an actual reviewer")
-            index = json.loads((self.state / "history.index").read_text())
+            index = read_index(self.state / "history.index")
             latest = [entry for entry in index["upstream_cache"]
                       if entry["credential_sha256"] == fixture.review_auth_hashes[-1]]
             self.evidence.update(cache=index["upstream_cache"], actual_auth_hashes=fixture.review_auth_hashes)
@@ -357,12 +358,12 @@ class TransparentHistory(unittest.TestCase):
         # Attest only this synthetic fixture's cache capability on the frozen
         # pair; native cache activity still comes solely from actual HTTP usage.
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for snapshot in index["snapshots"].values():
             snapshot["model_resolution"]["primary"]["cache"] = {
                 "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,
                 "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
-        path.write_bytes(wire(index))
+        write_index(path, index)
         options += ["--review-every-requests", "100"]
         # Advertised fixture capability precedes a real canonical dispatch.
         # No saved cache receipt is manufactured by the attestation above.
@@ -380,7 +381,7 @@ class TransparentHistory(unittest.TestCase):
         # Stage elapsed provider TTL only, not semantic advice, a receipt or a
         # planner result. Every outgoing body is still rendered by the real CLI.
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for entry in index.get("upstream_cache", []):
             if entry.get("write_window"):
                 entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
@@ -389,7 +390,7 @@ class TransparentHistory(unittest.TestCase):
                 for entry in snapshot.get(field, []):
                     if entry.get("write_window"):
                         entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
-        path.write_bytes(wire(index))
+        write_index(path, index)
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertNotIn(history[1], fixture.primaries[-1]["input"], "expired prefix permits cold omission")
@@ -397,11 +398,11 @@ class TransparentHistory(unittest.TestCase):
         proxy.close()
         # If both shapes are warm the smaller compact view can remain cheaper.
         # Expire its new receipt before genuinely re-warming canonical H alone.
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for entry in index["upstream_cache"]:
             if entry.get("write_window"):
                 entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
-        path.write_bytes(wire(index))
+        write_index(path, index)
         # Audit mode genuinely dispatches canonical H. Only its terminal provider
         # receipt may re-warm that exact shape; no invented saved cache entries.
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
@@ -438,12 +439,12 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history)[0], 200)
         proxy.close()
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         for snapshot in index["snapshots"].values():
             snapshot["model_resolution"]["primary"]["cache"] = {
                 "minimum_prefix_tokens":1024,"max_read_breakpoints":50,
                 "max_write_breakpoints":4,"implicit_breakpoint_uses_write_slot":True}
-        path.write_bytes(wire(index))
+        write_index(path, index)
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
         self.stack.callback(proxy.close)
         snapshots = []
@@ -451,7 +452,7 @@ class TransparentHistory(unittest.TestCase):
         # No sleep, clock change, receipt injection, or increasing request body.
         for fraction in (0, .75, 0):
             self.assertEqual(proxy.send(history)[0], 200)
-            index = json.loads(path.read_text())
+            index = read_index(path)
             records = index["upstream_cache"]
             snapshots.append({"expected":fraction,"records":records,
                               "paid":proxy.checkpoint(history)[1]["primary"]})
@@ -468,7 +469,7 @@ class TransparentHistory(unittest.TestCase):
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
         self.stack.callback(proxy.close)
-        self.assertEqual(json.loads(path.read_text())["upstream_cache"], snapshots[-1]["records"])
+        self.assertEqual(read_index(path)["upstream_cache"], snapshots[-1]["records"])
 
     def test_repeated_projection_prices_current_omission_once_after_restart(self):
         """Real advice/planner/receipts: identical H and N must not invent growth."""
@@ -533,7 +534,8 @@ class TransparentHistory(unittest.TestCase):
         self.assertGreater(len(fixture.reviews),1,"selected projections must not suppress ordinary async review")
 
     def test_completed_advice_survives_two_days_and_more_than_eight_cuts(self):
-        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"retained_{n}")),
+        fixture = self.fixture(lambda _b,n: (200,completed(response_id=f"retained_{n}",
+                input_tokens=60000 if h[1] in _b["input"] else 100)),
             lambda body,n: (200,advice_response({"protected":[],"removable":[2],"memories":[]})))
         proxy = self.proxy(fixture,["--review-replayed-history","--payoff-requests","1","--classifier-cache-policy","disabled"])
         h = [{"role":"user","content":"goal"},{"role":"assistant","content":"reviewed source " * 6000},
@@ -545,12 +547,12 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(proxy.send(h)[0],200)
         proxy.close()
         path = self.state / "history.index"
-        index = json.loads(path.read_text())
+        index = read_index(path)
         # Clock seam only: no manufactured advice, wire/cache receipt or plan.
         for records in index["reviews"].values():
             for record in (records if isinstance(records,list) else [records]):
                 record["at"] = int(time.time()) - 2*86400
-        path.write_bytes(wire(index))
+        write_index(path, index)
         proxy = self.proxy(fixture,["--review-every-requests","100","--payoff-requests","1","--classifier-cache-policy","disabled"])
         self.assertEqual(proxy.send(original+[{"role":"user","content":"sibling"}])[0],200)
         self.evidence.update(index=index,primaries=fixture.primaries)
@@ -677,7 +679,8 @@ class TransparentHistory(unittest.TestCase):
             return 200, advice_response({"protected": [], "removable": [2],
                 "memories": [{"source_ids": [2], "text": "EXACT_H_FACT"}]})
 
-        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}")), review)
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"exact_h_{n}",
+            input_tokens=10000 if history[1] in _b["input"] else 100)), review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled"]
         proxy = self.proxy(fixture, options, wait_reviews=False)
@@ -718,6 +721,553 @@ class TransparentHistory(unittest.TestCase):
             self.assertEqual(state["shadow"]["calls"], 0, "no sibling billed receipt inheritance")
         self.assertEqual(len(fixture.reviews), 1)
 
+
+    def test_late_ancestor_retirement_is_not_hidden_by_descendant_dispatch_after_restart(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+        self.stack.callback(release.set)
+        a = [{"role": "user", "content": "LATE_REVOCATION_GOAL"},
+             {"role": "assistant", "content": "LATE_SOURCE " + "payload " * 6000},
+             {"role": "user", "content": "A_REVIEW_CUT"}]
+        def review(body, n):
+            if n == 1:
+                return 200, advice_response({"protected": [], "removable": [2],
+                    "memories": [{"source_ids": [2], "text": "RETIRE_AT_A"}]})
+            self.assertEqual(n, 2)
+            memory = ledger(body)["eligible_memory_ids"][0]
+            held.set()
+            self.assertTrue(release.wait(10), "complete A retirement after descendant dispatch")
+            return 200, advice_response({"protected": [], "removable": [memory], "memories": []})
+        fixture = self.fixture(lambda body, n: (200, completed(response_id=f"late_{n}",
+            input_tokens=10000 if a[1] in body["input"] else 100)), review)
+        options = ["--review-replayed-history", "--payoff-requests", "1", "--classifier-cache-policy", "disabled"]
+        proxy = self.proxy(fixture, options)
+        self.assertEqual(proxy.send(a)[0], 200)
+        self.assertEqual(proxy.advice()["memories"][0]["text"], "RETIRE_AT_A")
+        proxy.wait_reviews = False
+        self.assertEqual(proxy.send(a)[0], 200)
+        self.assertTrue(held.wait(3))
+        d = a + [{"role": "user", "content": "DESCENDANT_BEFORE_RETIREMENT"}]
+        self.assertEqual(proxy.send(d)[0], 200)
+        self.assertNotIn(a[1], fixture.primaries[-1]["input"])
+        self.assertIn("RETIRE_AT_A", json.dumps(fixture.primaries[-1]["input"]),
+                      "descendant must actually publish the old applied selection")
+        release.set()
+        deadline = time.monotonic() + 5
+        while not proxy.reviewers_settled():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(proxy.advice()["memories"], [])
+        self.assertEqual(proxy.advice()["feedback"]["rejected_count"], 0)
+        proxy.close()
+        proxy = self.proxy(fixture, ["--review-every-requests", "100", "--payoff-requests", "1",
+                                     "--classifier-cache-policy", "disabled"])
+        e = d + [{"role": "user", "content": "AFTER_LATE_RETIREMENT"}]
+        self.assertEqual(proxy.send(e)[0], 200)
+        saved = proxy.checkpoint(e)[1]
+        self.evidence.update(late_ancestor=saved, primaries=fixture.primaries, reviews=fixture.reviews)
+        self.assertEqual(len(fixture.primaries), 4)
+        self.assertEqual(len(fixture.reviews), 2)
+        self.assertEqual(saved["primary"]["calls"], 4)
+        self.assertEqual(saved["shadow"]["calls"], 2)
+        self.assertEqual(saved["primary"]["unavailable_cost_calls"], 0)
+        native_input = sum(10000 if a[1] in body["input"] else 100 for body in fixture.primaries)
+        self.assertAlmostEqual(saved["primary"]["cost_usd"], (native_input * .10 + 4 * .50) / 1e6, places=12)
+        self.assertAlmostEqual(saved["shadow"]["cost_usd"], 2 * (100 * .10 + .50) / 1e6, places=12)
+        self.assertNotIn(a[1], fixture.primaries[-1]["input"],
+                         "retiring a fact does not revoke independent source-drop authority")
+        self.assertNotIn("RETIRE_AT_A", json.dumps(fixture.primaries[-1]["input"]))
+        self.assertEqual(proxy.advice()["memories"], [])
+
+    def test_shared_prefix_tracking_boundary_cannot_grant_another_free_initialization(self):
+        """A sibling has fresh money, not a new traditional-history start."""
+        root = self.state
+        outcomes = {}
+        for arm in ("direct", "sibling", "sibling_restart", "fresh"):
+            with self.subTest(arm=arm):
+                self.state = root / ("chronology_" + arm)
+                self.state.mkdir()
+                a = [{"role": "user", "content": "TRACKED_A_GOAL"}]
+                b = a + [{"role": "user", "content": "AUXILIARY_B_ONLY"}]
+                c = a + [{"type": "reasoning", "summary": [],
+                          "encrypted_content": "OPAQUE_C_NATIVE_EXTENT"},
+                         {"role": "user", "content": "FOREGROUND_C"}]
+                receipts = []
+                def primary(body, n):
+                    tokens = 300000 if "FOREGROUND_C" in json.dumps(body) else 120 if body["input"] == b else 100
+                    value = completed([], response_id=f"chronology_{arm}_{n}", input_tokens=tokens)
+                    receipts.append(value)
+                    return 200, value
+                fixture = self.fixture(primary)
+                options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                proxy = self.proxy(fixture, options)
+                if arm != "fresh":
+                    self.assertEqual(proxy.send(a, max_output_tokens=1)[0], 200)
+                    owner_a, _ = proxy.checkpoint(a)
+                if arm.startswith("sibling"):
+                    self.assertEqual(proxy.send(b, max_output_tokens=1)[0], 200)
+                    self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                    if arm == "sibling_restart":
+                        proxy.close()
+                        proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(c, max_output_tokens=1)[0], 200)
+                owner_c, child = proxy.checkpoint(c)
+                states = read_index(self.state / "history.index")["snapshots"]
+                status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                self.assertEqual(status, 200)
+                estimate = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_c.stem)
+                outcomes[arm] = {"child": child, "estimate": estimate,
+                                 "receipts": receipts, "primaries": fixture.primaries}
+                self.evidence["chronology_" + arm] = outcomes[arm]
+                expected_calls = 3 if arm.startswith("sibling") else 1 if arm == "fresh" else 2
+                self.assertEqual(len(fixture.primaries), expected_calls)
+                self.assertEqual(len(receipts), expected_calls)
+                self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                # The 300k native receipt crosses gpt-6-luna's 272k
+                # long-context tariff: both input and output rates change.
+                self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                    sum((v["usage"]["input_tokens"] * .20 + .75) / 1e6
+                        if v["usage"]["input_tokens"] > 272000 else
+                        (v["usage"]["input_tokens"] * .10 + .50) / 1e6
+                        for v in receipts), places=12)
+                self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), 0)
+                self.assertEqual(fixture.reviews, [], "no paid reviewer or rescue")
+                self.assertEqual(fixture.primaries[-1]["input"], c, "exact native C wire, no B-only content")
+                if arm.startswith("sibling"):
+                    self.assertNotEqual(owner_a, owner_c)
+                    self.assertEqual(child["primary"]["calls"], 1)
+                    self.assertEqual(child["primary"]["input_tokens"], 300000)
+                    self.assertAlmostEqual(child["primary"]["cost_usd"], .06000075, places=12)
+                    self.assertEqual(child["shadow"]["calls"], 0)
+                outcomes[arm]["native_controls_passed"] = True
+                print("R8_CHRONOLOGY=" + json.dumps({"arm": arm, "estimate": estimate,
+                    "owner_primary_calls": child["primary"]["calls"], "total_calls": expected_calls}, sort_keys=True), flush=True)
+                proxy.close()
+        self.state = root
+        # Grade only after all four native-money/wire/fresh-start controls ran.
+        self.assertEqual(set(outcomes), {"direct", "sibling", "sibling_restart", "fresh"})
+        self.assertTrue(all(row.get("native_controls_passed", False) for row in outcomes.values()),
+                        "a failed native control cannot qualify chronological semantics")
+        self.assertEqual(outcomes["fresh"]["estimate"]["initial_compactions"], 1,
+                         "a genuinely first oversized request still gets its one free start")
+        self.assertEqual(outcomes["direct"]["estimate"]["initial_compactions"], 0)
+        self.assertEqual(outcomes["direct"]["estimate"]["traditional_compactions"], 1)
+        self.assertGreater(outcomes["direct"]["estimate"]["summary_cost"], 0)
+        for arm in ("sibling", "sibling_restart"):
+            with self.subTest(continuity=arm):
+                self.assertEqual(outcomes[arm]["estimate"]["initial_compactions"], 0,
+                    "an internal sibling accounting boundary is not a fresh logical-history start")
+                self.assertEqual(outcomes[arm]["estimate"]["traditional_compactions"], 1)
+                self.assertGreater(outcomes[arm]["estimate"]["summary_cost"], 0)
+
+    def test_response_ancestor_empty_input_preserves_comparison_without_namespace_fallback(self):
+        """Observed response ancestry qualifies an empty cut, not its whole namespace."""
+        root = self.state
+        outcomes = {}
+        for empty in (False, True):
+            for arm in ("direct", "sibling", "sibling_restart"):
+                key = f"{'empty' if empty else 'nonempty'}_{arm}"
+                with self.subTest(setup=key):
+                    self.state = root / key
+                    self.state.mkdir()
+                    a = [] if empty else [{"role": "user", "content": "EMPTY_CUT_A"}]
+                    output = {"type": "message", "role": "assistant",
+                              "content": [{"type": "output_text", "text": "VERIFIED_A_OUTPUT"}]}
+                    b = [{"role": "user", "content": "EMPTY_CUT_B_ONLY"}]
+                    c = [{"type": "reasoning", "summary": [],
+                          "encrypted_content": "EMPTY_CUT_C_OPAQUE"},
+                         {"role": "user", "content": "EMPTY_CUT_FOREGROUND_C"}]
+                    receipts = []
+                    def primary(body, n):
+                        tokens = 300000 if body["input"][-1:] == c[-1:] else 120 if n > 1 else 100
+                        value = completed([output] if n == 1 else [],
+                                          response_id=f"empty_cut_{key}_{n}", input_tokens=tokens)
+                        receipts.append(value)
+                        return 200, value
+                    fixture = self.fixture(primary)
+                    options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                    proxy = self.proxy(fixture, options)
+                    fields = {"max_output_tokens": 1}
+                    self.assertEqual(proxy.send(a, **fields)[0], 200)
+                    owner_a, _ = proxy.checkpoint(a)
+                    response_a = f"empty_cut_{key}_1"
+                    if arm.startswith("sibling"):
+                        self.assertEqual(proxy.send(b, previous_response_id=response_a, **fields)[0], 200)
+                        self.assertEqual(fixture.primaries[-1]["input"], a + [output] + b)
+                        self.assertEqual(proxy.checkpoint(a + [output] + b)[0], owner_a)
+                        if arm == "sibling_restart":
+                            proxy.close()
+                            proxy = self.proxy(fixture, options)
+                    self.assertEqual(proxy.send(c, previous_response_id=response_a, **fields)[0], 200)
+                    owner_c, child = proxy.checkpoint(a + [output] + c)
+                    index = read_index(self.state / "history.index")
+                    status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                    self.assertEqual(status, 200)
+                    estimate = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_c.stem)
+                    expected_calls = 3 if arm.startswith("sibling") else 2
+                    self.assertEqual(len(fixture.primaries), expected_calls)
+                    self.assertEqual(len(receipts), expected_calls)
+                    self.assertEqual(sum(s["primary"]["calls"] for s in index["snapshots"].values()), expected_calls)
+                    self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in index["snapshots"].values()),
+                        sum((v["usage"]["input_tokens"] * .20 + .75) / 1e6
+                            if v["usage"]["input_tokens"] > 272000 else
+                            (v["usage"]["input_tokens"] * .10 + .50) / 1e6
+                            for v in receipts), places=12)
+                    self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in index["snapshots"].values()), 0)
+                    self.assertEqual(fixture.reviews, [])
+                    self.assertEqual(fixture.primaries[-1], {"model": "gpt-6-luna", "input": a + [output] + c, **fields})
+                    if arm.startswith("sibling"):
+                        self.assertNotEqual(owner_a, owner_c)
+                        self.assertEqual(child["primary"]["calls"], 1)
+                        self.assertEqual(child["primary"]["input_tokens"], 300000)
+                        self.assertAlmostEqual(child["primary"]["cost_usd"], .06000075, places=12)
+                        self.assertEqual(child["shadow"]["calls"], 0)
+                    outcomes[key] = {"estimate": estimate, "child": child,
+                                     "receipts": list(receipts), "primaries": list(fixture.primaries)}
+                    self.evidence[key] = outcomes[key]
+                    print("EMPTY_CUT_CHRONOLOGY=" + json.dumps({"arm": key, "estimate": estimate}), flush=True)
+                    if empty and arm == "sibling_restart":
+                        unrelated = [{"type": "reasoning", "summary": [],
+                                      "encrypted_content": "UNRELATED_OPAQUE"}, c[-1]]
+                        self.assertEqual(proxy.send(unrelated, **fields)[0], 200)
+                        owner, fresh = proxy.checkpoint(unrelated)
+                        self.assertNotIn(owner, (owner_a, owner_c))
+                        self.assertEqual(fresh["primary"]["calls"], 1)
+                        self.assertAlmostEqual(fresh["primary"]["cost_usd"], .06000075, places=12)
+                        self.assertEqual(fixture.primaries[-1]["input"], unrelated)
+                        _, stats = proxy.request("GET", "/carry/dashboard/stats")
+                        fresh_estimate = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner.stem)
+                        self.assertEqual(fresh_estimate["initial_compactions"], 1,
+                                         "an unrelated input cannot inherit an empty namespace cut")
+                        self.assertEqual(fresh_estimate["traditional_compactions"], 0)
+                        self.evidence["unrelated"] = {"estimate": fresh_estimate, "child": fresh,
+                                                       "primaries": list(fixture.primaries), "receipts": list(receipts)}
+                    proxy.close()
+        self.state = root
+        self.assertEqual(len(outcomes), 6)
+        for key, row in outcomes.items():
+            with self.subTest(continuity=key):
+                self.assertEqual(row["estimate"]["initial_compactions"], 0,
+                                 "verified response ancestry cannot grant another free initial compaction")
+                self.assertEqual(row["estimate"]["traditional_compactions"], 1)
+                self.assertAlmostEqual(row["estimate"]["summary_cost"], .05675, places=12)
+
+    def test_empty_response_ancestor_keeps_comparison_after_owner_advances(self):
+        """An observed ID remains a cut even when neither input nor output has nodes."""
+        root = self.state
+        outcomes = {}
+        for arm in ("direct", "sibling", "sibling_restart"):
+            with self.subTest(setup=arm):
+                self.state = root / arm
+                self.state.mkdir()
+                b = [{"role": "user", "content": "EMPTY_OUTPUT_B_ONLY"}]
+                c = [{"type": "reasoning", "summary": [], "encrypted_content": "EMPTY_OUTPUT_C"},
+                     {"role": "user", "content": "EMPTY_OUTPUT_FOREGROUND_C"}]
+                receipts = []
+                def primary(body, n):
+                    tokens = 300000 if body["input"] == c else 100
+                    value = completed([], response_id=f"empty_output_{arm}_{n}", input_tokens=tokens)
+                    receipts.append(value)
+                    return 200, value
+                fixture = self.fixture(primary)
+                options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                proxy = self.proxy(fixture, options)
+                fields = {"max_output_tokens": 1}
+                self.assertEqual(proxy.send([], **fields)[0], 200)
+                owner_a, _ = proxy.checkpoint([])
+                ancestor = f"empty_output_{arm}_1"
+                if arm.startswith("sibling"):
+                    self.assertEqual(proxy.send(b, previous_response_id=ancestor, **fields)[0], 200)
+                    self.assertEqual(fixture.primaries[-1]["input"], b)
+                    self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                    if arm == "sibling_restart":
+                        proxy.close()
+                        proxy = self.proxy(fixture, options)
+                self.assertEqual(proxy.send(c, previous_response_id=ancestor, **fields)[0], 200)
+                owner_c, child = proxy.checkpoint(c)
+                states = read_index(self.state / "history.index")["snapshots"]
+                status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                self.assertEqual(status, 200)
+                estimate = next(s["cost_estimate"] for s in stats["sessions"] if s["id"] == owner_c.stem)
+                expected_calls = 2 + int(arm.startswith("sibling"))
+                self.assertEqual(len(receipts), expected_calls)
+                self.assertEqual(len(fixture.primaries), expected_calls)
+                self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                    .06000075 + (expected_calls - 1) * .0000105, places=12)
+                self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), 0)
+                self.assertEqual(fixture.reviews, [])
+                self.assertEqual(fixture.primaries[-1], {"model": "gpt-6-luna", "input": c, **fields})
+                if arm.startswith("sibling"):
+                    self.assertNotEqual(owner_a, owner_c)
+                    self.assertEqual(child["primary"]["calls"], 1)
+                    self.assertAlmostEqual(child["primary"]["cost_usd"], .06000075, places=12)
+                outcomes[arm] = estimate
+                self.evidence[arm] = {"estimate": estimate, "child": child, "states": states,
+                                      "primaries": list(fixture.primaries), "receipts": list(receipts)}
+                proxy.close()
+        self.state = root
+        self.assertEqual(set(outcomes), {"direct", "sibling", "sibling_restart"})
+        for arm, estimate in outcomes.items():
+            with self.subTest(continuity=arm):
+                self.assertEqual(estimate["initial_compactions"], 0)
+                self.assertEqual(estimate["traditional_compactions"], 1)
+                self.assertAlmostEqual(estimate["summary_cost"], .05675, places=12)
+
+    def test_shared_prefix_preserves_already_summarized_context_without_inheriting_paid_totals(self):
+        """A's summarized quantity survives B; A's and B's money stays owned."""
+        root = self.state
+        outcomes = {}
+        for seed_kind in ("free", "paid"):
+            for arm in ("direct", "sibling", "sibling_restart"):
+                key = seed_kind + "_" + arm
+                with self.subTest(setup=key):
+                    self.state = root / ("summarized_" + key)
+                    self.state.mkdir()
+                    seed = [{"role": "user", "content": "SUMMARIZED_TRACKED_GOAL"}]
+                    a = seed + [{"role": "user", "content": "SUMMARY_AT_A"}]
+                    b = a + [{"role": "user", "content": "SUMMARY_B_ONLY"}]
+                    c = a + [{"type": "reasoning", "summary": [],
+                              "encrypted_content": "SUMMARY_C_OPAQUE"},
+                             {"role": "user", "content": "SUMMARY_FOREGROUND_C"}]
+                    receipts = []
+                    def primary(body, n):
+                        tokens = (300040 if body["input"] == c else
+                                  600000 if body["input"] == b else
+                                  300000 if body["input"] == a else 100)
+                        value = completed([], response_id=f"summarized_{key}_{n}", input_tokens=tokens)
+                        receipts.append(value)
+                        return 200, value
+                    fixture = self.fixture(primary)
+                    options = ["--review-every-requests", "100", "--classifier-cache-policy", "disabled"]
+                    proxy = self.proxy(fixture, options)
+                    # Freeze an uncached scenario so the absolute quantity
+                    # oracle is independent of modeled prefix warmth.
+                    fields = {"max_output_tokens": 1, "prompt_cache_options": {"mode": "explicit"}}
+                    if seed_kind == "paid":
+                        self.assertEqual(proxy.send(seed, **fields)[0], 200)
+                    self.assertEqual(proxy.send(a, **fields)[0], 200)
+                    owner_a, _ = proxy.checkpoint(a)
+                    status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                    self.assertEqual(status, 200)
+                    before = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_a.stem)
+                    if arm.startswith("sibling"):
+                        self.assertEqual(proxy.send(b, **fields)[0], 200)
+                        self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                        if arm == "sibling_restart":
+                            proxy.close()
+                            proxy = self.proxy(fixture, options)
+                    self.assertEqual(proxy.send(c, **fields)[0], 200)
+                    owner_c, child = proxy.checkpoint(c)
+                    states = read_index(self.state / "history.index")["snapshots"]
+                    status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                    self.assertEqual(status, 200)
+                    after = next(row["cost_estimate"] for row in stats["sessions"] if row["id"] == owner_c.stem)
+                    row = {"before": before, "after": after, "receipts": receipts,
+                           "primaries": fixture.primaries, "states": states, "child": child}
+                    outcomes[key] = row
+                    self.evidence["summarized_" + key] = row
+                    expected_calls = 2 + int(seed_kind == "paid") + int(arm.startswith("sibling"))
+                    self.assertEqual(len(fixture.primaries), expected_calls)
+                    self.assertEqual(len(receipts), expected_calls)
+                    self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                    self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                        sum((v["usage"]["input_tokens"] * .20 + .75) / 1e6
+                            if v["usage"]["input_tokens"] > 272000 else
+                            (v["usage"]["input_tokens"] * .10 + .50) / 1e6
+                            for v in receipts), places=12)
+                    self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), 0)
+                    self.assertEqual(fixture.reviews, [], "no paid reviewer or rescue")
+                    self.assertEqual(fixture.primaries[-1]["input"], c, "exact C wire, no B-only content")
+                    if arm.startswith("sibling"):
+                        self.assertNotEqual(owner_a, owner_c)
+                        self.assertEqual(child["primary"]["calls"], 1)
+                        self.assertEqual(child["primary"]["input_tokens"], 300040)
+                        self.assertAlmostEqual(child["primary"]["cost_usd"], .06000875, places=12)
+                        self.assertEqual(child["shadow"]["calls"], 0)
+                    row["native_controls_passed"] = True
+                    print("R8_SUMMARIZED=" + json.dumps({"key": key, "before": before, "after": after,
+                        "total_calls": expected_calls, "owner_primary_calls": child["primary"]["calls"]}, sort_keys=True), flush=True)
+                    proxy.close()
+        self.state = root
+        self.assertEqual(set(outcomes), {kind + "_" + arm for kind in ("free", "paid")
+                                        for arm in ("direct", "sibling", "sibling_restart")})
+        self.assertTrue(all(row.get("native_controls_passed", False) for row in outcomes.values()),
+                        "no context grading after a failed native control")
+        for kind in ("free", "paid"):
+            direct = outcomes[kind + "_direct"]
+            before, after = direct["before"], direct["after"]
+            self.assertEqual(before["initial_compactions"], int(kind == "free"))
+            self.assertEqual(before["traditional_compactions"], int(kind == "paid"))
+            self.assertEqual(after["initial_compactions"], before["initial_compactions"])
+            self.assertEqual(after["traditional_compactions"], before["traditional_compactions"])
+            marginal = after["traditional_cost"] - before["traditional_cost"]
+            self.assertAlmostEqual(marginal, (21040 * .10 + .50) / 1e6, places=12,
+                                   msg="A's 21k summary plus 40 native append; short-tier continuation")
+            for arm in ("sibling", "sibling_restart"):
+                with self.subTest(context=kind + "_" + arm):
+                    estimate = outcomes[kind + "_" + arm]["after"]
+                    # Check quantity/money independently of the initialization
+                    # counter so suppressing that counter alone cannot pass.
+                    self.assertAlmostEqual(estimate["traditional_cost"], marginal, places=12,
+                        msg="inherit A's retired context, not a fresh summary or B's 600k extent")
+                    self.assertEqual(estimate["initial_compactions"], 0)
+                    self.assertEqual(estimate["traditional_compactions"], 0)
+                    self.assertEqual(estimate["summary_cost"], 0)
+                    self.assertEqual(estimate["coverage"]["primary_responses"], 1)
+                    self.assertAlmostEqual(estimate["carry_cost"], .06000875, places=12,
+                                           msg="ancestor paid totals must not enter the child window")
+
+    def test_shared_prefix_preserves_applied_projection_and_native_sizing_after_auxiliary_cancel(self):
+        """Real wires/receipts: applied A is not B's current mutable tip."""
+        import base64
+        import socket
+        import threading
+        import zlib
+        root = self.state
+        outcomes = []
+        for arm in ("direct", "sibling_completed", "sibling", "sibling_restart"):
+            with self.subTest(arm=arm):
+                cancelled = arm in ("sibling", "sibling_restart")
+                self.state = root / arm
+                self.state.mkdir()
+                held, release = threading.Event(), threading.Event()
+                self.stack.callback(release.set)
+                a = [{"role": "user", "content": "R8_PROTECTED_GOAL"},
+                     {"role": "assistant", "content": "R8_RAW_A " + "payload " * 6000},
+                     {"role": "user", "content": "R8_KEEP_SEPARATOR"},
+                     {"type": "reasoning", "summary": [], "encrypted_content": "R8_NATIVE_OPAQUE_A"},
+                     {"role": "user", "content": "R8_A_BOUNDARY"}]
+                b = a + [{"role": "assistant", "content": "R8_RAW_B " + "branch " * 6000},
+                         {"role": "user", "content": "R8_B_BOUNDARY"}]
+                c = a + [{"role": "user", "content": "R8_FOREGROUND_C"}]
+                receipts = []
+                def primary(body, n):
+                    if cancelled and n == 5:
+                        held.set()
+                        self.assertTrue(release.wait(10), "release cancelled auxiliary after publication")
+                    tokens = 50000 if a[1] in body["input"] else 20000 if b[-2] in body["input"] else 10000
+                    value = completed(response_id=f"r8_{arm}_{n}", input_tokens=tokens)
+                    if cancelled and n == 5:
+                        # No native usage was delivered before cancellation.
+                        # A scripted provider completion is not an owned receipt;
+                        # keep this attempt explicitly unknown, never priced zero.
+                        value.pop("usage")
+                        value["status"] = "incomplete"
+                    receipts.append(value)
+                    return 200, value
+                def review(body, _n):
+                    is_b = "R8_B_BOUNDARY" in json.dumps(body)
+                    source = 6 if is_b else 2
+                    # An appended B source is not consumed replay. Its first
+                    # successful primary exposes it; only the next review can
+                    # grant removal/fact authority. Repeated A advice likewise
+                    # must not try to replace an already invisible source.
+                    eligible = source in ledger(body)["eligible_group_ids"]
+                    return 200, advice_response({"protected": [1],
+                        "removable": ([3, source] if is_b else [source]) if eligible else [],
+                        "memories": [{"source_ids": [source],
+                            "text": "R8_B_ONLY_FACT" if is_b else "R8_A_FACT"}] if eligible else []})
+                fixture = self.fixture(primary, review)
+                seed_options = ["--review-replayed-history", "--payoff-requests", "1",
+                                "--classifier-cache-policy", "disabled"]
+                quiet_options = ["--review-every-requests", "100", "--payoff-requests", "1",
+                                 "--classifier-cache-policy", "disabled"]
+                proxy = self.proxy(fixture, seed_options)
+                self.assertEqual(proxy.send(a)[0], 200)
+                self.assertEqual(proxy.send(a)[0], 200)
+                owner_a, applied = proxy.checkpoint(a)
+                self.assertNotIn(a[1], fixture.primaries[-1]["input"], "A must really apply before branching")
+                self.assertIn("R8_A_FACT", json.dumps(fixture.primaries[-1]["input"]))
+                self.assertIn(a[3], fixture.primaries[-1]["input"], "opaque native member remains exact")
+                self.assertTrue(applied["last_submitted_ids"], "actual submitted selection is established")
+                if arm != "direct":
+                    self.assertEqual(proxy.send(b)[0], 200)  # expose the appended source
+                    self.assertEqual(proxy.send(b)[0], 200)  # accept its now-eligible advice
+                    setup = {"arm": arm, "phase": "B_advice", "primaries": fixture.primaries,
+                             "reviews": fixture.reviews, "receipts": receipts,
+                             "saved": proxy.checkpoint(b)[1], "advice": proxy.advice()}
+                    print("R8_SETUP_ZLIB_BASE64=" + base64.b64encode(zlib.compress(wire(setup))).decode(), flush=True)
+                    self.assertIn(6, ledger(fixture.reviews[-1])["eligible_group_ids"],
+                                  "B fact source must be exposed before review acceptance")
+                    self.assertTrue(any(m["text"] == "R8_B_ONLY_FACT" for m in proxy.advice()["memories"]),
+                                    "B-only fact must be genuinely accepted, not an unused canary")
+                    proxy.close()
+                    proxy = self.proxy(fixture, quiet_options)
+                    # The provider arrival follows Carry's durable input frontier
+                    # publication. Disconnect before headers, then let the real
+                    # attempted-dispatch receipt owner finish and cold-read it.
+                    if cancelled:
+                        connection = http.client.HTTPConnection(*proxy.address, timeout=10)
+                        self.stack.callback(connection.close)
+                        connection.request("POST", "/v1/responses", wire({"model": "gpt-6-luna", "input": b}),
+                                           headers={"Content-Type": "application/json"})
+                        self.assertTrue(held.wait(3), "auxiliary must reach actual provider before cancellation")
+                    else:
+                        self.assertEqual(proxy.send(b)[0], 200)
+                    self.assertEqual(proxy.checkpoint(b)[0], owner_a)
+                    self.assertNotIn(a[1], fixture.primaries[-1]["input"], "B retains A's applied projection")
+                    self.assertNotIn(a[2], fixture.primaries[-1]["input"], "B's changed shared-prefix advice must actually apply")
+                    self.assertIn("R8_B_ONLY_FACT", json.dumps(fixture.primaries[-1]["input"]))
+                    self.assertNotIn(b[-2], fixture.primaries[-1]["input"], "B-only projection must really apply")
+                    if cancelled:
+                        connection.sock.shutdown(socket.SHUT_RDWR)
+                        connection.close()
+                        release.set()
+                    deadline = time.monotonic() + 5
+                    while proxy.checkpoint(b)[1]["primary"]["calls"] != 5:
+                        self.assertLess(time.monotonic(), deadline, "cancelled auxiliary must settle its actual receipt")
+                        time.sleep(.01)
+                    if arm == "sibling_restart":
+                        proxy.close()
+                        proxy = self.proxy(fixture, quiet_options)
+                else:
+                    proxy.close()
+                    proxy = self.proxy(fixture, quiet_options)
+                before_reviews = len(fixture.reviews)
+                self.assertEqual(proxy.send(c)[0], 200)
+                owner_c, child = proxy.checkpoint(c)
+                index = read_index(self.state / "history.index")
+                states = index["snapshots"]
+                outcome = {"arm": arm, "owner_a": owner_a.name, "owner_c": owner_c.name,
+                           "applied_a": applied, "child": child, "states": states,
+                           "primaries": fixture.primaries, "reviews": fixture.reviews, "receipts": receipts}
+                outcomes.append(outcome)
+                print("R8_EVIDENCE_ZLIB_BASE64=" + base64.b64encode(zlib.compress(wire(outcome))).decode(), flush=True)
+                self.evidence[arm] = outcome
+                expected_calls = 3 if arm == "direct" else 6
+                self.assertEqual(len(fixture.primaries), expected_calls)
+                self.assertEqual(len(receipts), expected_calls)
+                self.assertEqual(sum(s["primary"]["calls"] for s in states.values()), expected_calls)
+                self.assertAlmostEqual(sum(s["primary"]["cost_usd"] for s in states.values()),
+                    sum(v["usage"]["input_tokens"] * .10 / 1e6 + .50 / 1e6 for v in receipts if "usage" in v), places=12)
+                self.assertEqual(sum(s["shadow"]["calls"] for s in states.values()), before_reviews)
+                self.assertAlmostEqual(sum(s["shadow"]["cost_usd"] for s in states.values()),
+                                       before_reviews * (100 * .10 + .50) / 1e6, places=12)
+                self.assertEqual(len(fixture.reviews), before_reviews, "no paid rescue review")
+                self.assertEqual(sum(s["primary"]["unavailable_cost_calls"] for s in states.values()), int(cancelled))
+                self.assertEqual(child["primary"]["unavailable_cost_calls"], 0,
+                                 "B's unknown attempted expense cannot contaminate C")
+                sent = fixture.primaries[-1]["input"]
+                self.assertIn(a[0], sent)
+                self.assertIn(a[2], sent, "B-only removal of A's separator cannot leak into C")
+                self.assertIn(a[3], sent)
+                self.assertIn(c[-1], sent)
+                self.assertNotIn("R8_B_ONLY_FACT", json.dumps(sent), "never borrow B-only advice")
+                self.assertNotIn("R8_B_BOUNDARY", json.dumps(sent))
+                if arm != "direct":
+                    self.assertNotEqual(owner_c, owner_a, "genuine siblings remain separate accounting owners")
+                    self.assertEqual(child["primary"]["calls"], 1)
+                    self.assertEqual(child["shadow"]["calls"], 0)
+
+                # Complete money/wire/isolation guards before the reported seam.
+                self.assertNotIn(a[1], sent, "shared A's applied projection/native sizing must survive B's sole-tip advance")
+                self.assertIn("R8_A_FACT", json.dumps(sent))
+                self.assertEqual(child["last_plan"]["baseline_omitted_members"], [2])
+                self.assertIsNotNone(child["last_plan"]["primary_input_basis"],
+                                     "the reauthorized continuation retains compatible A quantities")
+                proxy.close()
+        self.state = root
 
     def test_empty_selection_retires_historical_memory_authority(self):
         def review(body, n):
@@ -844,7 +1394,8 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(len(fixture.primaries), count)
 
 
-    def seed(self, env=None, review=None, extra=(), history=None, primary_input_tokens=100):
+    def seed(self, env=None, review=None, extra=(), history=None, primary_input_tokens=None,
+             raw_input_tokens=10000):
         history = history or [{"role": "user", "content": "PROTECTED_GOAL"},
                    {"role": "assistant", "content": "RAW_A " + "payload " * 6000},
                    {"role": "user", "content": "A_BOUNDARY"}]
@@ -853,7 +1404,13 @@ class TransparentHistory(unittest.TestCase):
             return 200, advice_response({"protected": [i for i in ids if i == 1],
                 "removable": [i for i in ids if i != 1],
                 "memories": [{"source_ids": [2], "text": "A_FACT"}] if n == 1 else []})
-        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}", input_tokens=primary_input_tokens)), review or default_review)
+        # Native anchors now survive cold branches. The default raw source has
+        # thousands of visible tokens: a 100-token total cannot support its
+        # subtraction. Script a coherent raw/projected pair, preserving explicit
+        # receipt overrides for tests that grade their own exact paid totals.
+        fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}",
+            input_tokens=primary_input_tokens if primary_input_tokens is not None else
+                raw_input_tokens if history[1] in _b["input"] else 100)), review or default_review)
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--classifier-cache-policy", "disabled", *extra]
         proxy = TransparentProxy(self.state, fixture, options, env)
@@ -875,7 +1432,7 @@ class TransparentHistory(unittest.TestCase):
                                                              "--review-every-requests", "100"])
                 old_path, old = proxy.checkpoint(history)
                 self.assertEqual(old["primary"]["calls"], 1)
-                self.assertTrue(json.loads((self.state / "history.index").read_text())["reviews"], "real completed advice supplies old authority")
+                self.assertTrue(read_index(self.state / "history.index")["reviews"], "real completed advice supplies old authority")
                 time.sleep(ttl + 1.05)
                 if restart:
                     proxy.close()
@@ -979,7 +1536,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertGreaterEqual(len(fixture.reviews), 2)
         _, parent = proxy.checkpoint(b)
         self.assertTrue(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in proxy.advice()["memories"]))
-        index = json.loads((self.state / "history.index").read_text())
+        index = read_index(self.state / "history.index")
         self.assertTrue(any(any(m["text"] == "B_DEPENDENT_FACT_CLAIMS_A" for m in p["memories"])
                             for p in index["reviews"].values()),
                         "later compatible reviews must be committed too, not first-raw-only: "
@@ -1014,7 +1571,7 @@ class TransparentHistory(unittest.TestCase):
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"])
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(history)[0], 200)
-        archive = json.loads((self.state / "history.index").read_text())
+        archive = read_index(self.state / "history.index")
         references = [r for r in archive["transcripts"].values() if r["external_id"] == "native_1"]
         self.assertEqual(len(references), 1, "native reset must not erase the observed canonical transcript")
         frontier, observed = references[0]["frontier"], []
@@ -1033,9 +1590,7 @@ class TransparentHistory(unittest.TestCase):
 
     def test_history_empty_envelope_limits_two_requests_and_restart(self):
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"minimum_{n}")))
-        minimum = len(wire({"format": "carry-prefix-history-v4", "nodes": {},
-                            "upstream_cache": [], "tips": {}, "reviews": {},
-                            "transcripts": {}, "snapshots": {}}))
+        minimum = 256  # minimum decoded-record working set, not a whole-index size
         for limit in (2, minimum - 1):
             with self.subTest(rejected_limit=limit):
                 with self.assertRaises(AssertionError, msg="impossible history byte limits must reject startup"):
@@ -1051,8 +1606,8 @@ class TransparentHistory(unittest.TestCase):
             self.assertNotIn("id", result)
             index = proxy.state / "history.index"
             if index.exists():
-                self.assertLessEqual(index.stat().st_size, minimum)
-                json.loads(index.read_bytes())
+                self.assertFalse(read_index(index)["snapshots"])
+                self.assertFalse(read_index(index)["transcripts"])
         self.assertEqual(fixture.primaries, [])
         proxy.close()
         proxy = self.proxy(fixture, options)
@@ -1110,7 +1665,7 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
         child = history + [{"role": "user", "content": "C_ONLY"}]
         self.assertEqual(proxy.send(child)[0], 200)
-        archive = json.loads((self.state / "history.index").read_text())
+        archive = read_index(self.state / "history.index")
         checkpoints = [json.loads(p.read_text()) for p in self.state.glob("*.json")]
         self.assertGreaterEqual(len(checkpoints), 2)
         for state in checkpoints:
@@ -1202,7 +1757,7 @@ class TransparentHistory(unittest.TestCase):
         child = history + [{"role": "user", "content": "C_ONLY"}]
         self.assertEqual(proxy.send(child)[0], 200)
         self.assertIn("RAW_A", json.dumps(fixture.primaries[-1]))
-        points = [p for ps in json.loads((self.state / "history.index").read_text())["reviews"].values()
+        points = [p for ps in read_index(self.state / "history.index")["reviews"].values()
                   for p in ps]
         self.assertEqual(points, [], "failed review cannot publish semantic authority")
         for point in points:
@@ -1222,24 +1777,33 @@ class TransparentHistory(unittest.TestCase):
         # live owner now backpressures instead of deleting its authority.
         self.assertEqual(proxy.send([{"role": "user", "content": "TOO_SMALL_OWNER"}])[0], 507)
         self.assertEqual(fixture.primaries, [])
-        self.assertFalse((self.state / "history.index").exists())
-        self.assertEqual(list(self.state.glob("*.json")), [])
+        # Admission can now reject before creating the history store at all.
+        # If initialization did occur, it must contain no published authority.
+        if (self.state / "history.index").exists():
+            rejected = read_index(self.state / "history.index")
+            self.assertFalse(rejected["snapshots"])
+            self.assertFalse(rejected["transcripts"])
+        self.assertEqual(list(self.state.glob("*.json")),[])
         proxy.close()
         # The roomy arm must fit a completed selected snapshot, including its
         # numeric dispatch evidence. Keep the 4 KiB no-dispatch rejection above;
         # every publication below must still obey this declared byte bound.
         env["CARRY_PROXY_HISTORY_MAX_BYTES"] = "32768"
+        env["CARRY_PROXY_HISTORY_MAX_AGE_SECS"] = "604800"
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
         for n in range(8):
             self.assertEqual(proxy.send([{"role": "user", "content": f"UNIQUE_{n}"}])[0], 200)
-            raw = (self.state / "history.index").read_bytes()
-            index = json.loads(raw)
-            self.assertLessEqual(len(raw), int(env["CARRY_PROXY_HISTORY_MAX_BYTES"]))
-            self.assertLessEqual(len(index["nodes"]), 4)
-            self.assertLessEqual(len(index["tips"]) + len(index["transcripts"]), 4)
-        self.assertEqual(proxy.send([], previous_response_id="resp_1")[0], 409)
+            index = read_index(self.state / "history.index")
+            for kind in ("nodes", "tips", "reviews", "transcripts", "snapshots"):
+                for value in index[kind].values():
+                    self.assertLessEqual(len(wire(value)), 32768, "decoded record bound, not global eviction")
+        self.assertGreater(len(index["nodes"]), 4)
+        self.assertGreater(len(index["transcripts"]), 4)
+        self.assertEqual(proxy.send([], previous_response_id="resp_1")[0], 200,
+                         "working-set pressure cannot expire an observed ID")
         proxy.close()
+        env["CARRY_PROXY_HISTORY_MAX_AGE_SECS"] = "1"
         time.sleep(2.05)
         # Orphan publication is never authoritative.
         (self.state / "history.tmp").write_text('{"fake":"uncommitted"}')
@@ -1328,7 +1892,7 @@ class TransparentHistory(unittest.TestCase):
                     status, _ = proxy.send([{"role": "user", "content":
                         f"UNRELATED_{n} " + ("x" * 40000 if pressure == "bytes" else "x")}], wait=False)
                     self.assertIn(status, (200, 500, 507))
-                index = json.loads((self.state / "history.index").read_text())
+                index = read_index(self.state / "history.index")
                 try:
                     self.assertIn(owner, index["snapshots"],
                                   "GC must not delete an in-flight review's accounting/removal owner")
@@ -1337,7 +1901,7 @@ class TransparentHistory(unittest.TestCase):
                     release.set()
                 deadline = time.monotonic() + 5
                 while True:
-                    index = json.loads((self.state / "history.index").read_text())
+                    index = read_index(self.state / "history.index")
                     settled = index["snapshots"].get(owner, {})
                     if not settled.get("background_review_pending", True) and proxy.reviewers_settled():
                         break
@@ -1355,7 +1919,7 @@ class TransparentHistory(unittest.TestCase):
                     reviews_before = len(fixture.reviews)
                     proxy = TransparentProxy(self.state, fixture, options, env)
                     self.stack.callback(proxy.close)
-                    restarted = json.loads((self.state / "history.index").read_text())
+                    restarted = read_index(self.state / "history.index")
                     self.assertEqual(restarted["snapshots"][owner]["shadow"]["calls"], 1,
                                      "restart must retain the exact settled paid receipt")
                     followup = history + [{"role": "user", "content": "PINNED_CONTINUE"}]
@@ -1425,7 +1989,7 @@ class TransparentHistory(unittest.TestCase):
                 # primary intentionally holds that owner's reviewer settlement.
                 self.assertIn(proxy.send([{"role": "user", "content": f"PRIMARY_PRESSURE_{n}"}], wait=False)[0], (200, 500, 507))
             try:
-                index = json.loads((self.state / "history.index").read_text())
+                index = read_index(self.state / "history.index")
                 self.assertIn(owner, index["snapshots"], "primary transport owns its selected snapshot")
             finally:
                 release.set()
@@ -1447,7 +2011,7 @@ class TransparentHistory(unittest.TestCase):
         proxy.close()
         proxy = TransparentProxy(self.state, fixture, options, env)
         self.stack.callback(proxy.close)
-        restarted = json.loads((self.state / "history.index").read_text())["snapshots"][owner]
+        restarted = read_index(self.state / "history.index")["snapshots"][owner]
         self.assertEqual(restarted["primary"], after["primary"], "restart must not duplicate a settled primary")
         self.assertEqual(restarted["shadow"], after["shadow"], "restart must not duplicate a settled review")
         receipts_before = len(owner_receipts)
@@ -1468,8 +2032,7 @@ class TransparentHistory(unittest.TestCase):
         sent = owner_primaries[-1]["input"]
         self.assertIn(history[0], sent)
         if history[1] not in sent:
-            self.assertTrue(any(r["drops"] for r in json.loads(
-                (self.state / "history.index").read_text())["reviews"].values()),
+            self.assertTrue(any(r["drops"] for r in read_index(self.state / "history.index")["reviews"].values()),
                 "omission requires retained advice; advice does not require omission")
         self.evidence.update(before=before, after=after, restarted=restarted, resumed=resumed,
                              owner_primaries=owner_primaries, owner_review_wires=owner_wires, owner_receipts=owner_receipts)
@@ -1481,11 +2044,12 @@ class TransparentHistory(unittest.TestCase):
         proxy, fixture, history, _ = self.seed(extra=("--history-max-references", "32"))
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "STORAGE_PARENT"}])[0], 200)
         observations = []
+        retained_owners = set(read_index(self.state / "history.index")["snapshots"])
         for n in range(20):
             child = history + [{"role": "user", "content": f"STORAGE_CHILD_{n}"}]
             self.assertEqual(proxy.send(child)[0], 200)
             path = self.state / "history.index"
-            index = json.loads(path.read_text())
+            index = read_index(path)
             mirrors = list(self.state.glob("*.json"))
             observation = {"index_bytes": path.stat().st_size,
                 "diagnostic_mirror_bytes": sum(p.stat().st_size for p in mirrors),
@@ -1494,9 +2058,11 @@ class TransparentHistory(unittest.TestCase):
                 "snapshot_count": len(index["snapshots"]),
                 "shared_payload_copies": sum(node["value"] == history[1] for node in index["nodes"].values())}
             observations.append(observation)
-            self.assertLessEqual(observation["reference_count"], 32)
-            self.assertLessEqual(observation["index_bytes"], 33554432)
+            self.assertTrue(retained_owners <= set(index["snapshots"]), "unrelated owners cannot disappear under reference pressure")
+            self.assertGreaterEqual(observation["snapshot_count"], len(retained_owners) + n + 1)
+            self.assertLessEqual(observation["index_bytes"] + observation["diagnostic_mirror_bytes"], 1073741824)
             self.assertEqual(observation["shared_payload_copies"], 1)
+        self.assertGreater(observations[-1]["reference_count"], 32, "retain disk references beyond the active-owner working cap")
         summary = {"case": "20_siblings_shared_42k_prefix_reference_pressure", "samples": len(observations),
             "last": observations[-1],
             "maximum_observed_index_plus_mirrors_bytes": max(o["index_bytes"] + o["diagnostic_mirror_bytes"] for o in observations),
@@ -1560,7 +2126,10 @@ class TransparentHistory(unittest.TestCase):
         self.assertEqual(fixture.primaries[-1]["input"], sent)
 
     def test_real_primary_overflow_never_dispatches_recovery(self):
-        proxy, fixture, history, options = self.seed()
+        # Keep the synthetic native remainder below the tested 1024-token
+        # capacity after removing the ~6000 visible source tokens. The generic
+        # 10k raw seed leaves ~4k and is not a fitting-child precondition.
+        proxy, fixture, history, options = self.seed(raw_input_tokens=6200)
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "CAPACITY_PARENT"}])[0], 200)
         proxy.close()
         options += ["--primary-context-tokens", "1024", "--primary-output-reserve-tokens", "1",
@@ -1634,7 +2203,9 @@ class TransparentHistory(unittest.TestCase):
 
     def test_concurrent_siblings_keep_independent_selection_and_restart(self):
         import concurrent.futures
-        proxy, fixture, history, options = self.seed()
+        # Four concurrent owners must fit the unchanged disk ceiling. Their
+        # small records do not require four default 32 MiB settlement promises.
+        proxy, fixture, history, options = self.seed(extra=["--history-max-bytes", "262144"])
         # Retire the common live tip so both children use the immutable review.
         self.assertEqual(proxy.send(history + [{"role": "user", "content": "B_ONLY"}])[0], 200)
         children = [history + [{"role": "user", "content": f"SIBLING_{n}"}] for n in range(4)]

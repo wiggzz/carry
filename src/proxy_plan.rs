@@ -1,4 +1,4 @@
-//! Synchronous request-time economics. No selected state is ever persisted.
+//! Request-time economics: prior dispatches are reauthorized alternatives only.
 use super::*;
 
 #[derive(Clone, Debug)]

@@ -302,9 +302,16 @@ pub struct RequestEvidence {
     numeric_lost: bool,
     #[serde(skip)]
     archive_access: Option<archive::Access>,
+    // The actual terminal event before semantic prefix compression. Only its
+    // fixed-size numeric witness is needed by mandatory paid-only publication.
+    #[serde(skip)]
+    terminal_numeric: Option<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison_context: Option<archive::ComparisonContext>,
 }
 #[path = "proxy_evidence_archive.rs"]
 mod archive;
+pub(crate) use archive::ComparisonContext;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum EvidenceFormat {
@@ -331,6 +338,8 @@ impl Default for RequestEvidence {
             numeric_primary_items: None,
             numeric_lost: false,
             archive_access: None,
+            terminal_numeric: None,
+            comparison_context: None,
         }
     }
 }
@@ -481,6 +490,97 @@ impl RequestEvidence {
         Ok(())
     }
 
+    /// Upper envelope of one mandatory terminal append, its numeric archive
+    /// suffix and the publication-failure boundary. No provider response is
+    /// invented or persisted: this is shape/size admission before transport.
+    pub(crate) fn completion_bound(
+        &self,
+        body: &Value,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+        primary: bool,
+    ) -> std::io::Result<u64> {
+        let event = if primary {
+            // Source/prompt/configuration identities are fixed-width digests.
+            // Their CONTENT is irrelevant to size admission: do not hash or
+            // tokenize another copy of the actual (possibly large) prompt.
+            let shape_body = json!({"model":body["model"]});
+            let mut facts = PrimaryFacts::extract(
+                PrimaryObservation {
+                    body: &shape_body,
+                    response: &Value::Null,
+                    route,
+                    at: 0,
+                    standard: true,
+                    resolved,
+                    cost: Some(0.0),
+                    measurements: None,
+                },
+                None,
+                self.scenario,
+                Some(0),
+            );
+            facts.input = None;
+            facts.semantic_input = None;
+            facts.semantic_output = None;
+            facts.prompt = Some(PromptWitness {
+                items: 0,
+                wire: "0".repeat(64),
+                semantic: "0".repeat(64),
+                prior_prefix: Some((0, "0".repeat(64), "0".repeat(64))),
+            });
+            facts.native = Some(Usage::default());
+            facts.retained = Some(0);
+            facts.retained_visible = Some(0);
+            facts.retained_opaque = Some(0);
+            facts.retained_member = Some(0);
+            facts.allowance = Some(0);
+            facts.fixed = Some(0);
+            facts.protected = Some(0);
+            facts.read_refresh = Some(0);
+            // Implicit and Disabled are the longest serialized mode variants.
+            facts.cache_mode = carry::models::ScenarioCacheMode::Disabled;
+            Observation::Primary {
+                facts: Box::new(facts),
+                restoration: Some(crate::proxy_quantity::RestorationEstimate {
+                    tokens: 0,
+                    measured: true,
+                    estimated_opaque_items: 0,
+                }),
+                edited: false,
+            }
+        } else {
+            Observation::Reviewer {
+                usage: receipts::review_usage_shape(),
+                standard: true,
+                cost: Some(0.0),
+            }
+        };
+        crate::proxy::settlement::size_bound(&json!({
+            "observations":[&event, Observation::Boundary],
+            "numeric_pending":[&event, Observation::Boundary],
+            "numeric_primary_items":0,
+            "prior_untracked":0,
+            "numeric_lost":false,
+            "archive":self.archive,
+        }))
+    }
+
+    /// Keep the actual new receipt's bounded witness without dropping any prior
+    /// observations. Successful semantic publication still keeps full hashes;
+    /// paid-only publication deliberately grants no new semantic authority.
+    pub(crate) fn retain_numeric_terminal(&mut self) {
+        if let Some(event @ Observation::Primary { .. }) = &self.terminal_numeric
+            && let Some(target) = self
+                .observations
+                .iter_mut()
+                .rev()
+                .find(|event| matches!(event, Observation::Primary { .. }))
+        {
+            *target = event.clone();
+        }
+    }
+
     const MAX_OBSERVATIONS: usize = 4096;
     const MAX_REFERENCES: usize = 65536;
 
@@ -528,26 +628,29 @@ impl RequestEvidence {
         self.observations.clear();
     }
     fn append(&mut self, mut observation: Observation) {
+        let numeric = match &observation {
+            Observation::Primary {
+                facts,
+                restoration,
+                edited,
+            } => Some(Observation::Primary {
+                facts: Box::new(
+                    facts.numeric(
+                        self.numeric_primary_items
+                            .unwrap_or_else(|| self.last_prompt().0.len()),
+                    ),
+                ),
+                restoration: *restoration,
+                edited: *edited,
+            }),
+            _ => None,
+        };
+        if numeric.is_some() {
+            self.terminal_numeric = numeric.clone();
+        }
         if self.archive_access.is_some() {
             self.start_numeric();
-            let numeric = match &observation {
-                Observation::Primary {
-                    facts,
-                    restoration,
-                    edited,
-                } => Observation::Primary {
-                    facts: Box::new(
-                        facts.numeric(
-                            self.numeric_primary_items
-                                .unwrap_or_else(|| self.last_prompt().0.len()),
-                        ),
-                    ),
-                    restoration: *restoration,
-                    edited: *edited,
-                },
-                other => other.clone(),
-            };
-            self.queue_numeric(numeric);
+            self.queue_numeric(numeric.unwrap_or_else(|| observation.clone()));
         }
         if self.observations.len() == Self::MAX_OBSERVATIONS {
             self.discard_prefix();
@@ -649,14 +752,28 @@ impl RequestEvidence {
                     .checked_add(prefix.reviewer_attempts)
                     == Some(prior_untracked)
         });
-        replay.prior_untracked(if prefix.is_some() { 0 } else { prior_untracked });
+
         let mut rewrites = RewriteCount {
             prior_unknown: prior_untracked > 0,
             ..Default::default()
         };
         let mut dispatched = false;
         let (mut wire, mut semantic) = (Vec::new(), Vec::new());
-        let mut observe = |observation: &Observation| {
+        let mut observe = |observation: Option<&Observation>, context_complete: bool| {
+            let Some(observation) = observation else {
+                if self.comparison_context.is_some() {
+                    replay.begin_owned_window(context_complete);
+                    rewrites = RewriteCount {
+                        prior_unknown: prior_untracked > 0,
+                        ..Default::default()
+                    };
+                    dispatched = false;
+                    inferred_calls = 0;
+                    inferred_cost = 0.0;
+                }
+                replay.prior_untracked(if prefix.is_some() { 0 } else { prior_untracked });
+                return;
+            };
             match observation {
                 Observation::Dispatch {
                     newly_omitted_members,
@@ -740,14 +857,19 @@ impl RequestEvidence {
                 Observation::Boundary => replay.reset_epoch(),
             }
         };
+        let context_complete = self
+            .scan_comparison_context(|event| observe(Some(event), true))
+            .is_ok();
+        observe(None, context_complete);
         let archive_complete = if infer && self.archive.is_some() {
-            self.scan_numeric(&mut observe).is_ok()
+            self.scan_numeric(|event| observe(Some(event), true))
+                .is_ok()
         } else {
             for observation in &self.observations {
-                observe(observation);
+                observe(Some(observation), true);
             }
             true
-        };
+        } && context_complete;
         let mut estimate = replay.snapshot();
         estimate.rewrites = if archive_complete && !self.numeric_lost {
             rewrites
@@ -772,7 +894,7 @@ impl RequestEvidence {
                 initial_compactions: estimate.initial_compactions,
                 traditional_compactions: estimate.traditional_compactions,
                 summary_cost: estimate.summary_cost,
-                quantity_assumptions: "native_total_input;known_retention_else_max_visible_and_billed_output_proxy_for_reasoning_or_native_summary;missing_restoration_uses_last_known_or_zero_at_tracking_start;downward_canonical_rebase_holds_prior_quantity_with_zero_unknown_append;recognition_and_settings_changes_cool_cache_not_retired_history;same_outputs_and_tool_sequence;not_native_quantity_or_removal_authority",
+                quantity_assumptions: "native_total_input;known_retention_else_max_visible_and_billed_output_proxy_for_reasoning_or_native_summary;missing_restoration_uses_last_known_or_zero_at_tracking_start;downward_canonical_rebase_holds_prior_quantity_with_zero_unknown_append;recognition_and_settings_changes_cool_cache_not_retired_history;same_outputs_and_tool_sequence;not_native_quantity_or_removal_authority".into(),
             });
         }
         if let Some(prefix) = prefix {

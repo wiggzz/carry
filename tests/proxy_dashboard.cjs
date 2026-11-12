@@ -55,9 +55,28 @@ const total = (carry, traditional, savings, percent, included, excluded = 0, fai
 let data = { sessions: [session(1, 2), session(3, 4)], unavailable_sessions: 0,
   cost_estimate: total(4, 6, 2, 100 / 3, 2),
   cost_scenario: {context_window: 272000, reserve: 16384, keep_recent: 20000, summary: 1000} };
+// Existing single-page scenarios supply complete synthetic populations. Keep
+// those fixture facts explicit at the new producer boundary; the independent
+// population scenario below supplies totals that deliberately differ from rows.
+const fixtureLane = ledgers => {
+  const result = {};
+  for (const key of ['calls','input_tokens','output_tokens','cached_tokens',
+    'cache_write_tokens','unavailable_cost_calls','cost_usd']) {
+    if (ledgers.some(l => typeof l[key] === 'number'))
+      result[key] = ledgers.reduce((n,l) => n+(l[key]||0),0);
+  }
+  result.cache_observation = {};
+  for (const key of ['calls','input_tokens','cached_tokens'])
+    result.cache_observation[key] = ledgers.reduce((n,l) => n+(l.cache_observation?.[key]||0),0);
+  return result;
+};
 const sandbox = {
   document, location: {hash: ''}, history: {}, URLSearchParams,
-  fetch: async () => ({ok: true, json: async () => data}), setInterval() {},
+  fetch: async () => ({ok: true, json: async () => ({...data, usage:data.usage||{
+    primary:fixtureLane(data.sessions.map(s=>s.primary||{})),
+    reviewer:fixtureLane(data.sessions.map(s=>s.shadow||{})),
+    unavailable_owners:data.unavailable_sessions||0,
+  }})}), setInterval() {},
 };
 vm.createContext(sandbox);
 const html = fs.readFileSync(process.env.CARRY_DASHBOARD_HTML_FIXTURE || 'src/proxy_dashboard.html', 'utf8');
@@ -123,7 +142,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.ok(details && !details.open, 'technical detail is available but initially collapsed');
   const context = byClass(root,'context-overview');
   assert.ok(context, 'source state breakdown stays outside technical details');
-  for(const phrase of ['145 removed','12 removable','24 protected','19 unreviewed','4 memories']) {
+  for(const phrase of ['145 removed','12 removable','24 protected','19 unclassified','4 memories']) {
     assert.ok(text(context).includes(phrase), 'context overview includes '+phrase);
   }
   assert.ok(!walk(details).includes(context));
@@ -144,8 +163,14 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     'removed history is not represented by a broken or scaled segment');
   assert.ok(!/not to scale/i.test(text(context)),'no scale disclaimer is needed for a count badge');
   assert.match(bar.getAttribute('aria-label'),/current context/i);
+  assert.match(bar.getAttribute('aria-label'),/19 unclassified/,
+    'accessible counts describe residual classification, not review exposure');
+  assert.ok(!/unreviewed/i.test(text(context)+' '+bar.getAttribute('aria-label')),
+    'a residual source-item count cannot establish that items were never reviewed');
   const legendKeys = walk(context).filter(n => n.className === 'context-key');
   assert.equal(legendKeys.length,3,'every current-context state has a color legend');
+  assert.match(legendKeys[2].title,/not marked removable or protected/i,
+    'residual tooltip explains classification without inventing review history');
   for (const [index,state] of ['removable','protected','unreviewed'].entries()) {
     assert.equal(legendKeys[index].getAttribute('data-state-label'),state);
     assert.equal(bar.children[index].getAttribute('data-state'),state);
@@ -335,7 +360,6 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.cost_estimate={...data.cost_estimate,matched_primary_responses:3,
     quantity_evidence:{...recent.cost_estimate.quantity_evidence,total_primary_responses:5}};
   for(const root of elements.values())for(const n of walk(root))if(n.tagName?.toLowerCase()==='details')n.open=false;
-  vm.runInContext('expandedDiagnostics.clear()',sandbox);
   await refresh();
   for(const root of [byClass(recentRow,'session-savings'),elements.get('cards').children[1]]) {
     assert.match(visibleText(root),/Matched subtotal · not whole session/,'scope must be next to the visible percentage, not in closed details');
@@ -397,6 +421,119 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   data.cost_estimate.whole_window=null;
   await refresh();
   assert.equal(cards().get('Estimated savings'),'—','unknown actual costs must not fall back to a narrower comparison');
+  // Page rows are not the all-attempt population. Use intentionally unequal
+  // sentinels, then an empty raw page with the same retained numeric history.
+  data.usage={
+    primary:{calls:31,input_tokens:12345,output_tokens:67,cost_usd:11,
+      unavailable_cost_calls:0,cache_observation:{calls:31,input_tokens:12345,cached_tokens:2469}},
+    reviewer:{calls:9,input_tokens:321,output_tokens:12,cost_usd:2,
+      unavailable_cost_calls:1,cache_observation:{calls:0,input_tokens:0,cached_tokens:0}},
+  };
+  for(const rows of [[recent],[]]){
+    data.sessions=rows;
+    await refresh();
+    assert.equal(cards().get('Priced subtotal'),'$13.000000',
+      'all-attempt known money cannot be recomputed from the selected raw page');
+    assert.match(elements.get('observed-cost-summary').textContent,/1 unpriced call/);
+    assert.match(text(elements.get('usage-strip')),/31 primary calls/);
+    assert.match(text(elements.get('usage-strip')),/9 reviewer calls/);
+    const lanes=elements.get('usage').children;
+    assert.equal(lanes[0].children[1].textContent,'31');
+    assert.equal(lanes[0].children[2].textContent,'12,345');
+    assert.equal(lanes[0].children[3].textContent,'2,469 (provider-reported)');
+    assert.equal(lanes[0].children[4].textContent,'20.0%');
+    assert.equal(lanes[1].children[1].textContent,'9');
+    assert.equal(lanes[1].children[8].textContent,'1');
+  }
+  const previousFetch=sandbox.fetch, pageRequests=[];
+  const cursor='f'.repeat(64), later={...recent,id:'later-page-owner'};
+  sandbox.fetch=async(url,options)=>{
+    pageRequests.push([url,options]);
+    const after=new URL(url,'http://localhost').searchParams.get('after_id');
+    return {ok:true,json:async()=>({...data,sessions:after?[later]:[recent],
+      session_page:{has_more:!after,next_after:after?null:cursor}})};
+  };
+  await refresh();
+  const nextPage=document.getElementById('next-sessions'), firstPage=document.getElementById('first-sessions');
+  assert.ok(nextPage&&firstPage,'session keyset pages have visible navigation controls');
+  assert.equal(nextPage.disabled,false);
+  assert.equal(firstPage.disabled,true);
+  const firstDetail=document.getElementById('disclosure:session:'+recent.id);
+  firstDetail.open=true;
+  for(const handler of firstDetail.listeners.toggle||[])await handler();
+  await refresh();
+  assert.equal(document.getElementById('disclosure:session:'+recent.id),firstDetail);
+  assert.equal(firstDetail.open,true,'same-page polling retains the live disclosure node and state');
+  const click=async button=>{for(const handler of button.listeners.click||[])await handler();};
+  await click(nextPage);
+  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.get('after_id'),cursor);
+  assert.equal(pageRequests.at(-1)[1].cache,'no-store');
+  assert.equal(elements.get('sessions').children[0].id,'history:later-page-owner');
+  assert.equal(nextPage.disabled,true);
+  assert.equal(firstPage.disabled,false);
+  assert.equal(cards().get('Priced subtotal'),'$13.000000','page navigation cannot change population money');
+  await refresh();
+  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.get('after_id'),cursor,
+    'automatic refresh stays on the selected bounded page');
+  await click(firstPage);
+  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.has('after_id'),false);
+  assert.equal(elements.get('sessions').children[0].id,'history:'+recent.id);
+  const revisitedDetail=document.getElementById('disclosure:session:'+recent.id);
+  assert.notEqual(revisitedDetail,firstDetail,'navigation releases off-page detail nodes');
+  assert.equal(revisitedDetail.open,false,
+    'off-page disclosure state must not accumulate in a population-sized cache');
+  assert.equal(firstPage.disabled,true);
+  sandbox.fetch=previousFetch;
+  delete data.usage;
+  const monthInput=document.getElementById('accounting-month');
+  assert.ok(monthInput,'historical accounting must have a visible month selector');
+  const monthForm=document.getElementById('accounting-form');
+  const monthCards=document.getElementById('accounting-cards');
+  const monthStatus=document.getElementById('accounting-status');
+  monthInput.value='2026-02';
+  const monthRequests=[];
+  sandbox.fetch=async (url,options)=>{
+    monthRequests.push([url,options]);
+    return {ok:true,json:async()=>({window:{start_at:Date.UTC(2026,1,1)/1000-1,end_at:Date.UTC(2026,2,1)/1000-1,
+      retention_truncated:true,coverage:{observed_owners:12,included_owners:8,
+        missing_opening_owners:2,incompatible_owners:1,ambiguous_clock_owners:1},
+      usage:{primary:{calls:41,cost_usd:11,unavailable_cost_calls:3},
+        reviewer:{calls:7,cost_usd:2,unavailable_cost_calls:1},unavailable_owners:4},
+      comparison:{included_owners:5,unavailable_owners:7,primary_responses:19,
+        inferred_primary_responses:4,carry_cost:5,traditional_cost:7,savings:0.123,savings_percent:1.7}
+    }})};
+  };
+  const submitMonth=async()=>{for(const fn of monthForm.listeners.submit||[])await fn({preventDefault(){}})};
+  await submitMonth();
+  assert.equal(monthRequests.length,1);
+  const monthUrl=new URL(monthRequests[0][0],'http://localhost');
+  assert.equal(monthUrl.pathname,'/carry/dashboard/accounting');
+  assert.equal(Number(monthUrl.searchParams.get('start_at')),Date.UTC(2026,1,1)/1000-1);
+  assert.equal(Number(monthUrl.searchParams.get('end_at')),Date.UTC(2026,2,1)/1000-1);
+  assert.equal(monthRequests[0][1].cache,'no-store');
+  const historicalCards=new Map(monthCards.children.map(card=>card.children.slice(0,2).map(n=>n.textContent)));
+  assert.equal(historicalCards.get('Native priced subtotal'),'$13.000000');
+  assert.equal(historicalCards.get('Modeled Carry'),'$5.000000');
+  assert.equal(historicalCards.get('Modeled traditional'),'$7.000000');
+  assert.equal(historicalCards.get('Modeled savings'),'$0.123000 (1.7%)',
+    'month rendering trusts independent backend totals, never sums cumulative observations or current-page rows');
+  const shownMonth=text(monthStatus);
+  for(const expected of ['UTC','observation','8 / 12','5 included','7 unavailable','4 unpriced','retention','2 missing','1 incompatible','1 clock'])
+    assert.ok(shownMonth.toLowerCase().includes(expected.toLowerCase()),expected+': '+shownMonth);
+  sandbox.fetch=async()=>({ok:true,json:async()=>({window:{
+    start_at:Date.UTC(2026,1,1)/1000-1,end_at:Date.UTC(2026,2,1)/1000-1,
+    coverage:{observed_owners:1,included_owners:0,missing_opening_owners:1,incompatible_owners:0,ambiguous_clock_owners:0},
+    usage:{primary:{calls:0,cost_usd:0},reviewer:{calls:0,cost_usd:0},unavailable_owners:1},
+    comparison:{included_owners:0,unavailable_owners:1,primary_responses:0,inferred_primary_responses:0,carry_cost:null,traditional_cost:null,savings:null,savings_percent:null}
+  }})});
+  await submitMonth();
+  assert.ok(monthCards.children.every(card=>card.children[1].textContent==='—'),
+    'missing openings and unavailable modeled comparisons must not become displayed zero money');
+  sandbox.fetch=async()=>({ok:false,status:507});
+  monthInput.value='2026-03';await submitMonth();
+  assert.equal(monthCards.children.length,0,'a failed historical query must not relabel prior month money');
+  assert.ok(text(monthStatus).includes('507'));
+  sandbox.fetch=previousFetch;
   if(process.env.CARRY_DASHBOARD_STATS_FIXTURE){
     data=JSON.parse(fs.readFileSync(process.env.CARRY_DASHBOARD_STATS_FIXTURE,'utf8'));
     await refresh();
@@ -411,9 +548,9 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.equal(cards().get('With Carry'),amount(head?.carry_cost));
     assert.equal(cards().get('Traditional'),amount(head?.traditional_cost));
     if(head) assert.equal(cards().get('Estimated savings'),amount(head.savings)+(head.savings_percent==null?'':` (${Number(head.savings_percent).toFixed(1)}%)`));
-    const native=data.sessions.flatMap(s=>[s.primary,s.shadow]);
+    const native=data.usage?[data.usage.primary,data.usage.reviewer]:data.sessions.flatMap(s=>[s.primary,s.shadow]);
     const cost=native.some(l=>l.cost_usd!=null)?native.reduce((n,l)=>n+(l.cost_usd||0),0):null;
-    const missing=native.some(l=>l.unavailable_cost_calls)||data.unavailable_sessions;
+    const missing=native.some(l=>l.unavailable_cost_calls)||(data.usage?data.usage.unavailable_owners:data.unavailable_sessions);
     assert.equal(cards().get(missing?'Priced subtotal':'Observed cost'),amount(cost));
     assert.equal(walk(elements.get('sessions')).filter(n=>n.className==='session').length+
       walk(elements.get('background-sessions')).filter(n=>n.className==='session').length,data.sessions.length);

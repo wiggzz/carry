@@ -20,7 +20,8 @@ async function measurementContract() {
       selection_joint:{keep:3,compact:3,savings:0}},
       {candidate_id:'smaller',action:'projection',primary_retained_estimated_tokens:700,
       selection_joint:{keep:3,compact:2,savings:1}}]};
-  data={sessions:[s],unavailable_sessions:0,auth:'codex',cost_estimate:total(9,12,3,25,1,4)};
+  data={sessions:[s],unavailable_sessions:0,auth:'codex',cost_estimate:total(9,12,3,25,1,4),
+    usage:{primary:fixtureLane([s.primary]),reviewer:fixtureLane([s.shadow]),unavailable_owners:0}};
   const statsRequests=[];
   sandbox.fetch=async(url,options)=>{
     statsRequests.push([url,options]);return {ok:true,json:async()=>data};

@@ -44,7 +44,7 @@ use evidence::PrimaryFacts;
 pub use evidence::RequestEvidence;
 #[cfg(test)]
 use evidence::RequestEvidence as Trajectory;
-pub(crate) use evidence::{HistoricalSuccessSeed, SuccessWindow};
+pub(crate) use evidence::{ComparisonContext, HistoricalSuccessSeed, SuccessWindow};
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Coverage {
@@ -164,7 +164,7 @@ pub struct Estimate {
 /// ratio or a persistent simulator. Missing opaque retention uses billed output
 /// as an explicitly estimated proxy; missing restoration carries the last known
 /// projection. These assumptions never grant strict quantity/removal authority.
-#[derive(Clone, Default, Debug, Serialize)]
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct ChronologicalEstimate {
     traditional_cost: f64,
     primary_responses: u64,
@@ -173,12 +173,12 @@ pub struct ChronologicalEstimate {
     initial_compactions: u64,
     traditional_compactions: u64,
     summary_cost: f64,
-    quantity_assumptions: &'static str,
+    quantity_assumptions: String,
 }
 
 /// Derived full-window view. Never persisted as paid money
 /// or inserted into the native quantity/block evidence.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WholeWindowEstimate {
     carry_cost: f64,
     traditional_cost: f64,
@@ -187,18 +187,16 @@ pub struct WholeWindowEstimate {
     primary_responses: u64,
     inferred_primary_responses: u64,
     inferred_traditional_cost: f64,
-    assumption: &'static str,
+    assumption: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     trajectory: Option<ChronologicalEstimate>,
 }
 
 /// Public strict-evidence projection, plus the full-window headline estimate.
 /// Strict matched subtotals remain diagnostics and are never relabeled whole.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DashboardEstimate {
     whole_window: Option<WholeWindowEstimate>,
-    #[serde(skip)]
-    whole_window_incomplete: bool,
     quantity_evidence: Value,
     legacy_quantity_segment: Option<CachePolicySegment>,
     cache_initializations: crate::proxy_cache::CacheInitializations,
@@ -215,7 +213,7 @@ pub struct DashboardEstimate {
     observed_reviewer_cost: Option<f64>,
     unavailable_primary_cost_calls: u64,
     unavailable_reviewer_cost_calls: u64,
-    counterfactual_basis: &'static str,
+    counterfactual_basis: String,
     carry_cost: Option<f64>,
     traditional_cost: Option<f64>,
     reviewer_cost: Option<f64>,
@@ -227,6 +225,15 @@ pub struct DashboardEstimate {
     excluded_unpriced_calls: u64,
     excluded_unpriced_reviewer_calls: u64,
     coverage: Coverage,
+}
+
+impl DashboardEstimate {
+    fn whole_window_incomplete(&self) -> bool {
+        self.whole_window.is_none()
+            && (self.coverage.primary_responses > 0
+                || self.coverage.reviewer_responses > 0
+                || self.coverage.prior_untracked_calls > 0)
+    }
 }
 
 impl Estimate {
@@ -287,7 +294,7 @@ impl Estimate {
                     "chronological_native_inputs_with_explicit_quantity_and_same_owner_continuity_estimates"
                 } else {
                     "continuous_receipt_trajectory"
-                },
+                }.into(),
                 trajectory: Some(trajectory.clone()),
             });
         }
@@ -317,7 +324,8 @@ impl Estimate {
             inferred_primary_responses: 0,
             inferred_traditional_cost: 0.0,
             trajectory: None,
-            assumption: "complete_strict_receipt_window_without_chronological_reconstruction",
+            assumption: "complete_strict_receipt_window_without_chronological_reconstruction"
+                .into(),
         })
     }
 
@@ -346,13 +354,8 @@ impl Estimate {
             quantity_evidence["numeric_archive_unavailable"] = json!(true);
         }
         let whole_window = self.whole_window();
-        let whole_window_incomplete = whole_window.is_none()
-            && (self.coverage.primary_responses > 0
-                || self.coverage.reviewer_responses > 0
-                || self.coverage.prior_untracked_calls > 0);
         DashboardEstimate {
             whole_window,
-            whole_window_incomplete,
             quantity_evidence,
             legacy_quantity_segment: self.legacy_quantity_segment,
             cache_initializations: self.cache_initializations,
@@ -379,7 +382,8 @@ impl Estimate {
                 }
             } else {
                 "legacy_local_json_projection"
-            },
+            }
+            .into(),
             accounting_basis: self.accounting_basis,
             matched_primary_responses: self.matched_primary_responses,
             unavailable_primary_cost_calls: self.unavailable_primary_cost_calls,
@@ -485,6 +489,9 @@ enum WholeWindowScope {
 }
 
 impl DashboardTotals {
+    pub fn observe_activity(&mut self, in_flight: bool) {
+        self.in_flight_sessions += u64::from(in_flight);
+    }
     pub fn unavailable_whole_windows(&mut self, count: u64) {
         self.whole_window_unavailable_sessions += count;
     }
@@ -493,7 +500,7 @@ impl DashboardTotals {
         // Sum complete session windows only, with explicit included/excluded
         // coverage. Neither strict partial sums nor all-attempt observed spend
         // may fill an unavailable peer or enter this comparison denominator.
-        if estimate.whole_window_incomplete {
+        if estimate.whole_window_incomplete() {
             self.unavailable_whole_windows(1);
         } else if let Some(window) = &estimate.whole_window {
             self.whole_window_included_sessions += 1;
@@ -518,7 +525,7 @@ impl DashboardTotals {
                     }
                     _ => total.trajectory = None,
                 }
-                total.assumption = "sum_of_session_whole_window_point_estimates";
+                total.assumption = "sum_of_session_whole_window_point_estimates".into();
             } else {
                 self.whole_window = Some(window.clone());
             }
@@ -595,6 +602,8 @@ struct Replay {
     #[serde(skip)]
     inferred_continuity: bool,
     priced_primary_responses: u64,
+    #[serde(skip)]
+    ancestor_primary_history: bool,
 }
 /// A terminal observation with money already settled under dispatch-frozen
 /// tariffs. Comparison may forecast another history, never reprice this one.
@@ -638,10 +647,27 @@ impl Default for Replay {
             chronological: false,
             inferred_continuity: false,
             priced_primary_responses: 0,
+            ancestor_primary_history: false,
         }
     }
 }
 impl Replay {
+    /// Keep replayed context/cursors while opening this owner's paid window.
+    /// These values are transient replay state, never another persisted ledger.
+    fn begin_owned_window(&mut self, complete: bool) {
+        self.ancestor_primary_history = self.ancestor_primary_history
+            || self.result.coverage.primary_responses > 0
+            || self.result.coverage.prior_untracked_calls > 0
+            || !complete;
+        self.result = Self::default().result;
+        self.priced_primary_responses = 0;
+        self.available &= complete;
+        if !complete {
+            self.projection_known = false;
+            self.receipts.invalidate();
+        }
+    }
+
     pub fn snapshot(&self) -> Estimate {
         let mut estimate = self.result.clone();
         estimate.initialization_policy =
@@ -1517,7 +1543,7 @@ mod whole_window_tests {
         let absent: Estimate = serde_json::from_value(absent).unwrap();
         let missing = absent.dashboard(false);
         assert!(missing.whole_window.is_none());
-        assert!(missing.whole_window_incomplete);
+        assert!(missing.whole_window_incomplete());
         let old = known.dashboard(false);
         let mut total = DashboardTotals::default();
         total.observe(&Estimate::default().dashboard(false));

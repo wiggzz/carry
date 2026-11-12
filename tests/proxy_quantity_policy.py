@@ -4,6 +4,7 @@ All traces, receipts and state are synthetic and private; no provider calls.
 Native request totals and local prompt estimates intentionally remain distinct.
 """
 import copy
+from history_store import read_index, write_index
 import json
 import os
 import subprocess
@@ -82,7 +83,7 @@ class QuantityPolicy(unittest.TestCase):
                                        extra_env={'CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS': '1000000'})
                     self.harness.stack.callback(proxy.close)
                     for name, saved in previous_files.items():
-                        self.assertEqual(json.loads((state / name).read_text()), saved,
+                        self.assertEqual(read_index(state / name), saved,
                                          'restart must not mutate settled quantities or money')
                     self.assertEqual(proxy.send(**{'input_items': body['input']},
                                                 **{k: v for k, v in body.items() if k != 'input'})[0], 200)
@@ -90,7 +91,7 @@ class QuantityPolicy(unittest.TestCase):
                     self.assertEqual(len(stats['sessions']), 1)
                     estimates.append(copy.deepcopy(stats['sessions'][0]['cost_estimate']))
                     proxy.close()
-                    indexed = json.loads((state / 'history.index').read_text())
+                    indexed = read_index(state / 'history.index')
                     refs = [ref for ref in indexed['transcripts'].values()
                             if ref['external_id'] == f'quantity-{kind}-{index + 1}']
                     self.assertEqual(len(refs), 1)
