@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.2](https://github.com/wiggzz/carry/compare/v0.21.1...v0.21.2) (2026-11-12)
+
+
+### Bug Fixes
+
+* retain session history and preserve branch accounting continuity ([#225](https://github.com/wiggzz/carry/issues/225)) ([45c07dd](https://github.com/wiggzz/carry/commit/45c07dde5fe3677341623ab776d2f29d83d2a0b3))
+
 ## [0.21.1](https://github.com/wiggzz/carry/compare/v0.21.0...v0.21.1) (2026-11-05)
 
 
