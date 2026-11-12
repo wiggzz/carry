@@ -202,228 +202,7 @@ pub(super) fn initialize(service: &Service, pins: HashSet<String>) -> std::io::R
     if !path.exists() {
         return Ok(());
     }
-    match Store::open(service,pins.clone(),false) {
-        Ok(_)=>Ok(()),
-        Err(e) if e.get_ref().and_then(|e|e.downcast_ref::<rusqlite::Error>()).is_some_and(|e|matches!(e,rusqlite::Error::SqliteFailure(code,_) if code.code==rusqlite::ErrorCode::NotADatabase))=>import_v4(service,pins),
-        Err(e)=>Err(e),
-    }
-}
-fn import_v4(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
-    use std::io::Read;
-    let path = service.config.state_dir.join("history.index");
-    let mut bytes = Vec::new();
-    File::open(&path)?
-        .take(service.config.history_max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > service.config.history_max_bytes as usize {
-        return Err(full());
-    }
-    let invalid = || {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unsupported or invalid predecessor history",
-        )
-    };
-    let index: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    if index["format"] != "carry-prefix-history-v4" {
-        return Err(invalid());
-    }
-    let index = validate_predecessor(&index).map_err(|_| invalid())?;
-    let temporary = service.config.state_dir.join(".history-import.tmp");
-    if std::fs::symlink_metadata(&temporary).is_ok_and(|m| !m.is_file()) {
-        return Err(invalid());
-    }
-    struct Cleanup(PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-            }
-        }
-    }
-    let _cleanup = Cleanup(temporary.clone());
-    if temporary.exists() {
-        std::fs::remove_file(&temporary)?;
-    }
-    let store = Store::open_path(&Policy::new(&service.config), pins, true, &temporary)?;
-    store.begin()?;
-    let at = index["tips"]
-        .as_object()
-        .unwrap()
-        .values()
-        .chain(index["reviews"].as_object().unwrap().values())
-        .chain(index["transcripts"].as_object().unwrap().values())
-        .filter_map(|v| v["at"].as_u64())
-        .max()
-        .unwrap_or(0);
-    for kind in ["nodes", "tips", "reviews", "transcripts", "snapshots"] {
-        for (key, value) in index[kind].as_object().unwrap() {
-            let owner = if kind == "snapshots" {
-                key.as_str()
-            } else {
-                value["session"].as_str().unwrap_or("")
-            };
-            let age = if kind == "snapshots" {
-                index["tips"]
-                    .as_object()
-                    .unwrap()
-                    .values()
-                    .filter(|v| v["session"] == *key)
-                    .filter_map(|v| v["at"].as_u64())
-                    .max()
-                    .ok_or_else(invalid)?
-            } else {
-                value["at"].as_u64().unwrap_or(at)
-            };
-            store.put(kind, key, value, age, owner)?;
-            if kind == "snapshots" {
-                let session: Session =
-                    serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-                // Decode drops the runtime validation flag. Rebind the same
-                // successful-window authority as normal load before observing
-                // any historical money or coverage in the replacement store.
-                let session =
-                    recover_success_prefix(service, key, session).map_err(|_| invalid())?;
-                store.put(
-                    "owners",
-                    key,
-                    &json!({"shared":session.history_shared}),
-                    age,
-                    key,
-                )?;
-                store.account(key, &session)?;
-            }
-        }
-    }
-    store.put(
-        "upstream_cache",
-        "current",
-        &index["upstream_cache"],
-        at,
-        "",
-    )?;
-    store.commit()?;
-    drop(store);
-    File::open(&temporary)?.sync_all()?;
-    std::fs::rename(&temporary, &path)?;
-    File::open(&service.config.state_dir)?.sync_all()
-}
-// The bounded predecessor generation is validated as a graph before any staging
-// database is created. A successful rename must never replace readable JSON by
-// rows that the new reader cannot decode or whose ancestry is incomplete.
-fn validate_predecessor(value: &Value) -> Result<Value, ()> {
-    #[derive(serde::Deserialize, serde::Serialize)]
-    #[serde(deny_unknown_fields)]
-    struct Node {
-        parent: String,
-        value: Value,
-    }
-    #[derive(serde::Deserialize, serde::Serialize)]
-    #[serde(deny_unknown_fields)]
-    struct Predecessor {
-        #[serde(rename = "format")]
-        _format: String,
-        nodes: BTreeMap<String, Node>,
-        tips: BTreeMap<String, Reference>,
-        reviews: BTreeMap<String, semantic::Record>,
-        #[serde(default)]
-        transcripts: BTreeMap<String, Transcript>,
-        #[serde(default)]
-        snapshots: BTreeMap<String, Session>,
-        #[serde(rename = "upstream_cache")]
-        _cache: Vec<CacheEvidence>,
-    }
-    let index: Predecessor = serde_json::from_value(value.clone()).map_err(|_| ())?;
-    let mut roots: HashMap<String, (String, usize)> = HashMap::new();
-    for (key, node) in &index.nodes {
-        if *key != super::hash(&(&node.parent, &node.value)) {
-            return Err(());
-        }
-    }
-    // Memoize each ancestry once. Migration is bounded by predecessor bytes,
-    // rather than repeatedly walking every shared prefix of every record.
-    for key in index.nodes.keys() {
-        let mut cursor = key.as_str();
-        let mut trail = Vec::new();
-        let mut seen = HashSet::new();
-        while !roots.contains_key(cursor) {
-            let Some(node) = index.nodes.get(cursor) else {
-                break;
-            };
-            if !seen.insert(cursor) {
-                return Err(());
-            }
-            trail.push(cursor);
-            cursor = &node.parent;
-        }
-        let (root, mut depth) = roots.get(cursor).cloned().unwrap_or((cursor.to_owned(), 0));
-        if root.len() == 64 && root.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(());
-        }
-        for key in trail.into_iter().rev() {
-            depth += 1;
-            roots.insert(key.to_owned(), (root.clone(), depth));
-        }
-    }
-    let extent = |key: &str, namespace: &str| -> Result<usize, ()> {
-        if key == namespace {
-            return Ok(0);
-        }
-        let (root, depth) = roots.get(key).ok_or(())?;
-        if root != namespace {
-            return Err(());
-        }
-        Ok(*depth)
-    };
-    for (key, reference) in &index.tips {
-        if reference.session.is_empty() || reference.namespace.is_empty() {
-            return Err(());
-        }
-        extent(key, &reference.namespace)?;
-    }
-    for (key, reference) in &index.transcripts {
-        if reference.session.is_empty() || reference.external_id.is_empty() {
-            return Err(());
-        }
-        extent(&reference.frontier, &reference.namespace)?;
-        if !["response", "conversation"]
-            .into_iter()
-            .any(|kind| *key == super::hash(&(&reference.namespace, kind, &reference.external_id)))
-        {
-            return Err(());
-        }
-    }
-    for (key, record) in &index.reviews {
-        let depth = roots.get(key).map(|(_, depth)| *depth).unwrap_or(0);
-        if depth != record.len
-            || (depth == 0 && key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            return Err(());
-        }
-    }
-    for (id, snapshot) in &index.snapshots {
-        let namespace = snapshot.history_namespace.as_deref().ok_or(())?;
-        if !snapshot.history_shared
-            || !matches!(snapshot.version, 0 | 3)
-            || !index
-                .tips
-                .values()
-                .any(|r| r.session == *id && r.namespace == namespace)
-        {
-            return Err(());
-        }
-        let depth = extent(
-            snapshot.history_frontier.as_deref().unwrap_or(namespace),
-            namespace,
-        )?;
-        if depth != snapshot.history.len() {
-            return Err(());
-        }
-    }
-    // Import exactly the validated typed representation, including its serde
-    // defaults. Reading the original Value after accepting omitted maps gives
-    // validation and publication different schemas and can panic mid-import.
-    serde_json::to_value(index).map_err(|_| ())
+    Store::open(service, pins, false).map(|_| ())
 }
 
 impl Store {
@@ -496,14 +275,7 @@ impl Store {
         pins: HashSet<String>,
         write: bool,
     ) -> std::io::Result<Self> {
-        Self::open_path(policy, pins, write, &policy.directory.join("history.index"))
-    }
-    fn open_path(
-        policy: &Policy,
-        pins: HashSet<String>,
-        write: bool,
-        path: &Path,
-    ) -> std::io::Result<Self> {
+        let path = &policy.directory.join("history.index");
         let exists = match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => true,
             Ok(_) => {
@@ -516,8 +288,7 @@ impl Store {
         };
         if !exists && write {
             // The first connection also writes authority: reserve its complete
-            // bounded main/WAL/SHM extent before even creating a target. Import
-            // staging uses this same path and cannot borrow paid promises.
+            // bounded main/WAL/SHM extent before even creating a target.
             admit_extent(
                 &policy.directory,
                 policy.disk_limit,
@@ -1219,66 +990,11 @@ mod initialization_admission_tests {
 
     #[test]
     fn fresh_schema_refuses_before_crossing_physical_capacity() {
-        schema_capacity_control(false);
-    }
-
-    #[test]
-    fn import_staging_schema_refuses_before_crossing_physical_capacity() {
-        schema_capacity_control(true);
-    }
-
-    #[test]
-    fn admitted_schema_reopens_without_rewriting_authority() {
-        for staging in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut policy = Policy::fixture(directory.path());
-            policy.max_record = 8192;
-            policy.disk_limit = 2 * 1024 * 1024;
-            let path = directory.path().join(if staging {
-                ".history-import.tmp"
-            } else {
-                "history.index"
-            });
-            let store = Store::open_path(&policy, HashSet::new(), true, &path).unwrap();
-            let pages: u64 = store
-                .connection
-                .pragma_query_value(None, "page_count", |row| row.get(0))
-                .unwrap();
-            assert!(pages <= 16);
-            let configured_pages: u64 = store
-                .connection
-                .pragma_query_value(None, "max_page_count", |row| row.get(0))
-                .unwrap();
-            assert_eq!(configured_pages, policy.disk_limit / 4096);
-            assert!(disk_bytes(directory.path(), 0).unwrap() <= write_charge(16 * 4096));
-            assert!(store.get::<Value>("snapshots", "absent").unwrap().is_none());
-            drop(store);
-            let frozen = std::fs::read(&path).unwrap();
-            let reopened = Store::open_path(&policy, HashSet::new(), false, &path).unwrap();
-            assert!(
-                reopened
-                    .get::<Value>("snapshots", "absent")
-                    .unwrap()
-                    .is_none()
-            );
-            drop(reopened);
-            assert_eq!(std::fs::read(&path).unwrap(), frozen);
-        }
-    }
-
-    fn schema_capacity_control(staging: bool) {
         let directory = tempfile::tempdir().unwrap();
         let mut policy = Policy::fixture(directory.path());
         policy.max_record = 8192;
         policy.disk_limit = 2 * 1024 * 1024;
-        let original = directory.path().join("history.index");
-        let predecessor = b"preserved predecessor bytes; schema-initialization seam only";
-        let path = if staging {
-            std::fs::write(&original, predecessor).unwrap();
-            directory.path().join(".history-import.tmp")
-        } else {
-            original.clone()
-        };
+        let path = directory.path().join("history.index");
         let occupied = disk_bytes(directory.path(), 0).unwrap();
         File::create(directory.path().join("unrelated-retained-evidence"))
             .unwrap()
@@ -1286,19 +1002,48 @@ mod initialization_admission_tests {
             .unwrap();
         let before = disk_bytes(directory.path(), 0).unwrap();
         assert_eq!(before, policy.disk_limit - 4096);
-        // Keep a successful connection open while observing WAL/SHM, rather
-        // than missing initialization's peak after its final close.
-        let opened = Store::open_path(&policy, HashSet::new(), true, &path);
+        // Observe the connected WAL/SHM footprint, not only the closed store.
+        let opened = Store::open_policy(&policy, HashSet::new(), true);
         let connected_bytes = disk_bytes(directory.path(), 0).unwrap();
-        if staging {
-            assert_eq!(std::fs::read(&original).unwrap(), predecessor);
-        }
         assert!(
             opened.is_err() && connected_bytes <= policy.disk_limit,
-            "schema creation must refuse before physical capacity: staging={staging} before={before} connected={connected_bytes} cap={} opened={}",
+            "schema creation must refuse before physical capacity: before={before} connected={connected_bytes} cap={} opened={}",
             policy.disk_limit,
             opened.is_ok()
         );
         assert!(!path.exists(), "refused schema must not publish authority");
+    }
+
+    #[test]
+    fn admitted_schema_reopens_without_rewriting_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut policy = Policy::fixture(directory.path());
+        policy.max_record = 8192;
+        policy.disk_limit = 2 * 1024 * 1024;
+        let path = directory.path().join("history.index");
+        let store = Store::open_policy(&policy, HashSet::new(), true).unwrap();
+        let pages: u64 = store
+            .connection
+            .pragma_query_value(None, "page_count", |row| row.get(0))
+            .unwrap();
+        assert!(pages <= 16);
+        let configured_pages: u64 = store
+            .connection
+            .pragma_query_value(None, "max_page_count", |row| row.get(0))
+            .unwrap();
+        assert_eq!(configured_pages, policy.disk_limit / 4096);
+        assert!(disk_bytes(directory.path(), 0).unwrap() <= write_charge(16 * 4096));
+        assert!(store.get::<Value>("snapshots", "absent").unwrap().is_none());
+        drop(store);
+        let frozen = std::fs::read(&path).unwrap();
+        let reopened = Store::open_policy(&policy, HashSet::new(), false).unwrap();
+        assert!(
+            reopened
+                .get::<Value>("snapshots", "absent")
+                .unwrap()
+                .is_none()
+        );
+        drop(reopened);
+        assert_eq!(std::fs::read(&path).unwrap(), frozen);
     }
 }

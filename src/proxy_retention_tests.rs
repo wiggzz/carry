@@ -251,81 +251,20 @@ fn retention_invalid_predecessor_record_types_preserve_original_authority() {
 }
 
 #[test]
-fn retention_predecessor_defaulted_maps_import_in_isolated_processes() {
-    let mut failures = Vec::new();
-    for mode in ["explicit", "no-transcripts", "no-snapshots", "neither"] {
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "proxy::tests::retention_predecessor_defaulted_maps_child",
-                "--nocapture",
-            ])
-            .env("CARRY_TEST_PREDECESSOR_DEFAULTS", mode)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut timed_out = false;
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() >= deadline {
-                timed_out = true;
-                child.kill().unwrap();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+fn retention_json_history_with_omitted_maps_preserves_original_authority() {
+    for maps in [vec!["transcripts"], vec!["snapshots"], vec!["transcripts", "snapshots"]] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.index");
+        let mut index = json!({"format":"carry-prefix-history-v4", "nodes":{}, "tips":{}, "reviews":{}, "transcripts":{}, "snapshots":{}, "upstream_cache":[]});
+        for key in maps {
+            index.as_object_mut().unwrap().remove(key);
         }
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("predecessor-defaults: fixture ready"),
-            "{mode} fixture setup failed: {output:?}"
-        );
-        if timed_out || !output.status.success() {
-            failures.push(format!("{mode}: timed_out={timed_out}, {output:?}"));
-        }
+        let original = serde_json::to_vec(&index).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let service = checkpoint_service(directory.path());
+        assert!(history::initialize(&service).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
-    assert!(
-        failures.is_empty(),
-        "valid predecessor optional-map defaults must import without panic: {failures:?}"
-    );
-}
-
-#[test]
-fn retention_predecessor_defaulted_maps_child() {
-    let Ok(mode) = std::env::var("CARRY_TEST_PREDECESSOR_DEFAULTS") else {
-        return;
-    };
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("history.index");
-    let mut index = json!({"format":"carry-prefix-history-v4", "nodes":{}, "tips":{}, "reviews":{}, "transcripts":{}, "snapshots":{}, "upstream_cache":[]});
-    if mode == "no-transcripts" || mode == "neither" {
-        index.as_object_mut().unwrap().remove("transcripts");
-    }
-    if mode == "no-snapshots" || mode == "neither" {
-        index.as_object_mut().unwrap().remove("snapshots");
-    }
-    std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
-    let service = checkpoint_service(directory.path());
-    eprintln!("predecessor-defaults: fixture ready");
-    history::initialize(&service).unwrap();
-    history::initialize(&service).unwrap();
-    let mut session = Session {
-        history_shared: true,
-        history_namespace: Some("defaulted-predecessor".into()),
-        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
-        ..Session::default()
-    };
-    session
-        .ingest(&[json!({"role":"user","content":"after migration"})])
-        .unwrap();
-    numeric_primary(&mut session, 0);
-    history::committed(&service, "defaulted-owner", &session, None).unwrap();
-    let restored = history::restore(&service, "defaulted-owner").unwrap();
-    assert_eq!(restored.render_primary(), session.render_primary());
-    assert_eq!(
-        serde_json::to_value(&restored.primary).unwrap(),
-        serde_json::to_value(&session.primary).unwrap()
-    );
 }
 
 #[test]
@@ -381,7 +320,7 @@ fn historical_retention_fixture(service: &Service, owner: &str, with_seed: bool)
 }
 
 #[test]
-fn retention_import_accounts_validated_historical_success_prefix() {
+fn retention_current_store_preserves_validated_historical_success_prefix() {
     let directory = tempfile::tempdir().unwrap();
     let service = checkpoint_service(directory.path());
     let owner = "b".repeat(64);
@@ -398,16 +337,21 @@ fn retention_import_accounts_validated_historical_success_prefix() {
     .unwrap();
     assert_eq!(expected["observed_primary_cost"], 0.002);
     save(&service, &owner, &session).unwrap();
-    let path = directory.path().join("history.index");
-    let predecessor = history::fixture::read_index(&path);
-    std::fs::write(&path, predecessor).unwrap();
+    let frozen = history::restore(&service, &owner).unwrap();
     std::fs::remove_file(directory.path().join("historical-success.seed")).unwrap();
     history::initialize(&service).unwrap();
+    history::initialize(&service).unwrap();
+    let restored = history::restore(&service, &owner).unwrap();
+    assert_eq!(restored.render_primary(), frozen.render_primary());
+    assert_eq!(
+        serde_json::to_value(&restored.primary).unwrap(),
+        serde_json::to_value(&frozen.primary).unwrap()
+    );
     let page = history::accounting(&service, 0, "", 100).unwrap();
     assert_eq!(page["records"].as_array().unwrap().len(), 1);
     assert_eq!(
         page["records"][0]["estimate"], expected,
-        "import must validate embedded historical proof before freezing the accounting observation"
+        "restart must retain the validated historical accounting observation"
     );
 }
 
@@ -508,7 +452,7 @@ fn retention_evidence_transition_adds_observation_without_rewriting_money() {
 }
 
 #[test]
-fn retention_predecessor_import_preserves_money_bindings_and_rejects_capacity_atomically() {
+fn retention_current_store_preserves_money_bindings_and_rejects_capacity_atomically() {
     at_decision_clock(&[5_000_000], || {
         let directory = tempfile::tempdir().unwrap();
         let mut service = checkpoint_service(directory.path());
@@ -537,18 +481,11 @@ fn retention_predecessor_import_preserves_money_bindings_and_rejects_capacity_at
         let frozen =
             serde_json::to_value(history::restore(&service, "predecessor-owner").unwrap()).unwrap();
         let path = directory.path().join("history.index");
-        // Frozen v4 wire shape: shared compact snapshots, exact-prefix nodes,
-        // external-ID bindings and original reference timestamps, no new tables.
-        let predecessor = history::fixture::read_index(&path);
-        std::fs::write(&path, &predecessor).unwrap();
+        let original = history::fixture::read_index(&path);
         service.config.history_disk_bytes = 65536;
-        let rejected = history::namespace(&service, &HeaderMap::new(), &body).unwrap_err();
-        assert_eq!(
-            rejected.0,
-            StatusCode::INSUFFICIENT_STORAGE,
-            "supported predecessor must reach atomic disk admission, not be discarded as unknown state"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), predecessor);
+        let rejected = history::committed(&service, "predecessor-owner", &loaded, None).unwrap_err();
+        assert_eq!(rejected.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(history::fixture::read_index(&path), original);
         service.config.history_disk_bytes = 8 * 1024 * 1024;
         for _ in 0..2 {
             assert_eq!(

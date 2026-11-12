@@ -113,9 +113,9 @@ admission rather than evicting unexpired evidence; HTTP507 is not a reset reques
 Maintenance collects expired history within its own bounded disk reserve.
 See `carry proxy --help` for supported ranges and environment names.
 
-Restart with the same state directory. A validated predecessor JSON index can be
-imported into the current store; unsupported/corrupt state fails closed, never
-becomes an empty history. These storage operations do not change gateway
+Restart with the same state directory. Only the current SQLite store is supported;
+predecessor JSON and corrupt state fail closed without replacing the original
+file or becoming an empty history. These storage operations do not change gateway
 authentication: content digests are not authorization. Scripted loopback tests
 establish only their exercised transport/storage behavior, not native-client UI
 fork acceptance or live-reviewer quality.
