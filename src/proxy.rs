@@ -4408,8 +4408,8 @@ async fn relay(
                 "stream_error"
             };
         }
-        let mut converted_value = observer.completed;
-        let sse_completed = converted_value.is_some();
+        let sse_completed = observer.completed();
+        let mut conversion_allowed = sse_completed;
         let observed = if is_sse {
             observer.observed
         } else {
@@ -4466,7 +4466,7 @@ async fn relay(
                     observed.as_ref(),
                     true,
                 );
-                let value = observed.unwrap();
+                let value = observed.as_ref().unwrap();
                 let model = commit.outbound["model"].as_str().unwrap_or("");
                 let resolved = commit
                     .service
@@ -4504,7 +4504,7 @@ async fn relay(
                         native_value["status"] = json!("completed");
                         &native_value
                     } else {
-                        &value
+                        value
                     };
                     trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
                         body: &commit.outbound,
@@ -4553,12 +4553,12 @@ async fn relay(
                     }
                     commit.candidate.completed_requests += 1;
                 }
-                let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
+                let _ = trace(&commit.service, &commit.id, "primary_completed", value);
                 if save_observed(
                     &commit.service,
                     &commit.id,
                     &commit.candidate,
-                    Some((&commit.observed_input, &value)),
+                    Some((&commit.observed_input, value)),
                 )
                 .is_err()
                 {
@@ -4576,7 +4576,7 @@ async fn relay(
                         "primary_checkpoint_failed",
                         &json!({"candidate_committed":false,"accounting_committed":accounting_committed}),
                     );
-                    converted_value = None;
+                    conversion_allowed = false;
                     let _ = sender
                         .send(Err(std::io::Error::other("proxy checkpoint failed")))
                         .await;
@@ -4667,8 +4667,8 @@ async fn relay(
             // Conversion still requires clean HTTP EOF: a timeout/transport
             // error is a 502 even after a terminal. Accounting above retains
             // the existing terminal-authoritative streaming commit policy.
-            let _ = converted.send(if complete_transport {
-                converted_value
+            let _ = converted.send(if complete_transport && conversion_allowed {
+                observed
             } else {
                 None
             });

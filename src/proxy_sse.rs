@@ -48,36 +48,45 @@ pub(super) fn safe_error(error: &Value) -> Value {
     Value::Object(safe)
 }
 
+#[derive(Default, PartialEq)]
+enum ObservationState {
+    #[default]
+    Pending,
+    Completed,
+    Failed,
+    Invalid,
+}
+
 /// Bounded observation only; the relay forwards the original bytes unchanged.
 #[derive(Default)]
 pub(super) struct Observer {
     pending: Vec<u8>,
     output_items: BTreeMap<u64, Value>,
     output_bytes: usize,
-    terminal: bool,
-    invalid: bool,
-    pub completed: Option<Value>,
+    state: ObservationState,
     pub observed: Option<Value>,
 }
 
 impl Observer {
+    pub fn completed(&self) -> bool {
+        self.state == ObservationState::Completed
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
-        if self.invalid {
+        if self.state == ObservationState::Invalid {
             return;
         }
         for byte in bytes {
             self.pending.push(*byte);
             if self.pending.len() > 4 * 1024 * 1024 {
-                self.invalid = true;
-                self.completed = None;
+                self.state = ObservationState::Invalid;
                 self.observed = None;
                 return;
             }
             if self.pending.ends_with(b"\n\n") || self.pending.ends_with(b"\r\n\r\n") {
                 let event = std::mem::take(&mut self.pending);
                 let Ok(text) = std::str::from_utf8(&event) else {
-                    self.invalid = true;
-                    self.completed = None;
+                    self.state = ObservationState::Invalid;
                     self.observed = None;
                     return;
                 };
@@ -91,15 +100,16 @@ impl Observer {
                     .join("\n");
                 if let Ok(value) = serde_json::from_str::<Value>(&data) {
                     match value["type"].as_str() {
-                        Some("response.output_item.done") if !self.terminal => {
+                        Some("response.output_item.done")
+                            if self.state == ObservationState::Pending =>
+                        {
                             if let Some(index) = value["output_index"].as_u64()
                                 && value["item"].is_object()
                             {
                                 self.output_bytes += data.len();
                                 if self.output_bytes > 4 * 1024 * 1024 {
-                                    self.invalid = true;
+                                    self.state = ObservationState::Invalid;
                                     self.output_items.clear();
-                                    self.completed = None;
                                     self.observed = None;
                                     return;
                                 }
@@ -107,9 +117,10 @@ impl Observer {
                             }
                         }
                         Some("response.completed")
-                            if !self.terminal && value["response"]["status"] == "completed" =>
+                            if self.state == ObservationState::Pending
+                                && value["response"]["status"] == "completed" =>
                         {
-                            self.terminal = true;
+                            self.state = ObservationState::Completed;
                             let mut response = value["response"].clone();
                             if response["output"].is_null()
                                 || response["output"].as_array().is_some_and(Vec::is_empty)
@@ -120,13 +131,12 @@ impl Observer {
                                         .collect(),
                                 );
                             }
-                            self.completed = Some(response.clone());
                             self.observed = Some(response);
                         }
                         Some("response.failed" | "response.incomplete" | "error")
-                            if !self.terminal =>
+                            if self.state == ObservationState::Pending =>
                         {
-                            self.terminal = true;
+                            self.state = ObservationState::Failed;
                             if value["response"].is_object() {
                                 let mut response = value["response"].clone();
                                 response["error"] = safe_error(&response["error"]);
@@ -186,7 +196,7 @@ mod tests {
                 json!({"status":"failed","error":{"type":"invalid_request_error","param":"input[2]"}})
             )
         );
-        assert!(observer.completed.is_none());
+        assert!(!observer.completed());
     }
 
     #[test]
@@ -204,10 +214,57 @@ mod tests {
             }
         }
         assert_eq!(observer.observed.as_ref().unwrap()["output"], json!([item]));
+        assert!(observer.completed());
         assert_eq!(
-            observer.completed.as_ref().unwrap()["usage"]["output_tokens"],
+            observer.observed.as_ref().unwrap()["usage"]["output_tokens"],
             12
         );
+    }
+
+    #[test]
+    fn first_terminal_disposition_wins_over_payload_status() {
+        for event_type in [
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+            "error",
+        ] {
+            let mut observer = Observer::default();
+            let response = json!({"id":"first", "status":"completed", "error":{"type":"safe", "message":"private prose"}});
+            observer.feed(
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":event_type,"response":response})
+                )
+                .as_bytes(),
+            );
+            observer.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"later\",\"status\":\"completed\"}}\n\n");
+            assert_eq!(observer.observed.as_ref().unwrap()["id"], "first");
+            assert_eq!(observer.completed(), event_type == "response.completed");
+            if event_type != "response.completed" {
+                assert_eq!(
+                    observer.observed.as_ref().unwrap()["error"],
+                    json!({"type":"safe"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_invalid_input_discards_completed_observation() {
+        for oversized in [false, true] {
+            let mut observer = Observer::default();
+            observer.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n");
+            assert!(observer.completed());
+            if oversized {
+                observer.feed(&vec![b'x'; 4 * 1024 * 1024 + 1]);
+            } else {
+                observer.feed(b"data: \xff\n\n");
+            }
+            observer.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n");
+            assert!(!observer.completed());
+            assert!(observer.observed.is_none());
+        }
     }
 
     #[test]
@@ -215,6 +272,7 @@ mod tests {
         let mut observer = Observer::default();
         observer.feed(b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"earlier\"}}\n\n");
         observer.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"final\"}]}}\n\n");
-        assert_eq!(observer.completed.unwrap()["output"][0]["id"], "final");
+        assert!(observer.completed());
+        assert_eq!(observer.observed.unwrap()["output"][0]["id"], "final");
     }
 }
