@@ -251,8 +251,12 @@ class BrowserRetention(unittest.TestCase):
                                     for s in samples))
                 self.assertTrue(all(s['post_turn_dom']['nodes'] <= samples[0]['post_turn_dom']['nodes'] + 100
                                     for s in samples))
-                # Prove the settled sampling boundary still detects genuinely
-                # retained detached DOM rather than concealing a working-set leak.
+                # Calibrate the detector separately from the application being
+                # measured above. Live polling/error rendering can release
+                # unrelated nodes between control samples and hide part of the
+                # known retained allocation. A clean document has no app timers.
+                command(session + '/url', {'url': 'about:blank'})
+                wait("location.href==='about:blank' && document.readyState==='complete'")
                 evaluate("new Promise(resolve=>setTimeout(resolve,0))")
                 cdp('HeapProfiler.collectGarbage')
                 baseline = cdp('Memory.getDOMCounters')['nodes']
@@ -260,13 +264,17 @@ class BrowserRetention(unittest.TestCase):
                 evaluate("new Promise(resolve=>setTimeout(resolve,0))")
                 cdp('HeapProfiler.collectGarbage')
                 retained = cdp('Memory.getDOMCounters')['nodes']
+                report['dom_retention_control'] = dict(scope='isolated calibration document; dashboard bounds checked before navigation',
+                    baseline=baseline, retained=retained)
                 self.assertGreater(retained, baseline + 100)
+                self.assertEqual(retained, baseline + 120)
                 evaluate("delete window.retentionNegativeControl")
                 evaluate("new Promise(resolve=>setTimeout(resolve,0))")
                 cdp('HeapProfiler.collectGarbage')
                 released = cdp('Memory.getDOMCounters')['nodes']
+                report['dom_retention_control']['released'] = released
                 self.assertLessEqual(released, baseline + 100)
-                report['dom_retention_control'] = dict(baseline=baseline, retained=retained, released=released)
+                self.assertEqual(released, baseline)
                 months = [r for r in report['requests'] if '/accounting?' in r['path']]
                 self.assertEqual(len(months), 2)
                 start = int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp()) - 1
