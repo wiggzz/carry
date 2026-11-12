@@ -141,6 +141,13 @@ fn append(path: impl AsRef<Path>) -> Result<File> {
         .with_context(|| format!("failed to append log: {}", path.as_ref().display()))
 }
 
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,11 +219,4 @@ mod tests {
             "old output\nnew output\n"
         );
     }
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
