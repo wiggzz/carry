@@ -135,7 +135,12 @@ async fn exceptional_review_dispatches_the_reserved_view_and_preserves_primary_h
     assert!(reviews.try_recv().is_err(), "one exceptional attempt, no second ordinary review");
     assert_eq!(primaries.try_recv().unwrap(), body);
     assert!(primaries.try_recv().is_err());
-    let saved = load(&service, &id).unwrap();
+    let mut saved = load(&service, &id).unwrap();
+    // Completed advice is index authority, deliberately absent from Session JSON.
+    history::advice(&service, saved.history_namespace.as_deref().unwrap(), &input)
+        .unwrap()
+        .unwrap()
+        .apply(&mut saved);
     assert_eq!(saved.primary.calls, 1);
     assert_eq!(saved.shadow.calls, 1);
     assert_eq!(saved.completed_requests, 1);
@@ -150,7 +155,12 @@ async fn exceptional_review_dispatches_the_reserved_view_and_preserves_primary_h
     assert_eq!(events.iter().filter(|e| e["event"] == "exceptional_review").count(), 1);
     let mut cold = checkpoint_service(directory.path());
     cold.config = service.config.clone();
-    let restored = load(&cold, &id).unwrap();
+    let mut restored = load(&cold, &id).unwrap();
+    history::advice(&cold, restored.history_namespace.as_deref().unwrap(), &input)
+        .unwrap()
+        .unwrap()
+        .apply(&mut restored);
+    assert_eq!(restored.completed_review_len, input.len());
     assert_eq!(restored.primary.cost_usd, saved.primary.cost_usd);
     assert_eq!(restored.shadow.cost_usd, saved.shadow.cost_usd);
     assert_eq!(restored.render_primary(), input);
