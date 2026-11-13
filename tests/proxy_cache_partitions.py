@@ -37,15 +37,7 @@ def usage_for(case):
     return usage
 
 
-class CachePartitions(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(lambda: self.assertTrue(self.harness.doCleanups(),
-                                               "nested fixture cleanup failed"))
-
+class CachePartitions(support.FixtureCase):
     def lifecycle(self, *, case, sse):
         valid = case not in ("conflicting_write", "conflicting_read", "malformed_write")
         scripted = [
@@ -67,7 +59,7 @@ class CachePartitions(unittest.TestCase):
         def review(*_):
             raise AssertionError("partition tracer must not dispatch reviewer work")
 
-        fixture = self.harness.fixture(primary, review)
+        fixture = self.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "synthetic alias prefix " * 2000}]
         snapshots, states, estimates = [], [], []
@@ -76,9 +68,9 @@ class CachePartitions(unittest.TestCase):
                              primaries=fixture.primaries, reviews=fixture.reviews,
                              fixture_errors=fixture.errors)
         for step in range(3):
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                 extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             if sse:
                 connection = http.client.HTTPConnection(*proxy.address, timeout=30)
                 try:
@@ -95,7 +87,7 @@ class CachePartitions(unittest.TestCase):
             else:
                 self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
             saved = proxy.saved()
-            records = read_index(self.harness.state / "history.index")["upstream_cache"]
+            records = read_index(self.state / "history.index")["upstream_cache"]
             status, dashboard = proxy.request("GET", "/carry/dashboard/stats")
             self.assertEqual(status, 200)
             self.assertEqual(len(dashboard["sessions"]), 1)
@@ -114,7 +106,7 @@ class CachePartitions(unittest.TestCase):
                 self.assertAlmostEqual(saved["primary"]["cost_usd"], .0041, places=12)
             proxy.close()
             if step == 0:
-                checkpoint = next(self.harness.state.glob("*.json"))
+                checkpoint = next(self.state.glob("*.json"))
                 staged = json.loads(checkpoint.read_text())
                 resolved = staged["model_resolution"]["primary"]
                 resolved["cache"] = {"minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,

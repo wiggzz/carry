@@ -3,19 +3,13 @@
 Synthetic loopback providers only. No checkpoint fabrication or model calls.
 """
 import concurrent.futures
-import json
 import unittest
 
 import proxy_state_regressions as support
-from proxy_state_regressions import advice_response, completed, ledger
+from proxy_state_regressions import advice_response, completed
 
 
-class ReviewerIndependence(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.addCleanup(self.harness.doCleanups)
-
+class ReviewerIndependence(support.FixtureCase):
     @staticmethod
     def seed():
         return [{"role": "user", "content": "durable goal"},
@@ -23,12 +17,12 @@ class ReviewerIndependence(unittest.TestCase):
                 {"role": "user", "content": "latest protected direction"}]
 
     def proxy(self, fixture, options):
-        proxy = self.harness.proxy(fixture, options)
+        proxy = super().proxy(fixture, options)
         proxy.wait_reviews = False  # These assertions measure primary admission itself.
         return proxy
 
     def fixture(self, review):
-        fixture = self.harness.fixture(
+        fixture = super().fixture(
             lambda _body, n: (200, completed(response_id=f"primary_{n}")), review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         return fixture
@@ -98,7 +92,7 @@ class ReviewerIndependence(unittest.TestCase):
             self.assertTrue(fixture.held.wait(2))
             self.assertFalse(fixture.release.is_set())
             self.assertEqual(proxy.send(history)[0], 200)
-        saved = self.harness.wait_saved(proxy,
+        saved = self.wait_saved(proxy,
             lambda s: s["shadow"]["calls"] == 1 and not s["background_review_pending"])
         self.assertEqual(saved["invalid_reviews"], 1)
         self.assertEqual(saved["shadow"]["unavailable_cost_calls"], 1)
@@ -113,15 +107,6 @@ class ReviewerIndependence(unittest.TestCase):
 
     def test_reviewer_timeout_preserves_primary_progress_and_unknown_spend(self):
         self.failed_review("timeout")
-
-    @staticmethod
-    def imported_history():
-        history = [{"role": "user", "content": "DURABLE_IMPORT_REQUIREMENT"}]
-        for n in range(18):
-            history += [{"role": "assistant", "content": f"import evidence {n} " * 300},
-                        {"role": "user", "content": f"old direction {n}"}]
-        return history + [{"role": "user", "content": "UNREVIEWED_SUFFIX_DIRECTION"}]
-
 
 
 

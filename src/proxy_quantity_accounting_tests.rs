@@ -12,6 +12,62 @@ fn observe(m: &mut InputMeasurements, body: &Value, input: u64, at: u64) {
 }
 
 #[test]
+fn measured_blocks_preserve_newest_disjoint_coverage_and_zero_quantities() {
+    let item = |id: &str| Item {
+        identity: id.into(),
+        opaque: true,
+    };
+    let block = |ids: &[&str], input| MeasuredBlock {
+        items: ids.iter().map(|id| (*id).into()).collect(),
+        input,
+        allocation: None,
+        opaque: true,
+    };
+    let items = [item("a"), item("b"), item("c")];
+    let changed = items.iter().collect::<Vec<_>>();
+    let mut m = InputMeasurements::default();
+    m.blocks.extend([
+        block(&["a", "b"], 900),
+        block(&["c"], 7),
+        block(&["b", "c"], 30),
+    ]);
+    assert!(!m.fully_measured(&changed));
+    assert_eq!(m.changed_quantity(&changed, &[], true, false), None);
+    m.blocks.push_back(block(&["a"], 5));
+    // Empty/oversized blocks do not match; overlapping older blocks cannot
+    // donate their totals after newer evidence has claimed an occurrence.
+    m.blocks.push_back(block(&[], 1000));
+    m.blocks.push_back(block(&["a", "b", "c", "d"], 1000));
+    for m in [
+        m.clone(),
+        serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap(),
+    ] {
+        assert!(m.fully_measured(&changed));
+        assert_eq!(
+            m.changed_quantity(&changed, &[], true, false),
+            Some((35, true))
+        );
+        assert_eq!(m.changed_quantity(&changed, &[], false, false), None);
+        assert_eq!(m.changed_quantity(&[], &[], true, false), Some((0, false)));
+    }
+    let repeated = [&items[0], &items[0]];
+    let mut m = InputMeasurements::default();
+    m.blocks.push_back(block(&["a"], 0));
+    assert_eq!(
+        m.changed_quantity(&repeated[..1], &[], true, false),
+        Some((0, true))
+    );
+    assert!(!m.fully_measured(&repeated));
+    assert_eq!(m.changed_quantity(&repeated, &[], true, false), None);
+    m.blocks.push_back(block(&["a"], 8));
+    assert!(m.fully_measured(&repeated));
+    assert_eq!(
+        m.changed_quantity(&repeated, &[], true, false),
+        Some((8, true))
+    );
+}
+
+#[test]
 fn neutral_accounting_joint_residual_conserves_whole_and_partial_blocks() {
     let mut m = InputMeasurements::default();
     let base = request(vec![json!({"role":"user", "content":"base"})]);

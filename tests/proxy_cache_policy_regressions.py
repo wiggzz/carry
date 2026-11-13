@@ -11,17 +11,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class CachePolicyRegressions(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(self.cleanup_harness)
-
-    def cleanup_harness(self):
-        self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
-
+class CachePolicyRegressions(support.FixtureCase):
     def test_changed_present_policy_freezes_cumulative_boundary_once_across_restart(self):
         inputs = [(2000, 0), (2100, 2000), (2200, 2100), (2300, 2200)]
 
@@ -36,7 +26,7 @@ class CachePolicyRegressions(unittest.TestCase):
         def review(_body, _n):
             self.fail("below-review-threshold audit control must never dispatch a reviewer")
 
-        fixture = self.harness.fixture(primary, review)
+        fixture = self.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "immutable policy boundary"}]
         versions = [2, 3, 3, 4]
@@ -47,14 +37,14 @@ class CachePolicyRegressions(unittest.TestCase):
             if index:
                 # Only an isolated fixture's prospective resolution is changed.
                 # Keep the previous ledger version, tariff, history and money.
-                path = next(self.harness.state.glob("*.json"))
+                path = next(self.state.glob("*.json"))
                 saved = json.loads(path.read_text())
                 saved["model_resolution"]["primary"]["scenario_cache_policy"]["version"] = version
                 path.write_text(json.dumps(saved))
                 history.append({"role": "user", "content": f"append {index}"})
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "100000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
             status, stats = proxy.request("GET", "/carry/dashboard/stats")
             self.assertEqual(status, 200)

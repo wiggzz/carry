@@ -82,7 +82,8 @@ async fn synthetic_qualified_terminal_restart(sse: bool) {
         restarted.config = config.clone();
         let service = Arc::new(restarted);
         let id = "synthetic-qualified-terminal";
-        let candidate = load(&service, id).unwrap();
+        let mut candidate = load(&service, id).unwrap();
+        candidate.last_submitted_ids = candidate.history.iter().map(|i| i.id).collect();
         let before_money = candidate.primary.cost_usd;
         let previous = history::cache(&service).unwrap();
         let lock = session_lock(&service, id).await;
@@ -92,7 +93,6 @@ async fn synthetic_qualified_terminal_restart(sse: bool) {
             id: id.into(),
             request_id: format!("qualified-{step}"),
             reviewed: candidate.clone(),
-            submitted_ids: candidate.history.iter().map(|i| i.id).collect(),
             observed_input: body["input"].as_array().unwrap().clone(),
             candidate,
             outbound: body.clone(),

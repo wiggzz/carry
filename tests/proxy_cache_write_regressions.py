@@ -11,17 +11,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class CacheWriteRegressions(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(self.cleanup_harness)
-
-    def cleanup_harness(self):
-        self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
-
+class CacheWriteRegressions(support.FixtureCase):
     def summary_policy_control(self, *, migrate, migrate_at=1, requests=3):
         """Real producer/restart; native totals deliberately differ from wire size."""
         def primary(_body, n):
@@ -31,22 +21,22 @@ class CacheWriteRegressions(unittest.TestCase):
                 "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected review"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected review"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "synthetic large native receipt"}]
         snapshots = []
         for index in range(requests):
             if index:
                 if migrate and index == migrate_at:
-                    path = next(self.harness.state.glob("*.json"))
+                    path = next(self.state.glob("*.json"))
                     saved = json.loads(path.read_text())
                     # Future version is fixture metadata, not an implemented tariff.
                     saved["model_resolution"]["primary"]["scenario_cache_policy"]["version"] = 3
                     path.write_text(json.dumps(saved))
                 history.append({"role": "user", "content": f"append {index}"})
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
             status, stats = proxy.request("GET", "/carry/dashboard/stats")
             self.assertEqual(status, 200)
@@ -147,7 +137,7 @@ class CacheWriteRegressions(unittest.TestCase):
         def review(_body, _n):
             self.fail("off-mode negative control must never dispatch a reviewer")
 
-        fixture = self.harness.fixture(primary, review)
+        fixture = self.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "unchanged below-budget cache control"}]
         snapshots = []
@@ -156,8 +146,8 @@ class CacheWriteRegressions(unittest.TestCase):
             if index == 0 or restart:
                 if index:
                     proxy.close()
-                proxy = support.Proxy(self.harness.state, fixture, mode="off")
-                self.harness.stack.callback(proxy.close)
+                proxy = support.Proxy(self.state, fixture, mode="off")
+                self.stack.callback(proxy.close)
             if index:
                 history.append({"role": "user", "content": f"continue {index}"})
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
@@ -231,14 +221,14 @@ class CacheWriteRegressions(unittest.TestCase):
                 "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": written,
                     "cache_write_tokens_details": {"12h": written}}}
             return 200, response
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("off mode reviewed"))
+        fixture = self.fixture(primary, lambda *_: self.fail("off mode reviewed"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "unsupported lifetime receipt"}]
         snapshots = []
         expected = 0.0
         for index, (incoming, cached, written) in enumerate(receipts):
-            proxy = support.Proxy(self.harness.state, fixture, mode="off")
-            self.harness.stack.callback(proxy.close)
+            proxy = support.Proxy(self.state, fixture, mode="off")
+            self.stack.callback(proxy.close)
             if index:
                 history.append({"role": "user", "content": f"append {index}"})
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
@@ -271,31 +261,28 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
-    def test_breakpoint_override_and_mixed_lifetimes_keep_money_unknown_across_restart(self):
+    def breakpoint_lifetime_control(self, make_items, input_field, response_prefix):
         cases = [(["30m"], 2000), (["12h"], 2000),
                  (["30m", "12h"], 2000), (["12h"], 0), (["30m"], 2000)]
         def primary(body, n):
             lifetimes, written = cases[n-1]
             self.assertEqual(body["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
             self.assertEqual([b["prompt_cache_breakpoint"]["ttl"]
-                              for b in body["input"][-1]["content"]], lifetimes)
+                              for b in body["input"][-1][input_field]], lifetimes)
             long_written = written // len(lifetimes) if "12h" in lifetimes else 0
-            response = support.completed(response_id=f"breakpoint-ttl-{n}")
+            response = support.completed(response_id=f"{response_prefix}-{n}")
             response["usage"] = {"input_tokens": 2000, "output_tokens": 10,
                 "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": written,
                     "cache_write_tokens_details": {"ttl_30m_tokens": written-long_written,
                                                     "ttl_12h_tokens": long_written}}}
             return 200, response
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("off mode reviewed"))
+        fixture = self.fixture(primary, lambda *_: self.fail("off mode reviewed"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history, snapshots, expected = [], [], 0.0
         for index, (lifetimes, written) in enumerate(cases):
-            proxy = support.Proxy(self.harness.state, fixture, mode="off")
-            self.harness.stack.callback(proxy.close)
-            history.append({"role": "user", "content": [
-                {"type": "input_text", "text": f"breakpoint {index}",
-                 "prompt_cache_breakpoint": {"mode": "explicit", "ttl": ttl}}
-                for ttl in lifetimes]})
+            proxy = support.Proxy(self.state, fixture, mode="off")
+            self.stack.callback(proxy.close)
+            history.extend(make_items(index, lifetimes))
             self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
                 prompt_cache_options={"mode": "explicit", "ttl": "30m"})[0], 200)
             saved = proxy.saved()
@@ -322,57 +309,24 @@ class CacheWriteRegressions(unittest.TestCase):
             self.assertEqual(estimate["savings"], 0.0)
             proxy.close()
 
+    def test_breakpoint_override_and_mixed_lifetimes_keep_money_unknown_across_restart(self):
+        def make_items(index, lifetimes):
+            return [{"role": "user", "content": [
+                {"type": "input_text", "text": f"breakpoint {index}",
+                 "prompt_cache_breakpoint": {"mode": "explicit", "ttl": ttl}}
+                for ttl in lifetimes]}]
+        self.breakpoint_lifetime_control(make_items, "content", "breakpoint-ttl")
+
     def test_typed_tool_output_lifetimes_preserve_money_across_restart(self):
-        cases = [(["30m"], 2000), (["12h"], 2000),
-                 (["30m", "12h"], 2000), (["12h"], 0), (["30m"], 2000)]
-        def primary(body, n):
-            lifetimes, written = cases[n-1]
-            self.assertEqual(body["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
-            self.assertEqual([b["prompt_cache_breakpoint"]["ttl"]
-                              for b in body["input"][-1]["output"]], lifetimes)
-            long_written = written // len(lifetimes) if "12h" in lifetimes else 0
-            response = support.completed(response_id=f"tool-output-ttl-{n}")
-            response["usage"] = {"input_tokens": 2000, "output_tokens": 10,
-                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": written,
-                    "cache_write_tokens_details": {"ttl_30m_tokens": written-long_written,
-                                                    "ttl_12h_tokens": long_written}}}
-            return 200, response
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("off mode reviewed"))
-        self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        history, snapshots, expected = [], [], 0.0
-        for index, (lifetimes, written) in enumerate(cases):
-            proxy = support.Proxy(self.harness.state, fixture, mode="off")
-            self.harness.stack.callback(proxy.close)
-            history.extend([
+        def make_items(index, lifetimes):
+            return [
                 {"type": "function_call", "call_id": f"call_191_{index}",
                  "name": "lookup", "arguments": "{}"},
                 {"type": "function_call_output", "call_id": f"call_191_{index}", "output": [
                     {"type": "input_text", "text": f"tool result {index}",
                      "prompt_cache_breakpoint": {"mode": "explicit", "ttl": ttl}}
-                    for ttl in lifetimes]}])
-            self.assertEqual(proxy.send(history, model="gpt-6.1-sol",
-                prompt_cache_options={"mode": "explicit", "ttl": "30m"})[0], 200)
-            saved = proxy.saved()
-            estimate = proxy.request("GET", "/carry/dashboard/stats")[1]["sessions"][0]["cost_estimate"]
-            if index == 0 or not written:
-                expected += (2000 * (2.5 if written else 2) + 100) / 1e6
-            unknown = sum(bool(w) and n > 0 for n, (_, w) in enumerate(cases[:index+1]))
-            snapshots.append({"saved": saved, "estimate": estimate, "known": expected})
-            self.evidence.update(snapshots=snapshots, primaries=fixture.primaries)
-            self.assertEqual(fixture.primaries[-1]["input"], history)
-            self.assertEqual(saved["primary"]["calls"], index+1)
-            self.assertEqual(saved["primary"]["input_tokens"], (index+1)*2000)
-            self.assertEqual(saved["primary"]["cache_write_tokens"], sum(w for _, w in cases[:index+1]))
-            self.assertEqual(saved["primary"]["unavailable_cost_calls"], unknown)
-            self.assertAlmostEqual(saved["primary"]["cost_usd"], expected, places=12)
-            self.assertEqual(estimate["unavailable_primary_cost_calls"], unknown)
-            self.assertAlmostEqual(estimate["observed_primary_cost"], expected, places=12)
-            self.assertEqual(estimate["matched_primary_responses"], index + 1 - unknown)
-            self.assertEqual(estimate["excluded_unpriced_calls"], unknown)
-            self.assertAlmostEqual(estimate["carry_cost"], expected, places=12)
-            self.assertAlmostEqual(estimate["traditional_cost"], expected, places=12)
-            self.assertEqual(estimate["savings"], 0.0)
-            proxy.close()
+                    for ttl in lifetimes]}]
+        self.breakpoint_lifetime_control(make_items, "output", "tool-output-ttl")
 
     def test_branch_specific_summary_tiers_and_cache_survive_restart(self):
         # The actual full input stays large; only the hypothetical branch summarizes.
@@ -383,7 +337,7 @@ class CacheWriteRegressions(unittest.TestCase):
         snapshots = []
         for mode in ("implicit", "explicit"):
             with self.subTest(mode=mode):
-                self.harness.state = Path(self.harness.stack.enter_context(tempfile.TemporaryDirectory()))
+                self.state = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
                 inputs = [1000, 300000, 300100, 300200]
                 def primary(body, n):
                     incoming = inputs[n-1]
@@ -394,13 +348,13 @@ class CacheWriteRegressions(unittest.TestCase):
                         "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": written}}
                     self.assertEqual(body["prompt_cache_options"], {"mode": mode, "ttl": "30m"})
                     return 200, response
-                fixture = self.harness.fixture(primary, lambda *_: self.fail("off mode reviewed"))
+                fixture = self.fixture(primary, lambda *_: self.fail("off mode reviewed"))
                 self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
                 history = [{"role": "user", "content": "owned summary scenario"}]
                 actual, traditional, summary = 0.0, 0.0, 0.0
                 for index, incoming in enumerate(inputs):
-                    proxy = support.Proxy(self.harness.state, fixture, mode="off")
-                    self.harness.stack.callback(proxy.close)
+                    proxy = support.Proxy(self.state, fixture, mode="off")
+                    self.stack.callback(proxy.close)
                     if index:
                         history.append({"role": "user", "content": f"continue {index}"})
                     self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1,
@@ -434,7 +388,7 @@ class CacheWriteRegressions(unittest.TestCase):
                     self.assertAlmostEqual(estimate["savings"], traditional-actual, places=12)
                     proxy.close()
                     if index == 0:
-                        path = next(self.harness.state.glob("*.json"))
+                        path = next(self.state.glob("*.json"))
                         support.stage_comparison_scenario(saved, {"context_window":4000,
                             "reserve":100,"keep_recent":1500,"summary":100})
                         path.write_text(json.dumps(saved))

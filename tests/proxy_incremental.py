@@ -33,14 +33,9 @@ class ProjectionAssertionControls(unittest.TestCase):
             assert_source_projection(self, {"input": history + [history[-1], control]}, history)
 
 
-class IncrementalReviewer(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.addCleanup(self.harness.doCleanups)
-
+class IncrementalReviewer(support.FixtureCase):
     def fixture(self, review=None):
-        fixture = self.harness.fixture(
+        fixture = super().fixture(
             lambda _b, n: (200, completed(response_id=f"r{n}")),
             review or (lambda b, _n: (200, advice_response({
                 "protected": ledger(b)["eligible_group_ids"], "removable": [], "memories": []}))))
@@ -49,7 +44,7 @@ class IncrementalReviewer(unittest.TestCase):
 
     def test_fresh_projection_has_each_native_source_once_and_no_reviewer_answers(self):
         fixture = self.fixture()
-        proxy = self.harness.proxy(fixture, ["--classifier-cache-policy", "disabled",
+        proxy = self.proxy(fixture, ["--classifier-cache-policy", "disabled",
                                            "--min-payback-percent", "100"])
         history = [{"role": "user", "content": "durable goal"}]
         for n in range(4):
@@ -68,7 +63,7 @@ class IncrementalReviewer(unittest.TestCase):
 
     def test_primary_keeps_native_input_when_reviewer_does_not_fit(self):
         fixture = self.fixture()
-        proxy = self.harness.proxy(fixture, ["--review-replayed-history",
+        proxy = self.proxy(fixture, ["--review-replayed-history",
             "--classifier-max-input-tokens", "1024", "--classifier-max-output-tokens", "64"])
         history = [{"role": "user", "content": "DURABLE_REQUIREMENT"},
                    {"role": "assistant", "content": "large evidence " * 6000},
@@ -80,7 +75,7 @@ class IncrementalReviewer(unittest.TestCase):
 
     def test_estimated_oversized_protected_request_is_tried_upstream(self):
         fixture = self.fixture()
-        proxy = self.harness.proxy(fixture, ["--primary-context-tokens", "3000",
+        proxy = self.proxy(fixture, ["--primary-context-tokens", "3000",
             "--primary-output-reserve-tokens", "64"])
         status, _ = proxy.send([{"role": "user", "content": "protected new request " * 3000}])
         self.assertEqual(status, 200)
@@ -89,9 +84,9 @@ class IncrementalReviewer(unittest.TestCase):
 
     def test_screenshot_request_is_tried_and_upstream_413_is_preserved(self):
         upstream_error = {"error": {"code": "provider_context_limit", "message": "fixture limit"}}
-        fixture = self.harness.fixture(lambda *_: (413, upstream_error),
+        fixture = super().fixture(lambda *_: (413, upstream_error),
                                        lambda *_: self.fail("unexpected reviewer"))
-        proxy = self.harness.proxy(fixture, ["--primary-context-tokens", "3000",
+        proxy = self.proxy(fixture, ["--primary-context-tokens", "3000",
             "--primary-output-reserve-tokens", "64"])
         history = [{"role": "user", "content": [
             {"type": "input_text", "text": "Inspect this screenshot"},
@@ -113,7 +108,7 @@ class IncrementalReviewer(unittest.TestCase):
             del response["usage"]["input_tokens_details"]
             return 200, response
 
-        fixture = self.harness.fixture(primary,
+        fixture = super().fixture(primary,
             lambda *_: self.fail("protected native input must not require a reviewer"))
         options = ["--primary-context-tokens", "1000000",
                    "--primary-output-reserve-tokens", "64",
@@ -124,7 +119,7 @@ class IncrementalReviewer(unittest.TestCase):
                        {"type": "input_text", "text": "Inspect the screenshot"},
                        {"type": "input_image", "image_url":
                         "data:image/png;base64," + "aB3+cD4/eF5=" * 8000}]}]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         first = proxy.saved()["last_plan"]
         self.assertIsNone(first["primary_estimated_tokens"])
@@ -134,7 +129,7 @@ class IncrementalReviewer(unittest.TestCase):
             with self.subTest(restarted=restarted):
                 if restarted:
                     proxy.close()
-                    proxy = self.harness.proxy(fixture, options)
+                    proxy = self.proxy(fixture, options)
                 self.assertEqual(proxy.send(history)[0], 200)
                 plan = proxy.saved()["last_plan"]
                 self.assertEqual(plan["primary_estimated_tokens"], 55888)
@@ -149,9 +144,9 @@ class IncrementalReviewer(unittest.TestCase):
             del response["usage"]
             return 200, response
 
-        fixture = self.harness.fixture(primary,
+        fixture = super().fixture(primary,
             lambda *_: self.fail("unknown input quantity cannot authorize a paid review"))
-        proxy = self.harness.proxy(fixture, ["--primary-context-tokens", "3000",
+        proxy = self.proxy(fixture, ["--primary-context-tokens", "3000",
             "--primary-output-reserve-tokens", "64"])
         history = [{"type": "reasoning", "summary": [],
                     "encrypted_content": "opaqueCiphertext+" * 8000},

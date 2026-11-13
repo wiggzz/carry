@@ -134,6 +134,14 @@ impl Rates {
     pub fn cache_ratios(self) -> (f64, f64) {
         (self.cached / self.input, self.write / self.input)
     }
+
+    /// Price disjoint token partitions at already selected per-token rates.
+    pub fn cost(self, uncached: u64, cached: u64, written: u64, output: u64) -> f64 {
+        uncached as f64 * self.input
+            + cached as f64 * self.cached
+            + written as f64 * self.write
+            + output as f64 * self.output
+    }
 }
 
 /// Route identity is content-free. A gateway slug never certifies an official

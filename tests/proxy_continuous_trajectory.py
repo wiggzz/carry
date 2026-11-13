@@ -4,10 +4,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class ContinuousTrajectory(unittest.TestCase):
-    setUp = support.StateRegressions.setUp
-    record_evidence = support.StateRegressions.record_evidence
-    fixture = support.StateRegressions.fixture
+class ContinuousTrajectory(support.FixtureCase):
 
     def trajectory(self, *, large, opaque, boundary=False):
         count, step = 50, 30000

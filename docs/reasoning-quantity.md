@@ -65,22 +65,27 @@ primary and reviewer costs come from successful settlement evidence, not by
 subtracting guessed failed costs from all-attempt totals. Charge included
 reviewer expense once.
 
-The whole-window point estimate extends the directly modeled traditional cost
-to included successful primary expense lacking a usable quantity attribution.
-Where a usable matched reference exists, apply its traditional-to-primary expense
-ratio to that omitted primary expense. Otherwise disclose the weak assumption of
-primary-expense parity net of hypothetical compaction/cache. These assumptions
-do not reconstruct historical quantities or prove cache hits.
+The whole-window estimate replays every included successful primary in order,
+using native inputs and explicit quantity/continuity estimates where strict
+attribution is unavailable. It never fills missing requests using an expense
+ratio or primary-expense parity. A preserved strict subtotal can stand alone only
+when it already covers the complete successful primary population.
 
-Calculate net benefit against included successful primary plus reviewer expense.
-Aggregate comparable session amounts before calculating percentages. Keep strict
-measured/estimated/unavailable quantity coverage separate from inferred expense
-coverage. Missing successful-money evidence, unreadable windows and inconsistent
-populations leave the relevant comparison unavailable. Legacy all-attempt ledgers
-cannot fill those gaps; upgrading does not invent facts for old requests.
+Net benefit subtracts the same population's successful primary and reviewer
+expense. Aggregate comparable amounts before calculating percentages; disclose
+unavailable session windows and strict versus inferred quantity coverage.
+Missing chronology, successful money or consistent population proof leaves the
+relevant comparison unavailable. All-attempt totals cannot fill those gaps.
 
-The alternative assumes the same outputs and tool sequence. Reference-dependent
-imputation may change as evidence grows, but original paid receipts are never
-repriced. Unit controls and real-binary HTTP/restart fixtures verify accounting,
-privacy and continuity behavior; they do not establish predictive accuracy on
-private workloads, statistical confidence bounds or real-provider causal savings.
+The conventional scenario uses the shared `Scenario` policy: the catalog's
+ordinary context window, a 16,384-unit reserve, 20,000 recent units and a 1,000-unit
+summary by default. It checks after every successful primary response, including
+tool calls, not only agent-turn completion; initial admission also accounts for
+the requested output allowance and fixed/protected floor. These modeled
+transitions do not constrain real requests or reconstruct actual client summaries.
+Cache assumptions follow the frozen scenario contract, not a blanket live-hit or
+30-minute guarantee.
+
+The alternative assumes the same outputs and tool sequence; it never reprices
+original paid receipts. Behavioral accounting/restart controls do not establish
+predictive accuracy, statistical confidence bounds or real-provider causal savings.

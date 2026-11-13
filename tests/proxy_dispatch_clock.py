@@ -11,15 +11,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class DispatchClock(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(lambda: self.assertTrue(self.harness.doCleanups(),
-                                               'nested fixture cleanup failed'))
-
+class DispatchClock(support.FixtureCase):
     def test_warm_dispatch_crossing_expiry_preserves_frozen_comparison(self):
         inputs = [300000, 300100, 300200, 300300]
         clock = {}
@@ -38,7 +30,7 @@ class DispatchClock(unittest.TestCase):
                                                           'cache_write_tokens': 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail('unexpected reviewer'))
+        fixture = self.fixture(primary, lambda *_: self.fail('unexpected reviewer'))
         history = [{'role': 'assistant', 'content': 'owned summarized native history'},
                    {'role': 'user', 'content': 'continue'}]
         wires, snapshots, estimates = [], [], []
@@ -46,10 +38,10 @@ class DispatchClock(unittest.TestCase):
                              primaries=fixture.primaries, reviews=fixture.reviews)
 
         def start():
-            proxy = support.Proxy(self.harness.state, fixture, mode='audit',
+            proxy = support.Proxy(self.state, fixture, mode='audit',
                                   extra=['--request-timeout-secs', '15'],
                                   extra_env={'CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS': '1000000'})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             return proxy
 
         def estimate(proxy):
@@ -86,7 +78,7 @@ class DispatchClock(unittest.TestCase):
                 facts['read_refresh'] = None
                 facts['resolved']['scenario_cache_policy']['ttl_seconds'] = 1799
         staged['model_resolution']['primary']['scenario_cache_policy']['ttl_seconds'] = 1799
-        checkpoint = next(self.harness.state.glob('*.json'))
+        checkpoint = next(self.state.glob('*.json'))
         checkpoint.write_text(json.dumps(staged))
         self.evidence['staged'] = staged
 

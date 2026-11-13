@@ -1974,7 +1974,6 @@ struct Commit {
     request_id: String,
     candidate: Session,
     reviewed: Session,
-    submitted_ids: Vec<u64>,
     // Canonical caller ancestry is independent of the selected context. Native
     // compaction can clear the latter before this observation is committed.
     observed_input: Vec<Value>,
@@ -2199,12 +2198,12 @@ async fn forward_timed(
                 continue;
             }
             if effective.config.mode != Mode::Off && implicit {
-                // The candidate was only a metadata hint. Release its pin
-                // before selecting the actual owner, so a parent-to-child
-                // move does not consume an extra history-owner slot.
-                drop(history_pin.take());
-                let (selected, pin) =
-                    history::resolve(&service, namespace.as_ref().unwrap(), &body)?;
+                let (selected, pin) = history::resolve(
+                    &service,
+                    namespace.as_ref().unwrap(),
+                    &body,
+                    history_pin.take(),
+                )?;
                 if selected != id {
                     // A metadata hint or awaited mutable tip can differ from
                     // the expanded request's owner. Re-resolve under that lock
@@ -2440,11 +2439,14 @@ async fn forward_timed(
             // Only a completed, validated result can authorize a fitting retry.
             let mut bounded = (*service).clone();
             bounded.config.classifier_timeout_secs = bounded.config.classifier_timeout_secs.min(5);
-            let before = session.clone();
             session.review_epoch = next_review_generation();
             session.background_review_pending = true;
             let projection = planning::Projection::canonical(&session);
-            let review_body = review_body_projected(&bounded.config, &session, &projection);
+            let view = crate::proxy_state::ReviewedView::new(
+                &session,
+                &session.groups_for(&projection.omitted),
+            );
+            let review_body = review_body_for_view(&bounded.config, &session, &projection, &view);
             session.last_reviewer_dispatch =
                 Some(dispatch_measurement(&request_id, "reviewer", &review_body));
             settlement::reserve(&service, &mut session, &review_body, false).map_err(|_| {
@@ -2465,7 +2467,9 @@ async fn forward_timed(
             };
             timing.active_phase = "blocking_review";
             let started = Instant::now();
-            run_review(&bounded, &id, &mut session, &projection, &mut run).await;
+            if review_fits_measured(&bounded.config, &session, &review_body) {
+                review_chunk(&bounded, &id, &mut session, &review_body, &view, &mut run).await;
+            }
             timing::Phases::add(&mut timing.blocking_review_us, started);
             timing.active_phase = "preparation";
             session.background_review_pending = false;
@@ -2496,7 +2500,6 @@ async fn forward_timed(
             (candidate, report) = plan(&service.config, &session, &outbound);
             timing::Phases::add(&mut timing.planning_us, started);
             acquired = true;
-            let _ = before;
         }
         let projection = if active && service.config.mode == Mode::Compact {
             candidate.unwrap_or_else(|| planning::Projection::canonical(&session))
@@ -2652,12 +2655,6 @@ async fn forward_timed(
                 failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
             }
         })?;
-        let submitted_ids = session
-            .history
-            .iter()
-            .filter(|i| !projection.omitted.contains(&i.id))
-            .map(|i| i.id)
-            .collect();
         let _ = trace(&service, &id, "primary_submitted", &outbound);
         journal(
             &service,
@@ -2672,7 +2669,6 @@ async fn forward_timed(
             request_id,
             candidate: session,
             reviewed,
-            submitted_ids,
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
             native,
@@ -3218,6 +3214,7 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
     }
 }
 
+#[cfg(test)]
 async fn run_review(
     service: &Service,
     id: &str,
@@ -4408,8 +4405,8 @@ async fn relay(
                 "stream_error"
             };
         }
-        let mut converted_value = observer.completed;
-        let sse_completed = converted_value.is_some();
+        let sse_completed = observer.completed();
+        let mut conversion_allowed = sse_completed;
         let observed = if is_sse {
             observer.observed
         } else {
@@ -4466,7 +4463,7 @@ async fn relay(
                     observed.as_ref(),
                     true,
                 );
-                let value = observed.unwrap();
+                let value = observed.as_ref().unwrap();
                 let model = commit.outbound["model"].as_str().unwrap_or("");
                 let resolved = commit
                     .service
@@ -4504,7 +4501,7 @@ async fn relay(
                         native_value["status"] = json!("completed");
                         &native_value
                     } else {
-                        &value
+                        value
                     };
                     trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
                         body: &commit.outbound,
@@ -4530,12 +4527,12 @@ async fn relay(
                     commit.candidate.native_compactions += 1;
                 } else {
                     for item in &mut commit.candidate.history {
-                        if commit.submitted_ids.contains(&item.id) {
+                        if commit.candidate.last_submitted_ids.contains(&item.id) {
                             item.exposed = true;
                         }
                     }
                     commit.candidate.last_response_id = value["id"].as_str().map(str::to_owned);
-                    if let Some(conversation) = history::conversation(&value) {
+                    if let Some(conversation) = history::conversation(value) {
                         commit.candidate.history_conversation = Some(conversation.into());
                     }
                     commit.candidate.response_frontier = Some(commit.candidate.next_id);
@@ -4553,12 +4550,12 @@ async fn relay(
                     }
                     commit.candidate.completed_requests += 1;
                 }
-                let _ = trace(&commit.service, &commit.id, "primary_completed", &value);
+                let _ = trace(&commit.service, &commit.id, "primary_completed", value);
                 if save_observed(
                     &commit.service,
                     &commit.id,
                     &commit.candidate,
-                    Some((&commit.observed_input, &value)),
+                    Some((&commit.observed_input, value)),
                 )
                 .is_err()
                 {
@@ -4576,7 +4573,7 @@ async fn relay(
                         "primary_checkpoint_failed",
                         &json!({"candidate_committed":false,"accounting_committed":accounting_committed}),
                     );
-                    converted_value = None;
+                    conversion_allowed = false;
                     let _ = sender
                         .send(Err(std::io::Error::other("proxy checkpoint failed")))
                         .await;
@@ -4667,8 +4664,8 @@ async fn relay(
             // Conversion still requires clean HTTP EOF: a timeout/transport
             // error is a 502 even after a terminal. Accounting above retains
             // the existing terminal-authoritative streaming commit policy.
-            let _ = converted.send(if complete_transport {
-                converted_value
+            let _ = converted.send(if complete_transport && conversion_allowed {
+                observed
             } else {
                 None
             });

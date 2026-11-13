@@ -10,6 +10,15 @@ import unittest
 ENTRYPOINT = pathlib.Path(__file__).parents[1] / "containers" / "swebench-harness" / "entrypoint.py"
 
 
+def initialize_repo(repo):
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "file.txt").write_text("before\n")
+    subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+
+
 class HarnessEntrypointTests(unittest.TestCase):
     def test_carry_resume_session_is_forwarded_only_to_the_carry_command(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -17,12 +26,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             repo, prompt_dir, output = root / "repo", root / "input", root / "output"
             binary, session = root / "bin" / "carry", root / "session"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True); session.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             (prompt_dir / "task.md").write_text("fix")
             binary.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
@@ -51,12 +55,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             repo, prompt_dir, output = root / "repo", root / "input", root / "output"
             binary = root / "bin" / "carry"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True)
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             (prompt_dir / "task.md").write_text("fix")
             binary.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
@@ -103,12 +102,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             )
             binary = root / "bin" / "codex"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); session.mkdir(); binary.parent.mkdir(parents=True)
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             (prompt_dir / "task.md").write_text("fix")
             thread = "11111111-1111-4111-8111-111111111111"
             binary.write_text(
@@ -145,12 +139,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             repo, prompt_dir, output, session = (root / "repo", root / "input", root / "output", root / "codex-session")
             binary = root / "bin" / "codex"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); session.mkdir(); binary.parent.mkdir(parents=True)
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             (prompt_dir / "task.md").write_text("fix")
             binary.write_text(
                 "#!/usr/bin/env python3\nimport os,pathlib,sys\n"
@@ -188,12 +177,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             repo, prompt_dir, output, session = (root / "repo", root / "input", root / "output", root / "pi-session")
             binary = root / "bin" / "pi"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); session.mkdir(); binary.parent.mkdir(parents=True)
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             (prompt_dir / "task.md").write_text("fix")
             binary.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys,os,json\n"
@@ -229,12 +213,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             repo = root / "repo"; prompt_dir = root / "input"; output = root / "output"
             binary = root / "bin" / "carry"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir(); binary.parent.mkdir(parents=True)
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             (prompt_dir / "task.md").write_text("fix")
             binary.write_text(
                 "#!/usr/bin/env python3\nimport pathlib\n"
@@ -265,12 +244,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             root = pathlib.Path(directory)
             repo = root / "repo"; prompt_dir = root / "input"; output = root / "output"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             (prompt_dir / "task.md").write_text("fix")
             login = root / "codex-login"
             login.write_text(
@@ -323,12 +297,7 @@ class HarnessEntrypointTests(unittest.TestCase):
             prompt_dir = root / "input"
             output = root / "output"
             repo.mkdir(); prompt_dir.mkdir(); output.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-            (repo / "file.txt").write_text("before\n")
-            subprocess.run(["git", "-C", str(repo), "add", "file.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            initialize_repo(repo)
             prompt = "fix the thing with spaces"
             (prompt_dir / "task.md").write_text(prompt)
             helper = root / "agent.py"

@@ -44,15 +44,7 @@ class OwnerProxy(support.Proxy):
             connection.close()
 
 
-class LegacyHistoryLoads(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(lambda: self.assertTrue(self.harness.doCleanups(),
-                                               "nested fixture cleanup failed"))
-
+class LegacyHistoryLoads(support.FixtureCase):
     def lifecycle(self, *, shared, initialized):
         inputs = ([] if initialized else [10000]) + [300000, 300100, 300200, 300300,
                                                               300400, 300500]
@@ -72,14 +64,14 @@ class LegacyHistoryLoads(unittest.TestCase):
                                                           "cache_write_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, review)
+        fixture = self.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
 
         def start(review_enabled=False):
-            proxy = OwnerProxy(self.harness.state, fixture, shared=shared, mode="audit",
+            proxy = OwnerProxy(self.state, fixture, shared=shared, mode="audit",
                                extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS":
                                           "0" if review_enabled else "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             return proxy
 
         def snapshot(proxy):
@@ -115,11 +107,11 @@ class LegacyHistoryLoads(unittest.TestCase):
         # Keep the current evidence and age its dispatch clock to exercise
         # cold-once/rewarm behavior without injecting prediction state.
         # Shared snapshots, not mirrors, are the authoritative load target.
-        checkpoint = next(self.harness.state.glob("*.json"))
+        checkpoint = next(self.state.glob("*.json"))
         owner = checkpoint.stem
         staged = expire_dispatches(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
-        index_path = self.harness.state / "history.index"
+        index_path = self.state / "history.index"
         index = read_index(index_path)
         if shared:
             self.assertIn(owner, index["snapshots"])

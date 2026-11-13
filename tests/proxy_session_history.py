@@ -13,15 +13,7 @@ import proxy_state_regressions as support
 from proxy_legacy_history import OwnerProxy
 
 
-class SessionHistory(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(lambda: self.assertTrue(self.harness.doCleanups(),
-                                               "nested fixture cleanup failed"))
-
+class SessionHistory(support.FixtureCase):
     def lifecycle(self, *, shared, change_ttl, initialized):
         inputs = ([] if initialized else [10000]) + [300000, 300100, 300200,
                                                               300300, 300400]
@@ -34,7 +26,7 @@ class SessionHistory(unittest.TestCase):
                                                           "cache_write_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "assistant", "content": "owned history before TTL transition"},
                    {"role": "user", "content": "current request"}]
@@ -43,13 +35,13 @@ class SessionHistory(unittest.TestCase):
         for index, incoming in enumerate(inputs):
             if index:
                 history.append({"role": "user", "content": f"append {index}"})
-            proxy = OwnerProxy(self.harness.state, fixture, shared=shared, mode="audit",
+            proxy = OwnerProxy(self.state, fixture, shared=shared, mode="audit",
                                wait_reviews=False,
                                extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             # Real process restart may not rewrite any settled owner or index.
             for name, saved in previous_files.items():
-                self.assertEqual(read_index(self.harness.state / name), saved,
+                self.assertEqual(read_index(self.state / name), saved,
                                  "restart must preserve frozen money and quantities")
             ttl = "12h" if change_ttl and index >= transition else "30m"
             status, response = proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1,
@@ -60,7 +52,7 @@ class SessionHistory(unittest.TestCase):
             self.assertEqual(len(stats["sessions"]), 1)
             estimates.append(copy.deepcopy(stats["sessions"][0]["cost_estimate"]))
             proxy.close()
-            index_state = read_index(self.harness.state / "history.index")
+            index_state = read_index(self.state / "history.index")
             matches = [ref for ref in index_state["transcripts"].values()
                        if ref["external_id"] == response["id"]]
             self.assertEqual(len(matches), 1, "successful wire must bind one canonical owner")
@@ -68,7 +60,7 @@ class SessionHistory(unittest.TestCase):
             if shared:
                 saved = index_state["snapshots"][owner]
             else:
-                saved = json.loads((self.harness.state / f"{owner}.json").read_text())
+                saved = json.loads((self.state / f"{owner}.json").read_text())
             self.assertEqual(saved["history_shared"], shared)
             snapshots.append(copy.deepcopy(saved))
             owner_ids.append(owner)
@@ -76,7 +68,7 @@ class SessionHistory(unittest.TestCase):
             wires.append(copy.deepcopy(history))
             ttls.append(ttl)
             previous_files = {path.name: json.loads(path.read_text())
-                              for path in self.harness.state.glob("*.json")}
+                              for path in self.state.glob("*.json")}
             previous_files["history.index"] = index_state
         self.evidence.update(snapshots=snapshots, estimates=estimates, owner_ids=owner_ids, indexes=indexes,
                              primaries=fixture.primaries, reviews=fixture.reviews,

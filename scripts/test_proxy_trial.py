@@ -221,6 +221,77 @@ for line in sys.stdin:
             self.assertEqual(sum(e['type']=='agent_settled' for e in events),2)
             self.assertEqual([e['id'] for e in events if e['type']=='response'],['p1','c1','p2'])
 
+    def test_checkpoint_drivers_preserve_commands_failure_boundaries_and_process_cleanup(self):
+        import queue
+        import sys
+        from unittest.mock import patch
+        from scripts import proxy_trial, proxy_gateway_native_fixture as gateway
+        continuation = 'Continue from the installed checkpoint; finish.'
+        drivers = (
+            (proxy_trial.run_rpc_checkpoint, 'fixture', [continuation]),
+            (gateway.run_rpc_two_summaries, 'Run the supplied fixture tools and finish.',
+             [continuation + '\n' + 'SECOND_CHECKPOINT_FIXTURE_CONTEXT ' * 200, continuation]),
+        )
+        for driver, prompt, messages in drivers:
+            commands = [dict(id='p1', type='prompt', message=prompt)]
+            for number, message in enumerate(messages, 1):
+                commands.extend([dict(id=f'c{number}', type='compact'),
+                                 dict(id=f'p{number+1}', type='prompt', message=message)])
+            for stop in ('success', 'reject-c1', 'eof-c1', 'timeout-c1',
+                         *(['reject-c2'] if len(messages) == 2 else [])):
+                with self.subTest(driver=driver.__name__, stop=stop), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    binary = root / 'scripted_rpc.py'
+                    binary.write_text('''import json, os, sys, time
+for expected in json.loads(os.environ['EXPECTED_COMMANDS']):
+ actual = json.loads(sys.stdin.readline())
+ assert actual == expected, (actual, expected)
+ with open('commands.jsonl', 'a') as log: log.write(json.dumps(actual)+'\\n')
+ stop = os.environ['STOP']
+ if actual['id'] == 'c1':
+  if stop == 'eof-c1': sys.exit(0)
+  if stop == 'timeout-c1': time.sleep(60)
+ print('non-JSON client diagnostic', flush=True)
+ print(json.dumps({'type':'response','id':'unrelated','success':False}), flush=True)
+ rejected = stop == 'reject-'+actual['id']
+ print(json.dumps({'type':'response','id':actual['id'],'success':not rejected}), flush=True)
+ if rejected: time.sleep(60)
+ if actual['type'] == 'prompt':
+  print(json.dumps({'type':'agent_end'}), flush=True)
+  print(json.dumps({'type':'agent_settled'}), flush=True)
+time.sleep(60)
+''')
+                    env = dict(os.environ, EXPECTED_COMMANDS=json.dumps(commands), STOP=stop)
+                    kwargs = dict(cwd=root, env=env, timeout=.3 if stop.startswith('timeout') else 3)
+                    if driver is proxy_trial.run_rpc_checkpoint:
+                        kwargs['prompt'] = prompt
+                    processes = []
+                    popen = subprocess.Popen
+                    def launch(*args, **kwargs):
+                        process = popen(*args, **kwargs)
+                        processes.append(process)
+                        return process
+                    with (root / 'events').open('w') as output, patch.object(
+                            proxy_trial.subprocess, 'Popen', side_effect=launch):
+                        kwargs['output'] = output
+                        if stop.startswith('eof'):
+                            with self.assertRaises(RuntimeError):
+                                driver([sys.executable, str(binary)], **kwargs)
+                        elif stop.startswith('timeout'):
+                            with self.assertRaises((TimeoutError, queue.Empty)):
+                                driver([sys.executable, str(binary)], **kwargs)
+                        else:
+                            self.assertEqual(driver([sys.executable, str(binary)], **kwargs),
+                                             0 if stop == 'success' else 1)
+                    self.assertEqual(len(processes), 1)
+                    self.assertIsNotNone(processes[0].poll())
+                    self.assertTrue(processes[0].stdin.closed)
+                    self.assertTrue(processes[0].stdout.closed)
+                    actual = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
+                    end = len(commands) if stop == 'success' else next(
+                        i + 1 for i, command in enumerate(commands) if command['id'] == stop.split('-')[1])
+                    self.assertEqual(actual, commands[:end])
+
     def test_effective_mode_is_checked_locally_before_client_start(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); workspace=root/'workspace'; workspace.mkdir()

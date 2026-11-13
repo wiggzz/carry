@@ -2168,6 +2168,23 @@ def _clone(repo: str, commit: str, destination: pathlib.Path, mirror: pathlib.Pa
         raise RuntimeError("task checkout contains Git objects unreachable from the base commit")
 
 
+class _RepositoryCloner:
+    def __init__(self, root: pathlib.Path) -> None:
+        self.root = root
+        self.mirrors: dict[str, pathlib.Path] = {}
+
+    def __call__(self, repo: str, commit: str, destination: pathlib.Path) -> None:
+        if repo not in self.mirrors:
+            mirror = self.root / "repositories" / (repo.replace("/", "__") + ".git")
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["git", "clone", "--quiet", "--mirror", f"https://github.com/{repo}.git", str(mirror)],
+                check=True,
+            )
+            self.mirrors[repo] = mirror
+        _clone(repo, commit, destination, self.mirrors[repo])
+
+
 def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root: pathlib.Path,
                 clone: Any = None, harnesses: tuple[str, ...] = HARNESSES) -> list[dict[str, Any]]:
     by_id = {record.get("instance_id"): record for record in records}
@@ -2176,21 +2193,7 @@ def materialize(*, records: list[dict[str, Any]], selected_ids: list[str], root:
         raise ValueError("canonical dataset does not contain the requested unique selection")
     selected = [by_id[instance_id] for instance_id in selected_ids]
     root.mkdir(parents=True, exist_ok=True)
-    clone_impl = clone
-    if clone_impl is None:
-        mirrors: dict[str, pathlib.Path] = {}
-
-        def clone_one(repo: str, commit: str, destination: pathlib.Path) -> None:
-            if repo not in mirrors:
-                mirror = root / "repositories" / (repo.replace("/", "__") + ".git")
-                mirror.parent.mkdir(parents=True, exist_ok=True)
-                subprocess.run(
-                    ["git", "clone", "--quiet", "--mirror", f"https://github.com/{repo}.git", str(mirror)],
-                    check=True,
-                )
-                mirrors[repo] = mirror
-            _clone(repo, commit, destination, mirrors[repo])
-        clone_impl = clone_one
+    clone_impl = _RepositoryCloner(root) if clone is None else clone
     (root / "canonical-dataset.json").write_text(json.dumps(selected, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tasks = []
     for record in selected:
@@ -2566,18 +2569,7 @@ def execute_preparation(*, source: pathlib.Path, work: pathlib.Path, output: pat
     selected_records = [by_id[instance_id] for instance_id in frozen_ids]
     work.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
-    mirrors: dict[str, pathlib.Path] = {}
-
-    def clone_one(repo: str, commit: str, destination: pathlib.Path) -> None:
-        if repo not in mirrors:
-            mirror = work / "repositories" / (repo.replace("/", "__") + ".git")
-            mirror.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", "--quiet", "--mirror", f"https://github.com/{repo}.git", str(mirror)],
-                check=True,
-            )
-            mirrors[repo] = mirror
-        _clone(repo, commit, destination, mirrors[repo])
+    clone_one = _RepositoryCloner(work)
 
     started = time.monotonic()
     dockerfile_templates = importlib.import_module(
@@ -2763,18 +2755,7 @@ def execute_benchmark(*, source: pathlib.Path, work: pathlib.Path, output: pathl
     finalize(tasks=tasks, records=records, output=output, provenance=provenance_payload,
              harnesses=harnesses, attempt_numbers=attempt_numbers)
 
-    mirrors: dict[str, pathlib.Path] = {}
-
-    def clone_one(repo: str, commit: str, destination: pathlib.Path) -> None:
-        if repo not in mirrors:
-            mirror = work / "repositories" / (repo.replace("/", "__") + ".git")
-            mirror.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", "--quiet", "--mirror", f"https://github.com/{repo}.git", str(mirror)],
-                check=True,
-            )
-            mirrors[repo] = mirror
-        _clone(repo, commit, destination, mirrors[repo])
+    clone_one = _RepositoryCloner(work)
 
     # Build each reviewed harness once, export it as a read-only bundle, then
     # pull every selected task/evaluator image before the first model call.

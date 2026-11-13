@@ -1018,7 +1018,7 @@ fn observed_cost(
         return None;
     }
     let rates = resolved.rates_for_input(usage.input_tokens as f64)?;
-    Some(cost_at_rates(usage, rates))
+    Some(usage.cost_at_rates(rates))
 }
 
 fn modeled_cost(model: &str, usage: &Usage, resolved: Option<&ResolvedModel>) -> Option<f64> {
@@ -1029,18 +1029,7 @@ fn modeled_cost(model: &str, usage: &Usage, resolved: Option<&ResolvedModel>) ->
         return None;
     }
     let rates = resolved.forecast_rates_for_input(usage.input_tokens as f64)?;
-    Some(cost_at_rates(usage, rates))
-}
-
-fn cost_at_rates(usage: &Usage, rates: carry::models::Rates) -> f64 {
-    let cached = usage.cached_input_tokens.min(usage.input_tokens);
-    let written = usage
-        .cache_write_input_tokens
-        .min(usage.input_tokens - cached);
-    (usage.input_tokens - cached - written) as f64 * rates.input
-        + cached as f64 * rates.cached
-        + written as f64 * rates.write
-        + usage.output_tokens as f64 * rates.output
+    Some(usage.cost_at_rates(rates))
 }
 
 fn has_native_modalities(value: &Value) -> bool {

@@ -26,10 +26,7 @@ def selected_archive(proxy):
     return proxy.state / f".request-evidence-{mark['owner']}-{namespace}{suffix}.jsonl"
 
 
-class EvidenceArchive(unittest.TestCase):
-    setUp = support.StateRegressions.setUp
-    record_evidence = support.StateRegressions.record_evidence
-    fixture = support.StateRegressions.fixture
+class EvidenceArchive(support.FixtureCase):
 
     def rollover(self, bound):
         fixture = self.fixture(lambda _b, n: (200, support.completed(response_id=f'archive-{n}', input_tokens=1000)))

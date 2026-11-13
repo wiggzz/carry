@@ -141,7 +141,7 @@ async fn numeric_background_review_keeps_captured_projection_after_owner_advance
         vec![2, 4],
         "index 2 must not retarget to the current unmerged source"
     );
-    assert_eq!(restored.memory_anchors[&restored.memories[0].id], 4);
+    assert_joined_fact_placement(&restored);
     let paid = history::restore(&service, id).unwrap();
     assert_eq!(paid.shadow.calls, 1);
     assert_eq!(paid.shadow.input_tokens, 10000);
@@ -255,7 +255,8 @@ fn canonical_source_survives_disposable_projection_and_owner_serialization() {
         &json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"fact"}]}),
     )
     .unwrap();
-    let record = semantic::Record::capture(&s);
+    let record: semantic::Record =
+        serde_json::from_value(serde_json::to_value(semantic::Record::capture(&s)).unwrap()).unwrap();
     let omitted = HashSet::from([2]);
     let projection = s.render_projection(&omitted);
     assert!(!projection.contains(&canonical[1]));
@@ -266,8 +267,19 @@ fn canonical_source_survives_disposable_projection_and_owner_serialization() {
     let mut restored: Session = serde_json::from_value(serialized).unwrap();
     record.apply(&mut restored);
     assert!(restored.drop_authorized(&restored.groups()[1]));
+    assert_eq!(restored.render_projection(&omitted), projection);
     assert_eq!(restored.render_primary(), canonical);
     assert_eq!(config.history_max_age_secs, 604800);
+}
+
+fn assert_joined_fact_placement(session: &Session) {
+    let input = session.render_projection(&HashSet::from([2]));
+    let latest_source = &session.history.iter().find(|item| item.id == 4).unwrap().value;
+    let position = input.iter().position(|item| item == latest_source).unwrap();
+    assert!(input[position + 1]["content"]
+        .as_str()
+        .unwrap()
+        .contains(&session.memories[0].text));
 }
 
 #[test]
@@ -291,7 +303,7 @@ fn merged_projected_group_authorizes_original_member_union_not_separator() {
     );
     s.apply_advice(&groups,&json!({"protected":[],"removable":[2],"memories":[{"source_ids":[2],"text":"union fact"}]})).unwrap();
     assert_eq!(s.memories[0].source_ids, vec![2, 4]);
-    assert_eq!(s.memory_anchors[&s.memories[0].id], 4);
+    assert_joined_fact_placement(&s);
     let r = semantic::Record::capture(&s);
     let mut restored = s.clone();
     r.apply(&mut restored);
@@ -445,7 +457,7 @@ fn reviewer_memory_provenance_resolves_merged_split_and_omitted_original_groups(
         }
     }
     assert_eq!(restored.render_primary(), original);
-    assert_eq!(restored.memory_anchors[&restored.memories[0].id], 4);
+    assert_joined_fact_placement(&restored);
 }
 
 #[test]

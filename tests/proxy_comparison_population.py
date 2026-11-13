@@ -9,10 +9,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class ComparisonPopulation(unittest.TestCase):
-    setUp = support.StateRegressions.setUp
-    record_evidence = support.StateRegressions.record_evidence
-    fixture = support.StateRegressions.fixture
+class ComparisonPopulation(support.FixtureCase):
 
     def test_failed_attempts_do_not_censor_or_price_successful_comparisons(self):
         for failure in ('transport', 'unpriced_terminal', 'priced_terminal'):

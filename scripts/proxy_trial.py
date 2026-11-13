@@ -51,8 +51,9 @@ def client_configuration(root, *, client, base_url, model, session_id,
     return {'PI_CODING_AGENT_DIR':str(home), 'PI_OFFLINE':'1', 'PI_TELEMETRY':'0'}
 
 
-def run_rpc_checkpoint(command, *, cwd, env, output, prompt, timeout):
-    """Scripted fixture only: settled prompt -> manual compact -> settled continuation."""
+def run_rpc_checkpoint(command, *, cwd, env, output, prompt, timeout,
+                       continuations=('Continue from the installed checkpoint; finish.',)):
+    """Scripted fixture only: settle each prompt before compacting and continuing."""
     process=subprocess.Popen(command,cwd=cwd,env=env,stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,start_new_session=True)
     events=queue.Queue()
@@ -76,11 +77,12 @@ def run_rpc_checkpoint(command, *, cwd, env, output, prompt, timeout):
     try:
         send({'id':'p1','type':'prompt','message':prompt})
         wait(lambda e:e.get('type')=='agent_settled')
-        send({'id':'c1','type':'compact'})
-        compact=wait(lambda e:e.get('type')=='response' and e.get('id')=='c1')
-        if compact.get('success') is not True: return 1
-        send({'id':'p2','type':'prompt','message':'Continue from the installed checkpoint; finish.'})
-        wait(lambda e:e.get('type')=='agent_settled')
+        for number, message in enumerate(continuations, 1):
+            send({'id':f'c{number}','type':'compact'})
+            compact=wait(lambda e:e.get('type')=='response' and e.get('id')==f'c{number}')
+            if compact.get('success') is not True: return 1
+            send({'id':f'p{number+1}','type':'prompt','message':message})
+            wait(lambda e:e.get('type')=='agent_settled')
         return 0
     finally:
         stop_process_group(process)

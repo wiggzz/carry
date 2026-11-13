@@ -10,10 +10,9 @@ import unittest
 import proxy_state_regressions as support
 
 
-class TraditionalEstimation(unittest.TestCase):
-    setUp = support.StateRegressions.setUp
+class TraditionalEstimation(support.FixtureCase):
     def record_evidence(self):
-        support.StateRegressions.record_evidence(self)
+        super().record_evidence()
         # Reconcile old subset assertions explicitly: they remain strict evidence
         # controls, but every frozen known-money HTTP window also has this NEW
         # full denominator. Includes invalid partial attribution, unknown output,
@@ -61,8 +60,6 @@ class TraditionalEstimation(unittest.TestCase):
             elif isinstance(value, list):
                 for child in value: check(child)
         check(self.evidence)
-    fixture = support.StateRegressions.fixture
-    proxy = support.StateRegressions.proxy
 
     def snapshot(self, proxy):
         # Join immutable checkpoint evidence with its real HTTP projection for

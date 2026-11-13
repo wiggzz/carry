@@ -342,7 +342,7 @@ fn native_read_lifecycle_reconciles_prefix_miss_compaction_and_cold_resume() {
         .plan_compaction(&[], cache.policy_for_history(&appended, 1, 0))
         .unwrap();
     let change = context.compact(plan);
-    cache.mark_compaction(&change.invalidated_generations);
+    cache.mark_compaction(&change.plan.invalidated_generations);
     let current = context.input_items();
     assert!(!current.starts_with(&history));
     assert_eq!(
@@ -356,7 +356,7 @@ fn native_read_lifecycle_reconciles_prefix_miss_compaction_and_cold_resume() {
             .policy()
             .breakpoints
             .iter()
-            .all(|b| !change.invalidated_generations.contains(&b.generation))
+            .all(|b| !change.plan.invalidated_generations.contains(&b.generation))
     );
     assert!(
         !current
