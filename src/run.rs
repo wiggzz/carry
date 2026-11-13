@@ -818,7 +818,7 @@ pub async fn run_interactive_with_events(
 }
 
 async fn run_loop(
-    config: RunConfig,
+    mut config: RunConfig,
     backend: &mut Backend,
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
     events: Option<broadcast::Sender<serde_json::Value>>,
@@ -903,7 +903,7 @@ async fn run_loop(
 
     let max_read_breakpoints =
         prompt_cache_capabilities.map_or(0, |capabilities| capabilities.max_read_breakpoints);
-    let mut context_state = config.resume_context.clone().unwrap_or_else(|| {
+    let mut context_state = config.resume_context.take().unwrap_or_else(|| {
         ContextState::new_with_max_read_breakpoints(config.prompt.clone(), max_read_breakpoints)
     });
     if resumed && !config.prompt.trim().is_empty() {
