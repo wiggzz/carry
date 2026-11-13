@@ -1757,11 +1757,6 @@ class TransparentHistory(regressions.FixtureCase):
         points = [p for ps in read_index(self.state / "history.index")["reviews"].values()
                   for p in ps]
         self.assertEqual(points, [], "failed review cannot publish semantic authority")
-        for point in points:
-            self.assertEqual(point["memories"], [])
-            self.assertEqual(point["drop_members"], {})
-            self.assertNotIn("drop", point["opinions"].values())
-            self.assertFalse(any(source["removed"] for source in point["sources"]))
 
     def test_index_byte_node_age_limits_and_evicted_ids_fail_closed(self):
         env = {"CARRY_PROXY_HISTORY_MAX_BYTES": "4096", "CARRY_PROXY_HISTORY_MAX_NODES": "4",

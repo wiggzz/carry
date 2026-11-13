@@ -3,11 +3,10 @@
 Synthetic loopback providers only. No checkpoint fabrication or model calls.
 """
 import concurrent.futures
-import json
 import unittest
 
 import proxy_state_regressions as support
-from proxy_state_regressions import advice_response, completed, ledger
+from proxy_state_regressions import advice_response, completed
 
 
 class ReviewerIndependence(support.FixtureCase):
@@ -108,15 +107,6 @@ class ReviewerIndependence(support.FixtureCase):
 
     def test_reviewer_timeout_preserves_primary_progress_and_unknown_spend(self):
         self.failed_review("timeout")
-
-    @staticmethod
-    def imported_history():
-        history = [{"role": "user", "content": "DURABLE_IMPORT_REQUIREMENT"}]
-        for n in range(18):
-            history += [{"role": "assistant", "content": f"import evidence {n} " * 300},
-                        {"role": "user", "content": f"old direction {n}"}]
-        return history + [{"role": "user", "content": "UNREVIEWED_SUFFIX_DIRECTION"}]
-
 
 
 
