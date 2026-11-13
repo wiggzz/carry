@@ -574,22 +574,7 @@ class InitializationRegressions(support.FixtureCase):
         import json
         import os
         import subprocess
-        from html.parser import HTMLParser
-
-        class Cells(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.cells, self.cell = [], None
-            def handle_starttag(self, tag, _attrs):
-                if tag == "td":
-                    self.cell = ""
-            def handle_data(self, data):
-                if self.cell is not None:
-                    self.cell += data
-            def handle_endtag(self, tag):
-                if tag == "td" and self.cell is not None:
-                    self.cells.append(self.cell)
-                    self.cell = None
+        from proxy_quantity_policy import Cells
 
         session = self.state / "sessions" / "noop-native"
         session.mkdir(parents=True)
@@ -710,25 +695,7 @@ class InitializationRegressions(support.FixtureCase):
         import json
         import os
         import subprocess
-        from html.parser import HTMLParser
-
-        class Cells(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.cells, self.cell = [], None
-
-            def handle_starttag(self, tag, _attrs):
-                if tag == "td":
-                    self.cell = ""
-
-            def handle_data(self, data):
-                if self.cell is not None:
-                    self.cell += data
-
-            def handle_endtag(self, tag):
-                if tag == "td" and self.cell is not None:
-                    self.cells.append(self.cell)
-                    self.cell = None
+        from proxy_quantity_policy import Cells
 
         session = self.state / "sessions" / "fixed-floor186"
         session.mkdir(parents=True)
