@@ -1,4 +1,94 @@
 // Retention promises cannot be overridden by the continuation working-set cap.
+#[tokio::test]
+async fn queued_owner_survives_expiry_at_reresolution_and_cold_accounting() {
+    async fn request(service: Arc<Service>, wire: Bytes) {
+        let response = forward_request(service, HeaderMap::new(), wire, false, "queued-expiry".into())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    }
+    let (sent, mut captures) = mpsc::unbounded_channel();
+    let router = Router::new().route("/responses", post(move |body: Bytes| {
+        let sent = sent.clone();
+        async move {
+            sent.send(body).unwrap();
+            axum::Json(json!({"status":"completed","output":[],
+                "usage":{"input_tokens":100,"output_tokens":1,
+                    "input_tokens_details":{"cached_tokens":0}}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/responses", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.mode = Mode::Audit;
+    service.config.review_min_primary_tokens = 1_000_000;
+    service.config.upstream_url = url;
+    service.config.history_max_age_secs = 1;
+    service.config.history_max_references = 1;
+    let service = Arc::new(service);
+    let body = json!({"model":"gpt-6-luna","input":[{"role":"user","content":"queued history"}],"stream":false});
+    let wire = Bytes::from(serde_json::to_vec(&body).unwrap());
+    let namespace = history::namespace(&service, &HeaderMap::new(), &body).unwrap();
+    let (owner, setup_pin) = history::resolve(&service, &namespace, &body).unwrap();
+    request(service.clone(), wire.clone()).await;
+    assert_eq!(captures.recv().await.unwrap(), wire);
+    let first = history::restore(&service, &owner).unwrap();
+    assert_eq!(first.primary.calls, 1);
+    assert_eq!(first.primary.input_tokens, 100);
+    assert_eq!(first.primary.output_tokens, 1);
+    assert!(first.primary.cost_usd > 0.0);
+    assert_eq!(first.primary.unavailable_cost_calls, 0);
+
+    let lock = session_lock(&service, &owner).await;
+    let (waiter, mut waits) = mpsc::unbounded_channel();
+    *service.lock_waits.lock().unwrap() = Some(waiter);
+    let queued = tokio::spawn(request(service.clone(), wire.clone()));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(10), waits.recv()).await.unwrap().unwrap(), owner);
+    drop(setup_pin);
+    // Deterministically cross retention after candidate admission, while its
+    // primary lock is held. No sleep or production scheduling/clock override.
+    let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
+    assert!(db.execute("UPDATE records SET at=1 WHERE owner=?1 AND kind IN ('tips','snapshots')", [&owner]).unwrap() >= 2);
+    drop(db);
+    assert!(history::pin(&service, "another-owner").is_err(), "queued pin consumes the one owner slot");
+    drop(lock);
+    tokio::time::timeout(Duration::from_secs(10), queued).await.unwrap().unwrap();
+    assert_eq!(captures.recv().await.unwrap(), wire);
+    assert!(captures.try_recv().is_err());
+    provider.abort();
+    *service.lock_waits.lock().unwrap() = None;
+
+    // A cold coordinator must retain the same owner, immutable receipts and
+    // aggregate money, not just return two successful HTTP responses.
+    let mut cold = checkpoint_service(directory.path());
+    cold.config = service.config.clone();
+    let cold = Arc::new(cold);
+    let cold_pin = history::pin(&cold, &owner).unwrap();
+    let stats = dashboard_stats(State(cold.clone()), ConnectInfo("127.0.0.1:1".parse().unwrap()),
+        HeaderMap::new(), axum::extract::Query(SessionPage::default())).await.unwrap();
+    let stats: Value = serde_json::from_slice(&axum::body::to_bytes(stats.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(stats["usage"]["primary"]["calls"], 2);
+    assert_eq!(stats["usage"]["primary"]["input_tokens"], 200);
+    assert_eq!(stats["usage"]["primary"]["output_tokens"], 2);
+    assert!((stats["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 2.0 * first.primary.cost_usd).abs() < 1e-12);
+    let retained = history::restore(&cold, &owner).unwrap();
+    assert_eq!(retained.primary.calls, 2, "already queued request must not split into another owner at expiry");
+    assert_eq!(retained.primary.input_tokens, 200);
+    assert_eq!(retained.primary.output_tokens, 2);
+    assert_eq!(retained.primary.unavailable_cost_calls, 0);
+    assert!((retained.primary.cost_usd - 2.0 * first.primary.cost_usd).abs() < 1e-12);
+    assert_eq!(retained.completed_requests, 2);
+    assert_eq!(retained.render_primary(), body["input"].as_array().unwrap().clone());
+    let (selected, pin) = history::candidate(&cold, &namespace, &body).unwrap().unwrap();
+    assert_eq!(selected, owner);
+    drop(pin);
+    drop(cold_pin);
+    drop(history::pin(&cold, "released-owner-slot").unwrap());
+}
+
 #[test]
 fn a_retention_existing_owner_admission_completes_without_lock_recursion() {
     let mut failures = Vec::new();
