@@ -37,6 +37,30 @@ upstream runner and graders, but cannot establish savings, speed or quality on
 real tasks. A compact request is not proof of a selected/dispatched/committed
 rewrite. Reports keep unknown counters null and qualify rewrite-unproven runs.
 
+## Workflow ownership and study expansion
+
+SCB runs through `run-slopcodebench.yml` ("Official SCB paired Codex"), not
+`run-swebench.yml`. The suites share the existing trusted gateway/container
+runtime in `swebench_smoke.py`, plus the legacy `swe-bench` GitHub Environment.
+Those shared implementation and secret-boundary names do not select the grader.
+Keep suite-specific workflow names; a future shared-runtime rename should be
+atomic across imports, packaging and tests, while an Environment rename also
+needs deliberate secret/protection/OIDC migration. Neither rename is needed to
+run the existing SCB lane correctly.
+
+The current hosted preparation is deliberately a one-problem, one-repetition
+`cfgpipe` pilot. General contract/planner support for more selections and
+repetitions is not proof that this hosted preparation already supports them.
+For a representative successor, parameterize the preparation selection and
+repetition count, then derive denominator validation from the frozen plan rather
+than the pilot's literal 12 outcomes. Default to at least three fresh paired
+whole-problem repetitions; preserve every official checkpoint in each problem.
+Expand a predeclared mix of domains and context horizons separately from
+replication, and qualify every selected problem with real official gold tests
+before paid work. Publish individual attempts, paired differences, spread,
+quality and all primary/reviewer costs; correlated checkpoints are not independent
+task samples. A one-run pilot remains useful but cannot measure variability.
+
 ## Safe first commands
 
 From the clean pinned Carry checkout, these commands only print a plan:
