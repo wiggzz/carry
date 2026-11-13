@@ -10,21 +10,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import queue
 import socket
 import subprocess
-import threading
 import time
 import urllib.error
 import urllib.request
 
 try:
     from proxy_native_fixture import Fixture, ClientObserver, checkpoint_continuation_clean
-    from proxy_trial import client_configuration, stop_process_group
+    from proxy_trial import client_configuration, run_rpc_checkpoint, stop_process_group
     from proxy_gateway_fixture_support import Gateway
 except ModuleNotFoundError:
     from scripts.proxy_native_fixture import Fixture, ClientObserver, checkpoint_continuation_clean
-    from scripts.proxy_trial import client_configuration, stop_process_group
+    from scripts.proxy_trial import client_configuration, run_rpc_checkpoint, stop_process_group
     from scripts.proxy_gateway_fixture_support import Gateway
 
 
@@ -48,43 +46,11 @@ def grade_case(case, *, exit_code, rpc, fixture, state, received):
 
 
 def run_rpc_two_summaries(command, *, cwd, env, output, timeout=60):
-    process=subprocess.Popen(command,cwd=cwd,env=env,stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,start_new_session=True)
-    values=queue.Queue()
-    def read():
-        for line in process.stdout:
-            output.write(line); output.flush()
-            try: values.put(json.loads(line))
-            except ValueError: pass
-        values.put(None)
-    reader=threading.Thread(target=read,daemon=True); reader.start()
-    deadline=time.monotonic()+timeout
-    def send(value):
-        process.stdin.write(json.dumps(value)+'\n'); process.stdin.flush()
-    def wait(predicate):
-        while True:
-            remaining=deadline-time.monotonic()
-            if remaining<=0: raise TimeoutError('two-summary RPC fixture deadline')
-            value=values.get(timeout=remaining)
-            if value is None: raise RuntimeError('two-summary RPC fixture early EOF')
-            if predicate(value): return value
-    try:
-        send({'id':'p1','type':'prompt','message':'Run the supplied fixture tools and finish.'})
-        wait(lambda e:e.get('type')=='agent_settled')
-        for number in (1,2):
-            send({'id':f'c{number}','type':'compact'})
-            compact=wait(lambda e:e.get('type')=='response' and e.get('id')==f'c{number}')
-            if compact.get('success') is not True: return 1
-            # Explicit fixture-only new native input gives the second manual summary real work.
-            # This is not a production context limit, truncation or agent step cap.
-            message='Continue from the installed checkpoint; finish.'
-            if number==1: message += '\n' + 'SECOND_CHECKPOINT_FIXTURE_CONTEXT ' * 200
-            send({'id':f'p{number+1}','type':'prompt','message':message})
-            wait(lambda e:e.get('type')=='agent_settled')
-        return 0
-    finally:
-        stop_process_group(process); reader.join(timeout=3)
-        process.stdin.close(); process.stdout.close()
+    # Fixture-only new native input gives the second manual summary real work.
+    continuation='Continue from the installed checkpoint; finish.'
+    return run_rpc_checkpoint(command,cwd=cwd,env=env,output=output,timeout=timeout,
+        prompt='Run the supplied fixture tools and finish.', continuations=(
+            continuation+'\n'+'SECOND_CHECKPOINT_FIXTURE_CONTEXT '*200, continuation))
 
 
 def run_case(args,case):
