@@ -3157,6 +3157,73 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
         self.assertEqual(len(clones), 5)
         self.assertTrue(all(destination.parts[-2:] == ("carry", "repo") for _, _, destination in clones))
 
+    def test_default_materialization_reuses_only_operation_local_repository_mirrors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            source.mkdir()
+            subprocess.run(["git", "init", "--quiet", "--initial-branch=main"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.name", "Benchmark Test"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.email", "benchmark@example.invalid"], cwd=source, check=True)
+            commits = []
+            for text in ("base", "future"):
+                (source / "value.txt").write_text(text + "\n")
+                subprocess.run(["git", "add", "value.txt"], cwd=source, check=True)
+                subprocess.run(["git", "commit", "--quiet", "-m", text], cwd=source, check=True)
+                commits.append(subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=source, check=True,
+                    text=True, capture_output=True,
+                ).stdout.strip())
+            records = [
+                {"instance_id": f"task-{index}", "repo": repo, "base_commit": commit,
+                 "problem_statement": "public issue", "patch": "private solution"}
+                for index, (repo, commit) in enumerate((
+                    ("owner/one", commits[0]), ("owner/one", commits[1]),
+                    ("owner/two", commits[0]),
+                ))
+            ]
+            run = subprocess.run
+            downloads = []
+
+            def local_download(command, **kwargs):
+                if command[:4] == ["git", "clone", "--quiet", "--mirror"]:
+                    downloads.append(command)
+                    command = [*command[:4], str(source), command[5]]
+                return run(command, **kwargs)
+
+            with mock.patch.object(self.worker.subprocess, "run", side_effect=local_download):
+                for operation in ("first", "second"):
+                    work = root / operation
+                    tasks = self.worker.materialize(
+                        records=records, selected_ids=[record["instance_id"] for record in records],
+                        root=work, harnesses=("carry", "pi"),
+                    )
+                    self.assertEqual([task["instance_id"] for task in tasks],
+                                     [record["instance_id"] for record in records])
+                    for record in records:
+                        task = work / "tasks" / record["instance_id"]
+                        self.assertNotIn("private solution", (task / "input" / "task.json").read_text())
+                        for harness in ("carry", "pi"):
+                            checkout = task / harness / "repo"
+                            self.assertEqual(run(
+                                ["git", "rev-parse", "HEAD"], cwd=checkout, check=True,
+                                text=True, capture_output=True,
+                            ).stdout.strip(), record["base_commit"])
+                            if record["base_commit"] == commits[0]:
+                                self.assertNotEqual(run(
+                                    ["git", "cat-file", "-e", commits[1]], cwd=checkout,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                ).returncode, 0)
+                    self.assertEqual(json.loads((work / "canonical-dataset.json").read_text()), records)
+            self.assertEqual([command[4] for command in downloads], [
+                "https://github.com/owner/one.git", "https://github.com/owner/two.git",
+            ] * 2)
+            self.assertEqual([pathlib.Path(command[5]) for command in downloads], [
+                root / operation / "repositories" / mirror
+                for operation in ("first", "second")
+                for mirror in ("owner__one.git", "owner__two.git")
+            ])
+
     def test_clone_excludes_commits_after_the_task_base(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

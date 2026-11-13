@@ -398,6 +398,7 @@ pub(super) fn resolve(
     service: &Service,
     namespace: &str,
     body: &Value,
+    previous: Option<Pin>,
 ) -> Result<(String, Pin), Failure> {
     let _guard = IO.lock().unwrap();
     let store = read(service).map_err(read_failure)?;
@@ -405,9 +406,17 @@ pub(super) fn resolve(
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
     if let Some(id) = prefix_owner(&store, namespace, input).map_err(read_failure)? {
+        // Preserve the admitted owner's protection through selection. Transfer
+        // a different hint's slot only under the same publication/admission lock.
+        if let Some(pin) =
+            previous.filter(|pin| pin.0.0 == service.config.state_dir && pin.0.1 == id)
+        {
+            return Ok((id, pin));
+        }
         let pin = pin_owner(service, &id, &mut PINS.lock().unwrap())?;
         return Ok((id, pin));
     }
+    drop(previous);
     reserve(
         service,
         hash(&(namespace, path(namespace, input).last())),
@@ -606,7 +615,6 @@ pub(super) fn hydrate(
     session.completed_review_len = 0;
     session.drop_members.clear();
     session.memories.clear();
-    session.memory_anchors.clear();
     let Some(namespace) = session.history_namespace.as_deref() else {
         return Ok(());
     };

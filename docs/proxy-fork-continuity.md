@@ -34,6 +34,21 @@ projections and reviewer inputs, not from immutable historical audit evidence.
 
 ## Disposable planning and cache evidence
 
+Useful conclusions and unfinished work (status, next action, evidence pointers
+and blockers) belong in concise factual memories, not repeated human instructions.
+A memory is not required for every drop. Rejected
+replacement memories preserve their identifiable eligible supporting sources,
+including when concurrent growth exhausts admission at background merge; unrelated
+valid drops remain valid. Validation cannot discover an unwritten fact or prove
+that a live reviewer preserved its meaning.
+
+Each projection inserts one neutral absence notice per contiguous omitted run.
+Facts appear after their latest complete source cohort and do not split those
+runs. Both notices and facts are rendered afresh, so repeat requests and restart
+do not accumulate copies. Canonical history is unchanged. The actual rendered
+request, including this overhead, is what sizing and cache-prefix checks use;
+neither a notice nor a memory proves semantic safety or realized savings.
+
 Every request starts from canonical source plus applicable completed advice.
 Approved-removable source may be retained while a compatible cache prefix is
 warm, omitted when cold, and retained again after a genuine canonical upstream
@@ -76,13 +91,12 @@ new review until a permissible projection fits; protection is never bypassed.
 
 ## Canonical storage and observed IDs
 
-`history.index` contains a shared immutable parent-linked native-value graph,
-review records keyed by original frontiers, bounded wire evidence, transcript
-references, and paid-owner transport/accounting snapshots. Snapshots do not store
-selected removals or semantic authority. Diagnostic JSON mirrors are not a
-fallback authority. Atomic index publication, in-flight owner pins and bounded
-backpressure protect settlement; independent process writers to one directory
-are unsupported.
+`history.index` is a SQLite store containing a shared immutable parent-linked
+native-value graph, prefix-bound advice, wire evidence, transcript references,
+paid-owner snapshots and independent numeric observations. Snapshots do not store
+semantic authority; diagnostic JSON mirrors are not fallback authority. Atomic
+transactions, in-flight owner pins and reserved disk headroom protect settlement.
+Only one process may own a state directory.
 
 Observed successful `previous_response_id` and `conversation` references expand
 only retained original input plus actual provider output. They are mutually
@@ -90,29 +104,18 @@ exclusive. Carry strips these references after expansion. Unknown, expired,
 evicted or differently scoped IDs return HTTP409 before primary dispatch;
 unreadable/corrupt indexes fail closed. No remote unseen transcript is invented.
 
-| Control | Default | Meaning |
-| --- | --- | --- |
-| `--history-max-age-secs` / `CARRY_PROXY_HISTORY_MAX_AGE_SECS` | 604800 | 0–604800 seconds; seven-day age target |
-| `--history-max-nodes` / `CARRY_PROXY_HISTORY_MAX_NODES` | 16384 | 1–65536 unique canonical nodes |
-| `--history-max-references` / `CARRY_PROXY_HISTORY_MAX_REFERENCES` | 256 | 1–4096 total tip/review/transcript references |
-| `--history-max-bytes` / `CARRY_PROXY_HISTORY_MAX_BYTES` | 33554432 | Total serialized index bytes; must fit its empty envelope |
+Detailed history defaults to seven days (`--history-max-age-secs`); numeric
+observations default to 180 days (`--accounting-max-age-secs`). Disk/reference
+pressure cannot shorten detailed retention. Node/record limits bound decoded
+working sets, and the reference limit bounds concurrently pinned owners, not
+total retained sessions. The separate `--history-disk-bytes` ceiling rejects
+admission rather than evicting unexpired evidence; HTTP507 is not a reset request.
+Maintenance collects expired history within its own bounded disk reserve.
+See `carry proxy --help` for supported ranges and environment names.
 
-There is no hidden eight-review cap. Explicit node/reference/byte capacity can
-evict older settled evidence before seven days. Age is checked on lookup and
-publication; unreachable nodes and expired records are physically collected on
-the next publication, not by a background eraser. In-flight owners are pinned;
-if mandatory live state cannot fit, admission fails locally with HTTP507.
-Lowering a byte budget below an existing file fails closed rather than silently
-reinterpreting it. The index limit is not a whole-directory or peak-memory limit:
-atomic old/new generations and diagnostic mirrors also occupy storage.
-
-## Intentional fresh-state boundary
-
-This unmerged redesign uses `carry-prefix-history-v4` and session version 3.
-Use a **new empty state directory** when adopting it. No legacy checkpoint loader,
-migration, fork-point API, permanent selection, retired-member map, reviewer replay
-or keep-lease compatibility is provided. No live directory is migrated or wiped
-by this change. Removed operator surfaces and superseded tests are recorded with
-the redesign evidence. Existing gateway authentication boundaries are unchanged;
-content digests are not authorization. No deployment or native-client UI fork
-acceptance follows from synthetic loopback tests.
+Restart with the same state directory. Only the current SQLite store is supported;
+predecessor JSON and corrupt state fail closed without replacing the original
+file or becoming an empty history. These storage operations do not change gateway
+authentication: content digests are not authorization. Scripted loopback tests
+establish only their exercised transport/storage behavior, not native-client UI
+fork acceptance or live-reviewer quality.

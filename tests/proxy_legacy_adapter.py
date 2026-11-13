@@ -15,12 +15,9 @@ import proxy_legacy_history as legacy
 import proxy_state_regressions as support
 
 
-class LegacyAdapterLoads(unittest.TestCase):
-    def setUp(self):
-        legacy.LegacyHistoryLoads.setUp(self)
-
+class LegacyAdapterLoads(support.FixtureCase):
     def lifecycle_adapter(self, *, shared, controls, folded):
-        auth = self.harness.state / "synthetic-codex"
+        auth = self.state / "synthetic-codex"
         auth.mkdir()
         payload = base64.urlsafe_b64encode(support.wire({"https://api.openai.com/auth": {
             "chatgpt_account_id": "fixture-account"}})).decode().rstrip("=")
@@ -42,7 +39,7 @@ class LegacyAdapterLoads(unittest.TestCase):
         def review(*_):
             raise AssertionError("review threshold must suppress synthetic reviewer work")
 
-        fixture = self.harness.fixture(primary, review)
+        fixture = self.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         fields = {"model": "gpt-6.1-sol", "instructions": "fixed native instruction",
                   "prompt_cache_key": "legacy-adapter-stable-key"}
@@ -63,10 +60,10 @@ class LegacyAdapterLoads(unittest.TestCase):
         expected_wires = []
 
         def start():
-            proxy = legacy.OwnerProxy(self.harness.state, fixture, shared=shared, mode="audit",
+            proxy = legacy.OwnerProxy(self.state, fixture, shared=shared, mode="audit",
                 extra=["--codex-login", "--codex-home", str(auth)],
                 extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             return proxy
 
         def snapshot(proxy):
@@ -107,7 +104,7 @@ class LegacyAdapterLoads(unittest.TestCase):
 
         # Age actual adapted dispatches uniformly. No mutable modeled-cache
         # projection exists now; restart itself must never renew these events.
-        checkpoint = next(self.harness.state.glob("*.json"))
+        checkpoint = next(self.state.glob("*.json"))
         owner = checkpoint.stem
         def without_cache(target):
             facts = [o["Primary"]["facts"] for o in target["request_evidence"]["observations"] if "Primary" in o]
@@ -120,7 +117,7 @@ class LegacyAdapterLoads(unittest.TestCase):
             return legacy.expire_dispatches(target)
         staged = without_cache(copy.deepcopy(saved))
         checkpoint.write_text(json.dumps(staged))
-        index_path = self.harness.state / "history.index"
+        index_path = self.state / "history.index"
         index = read_index(index_path)
         if shared:
             self.assertIn(owner, index["snapshots"])

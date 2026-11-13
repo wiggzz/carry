@@ -16,7 +16,6 @@ pub(super) struct Record {
     pub opinions: BTreeMap<u64, String>,
     pub drops: BTreeMap<u64, Vec<u64>>,
     pub memories: Vec<Memory>,
-    pub anchors: BTreeMap<u64, u64>,
     pub exposed: Vec<u64>,
     pub next_memory_id: u64,
     pub feedback: Value,
@@ -55,7 +54,6 @@ impl Record {
             opinions,
             drops: session.drop_members.clone(),
             memories: session.memories.clone(),
-            anchors: session.memory_anchors.clone(),
             next_memory_id: session.next_memory_id,
             feedback: session.review_feedback.clone(),
             exposed: session
@@ -106,12 +104,6 @@ impl Record {
             .iter()
             .filter(|m| valid(&m.source_ids))
             .cloned()
-            .collect();
-        session.memory_anchors = self
-            .anchors
-            .iter()
-            .filter(|(id, _)| session.memories.iter().any(|m| m.id == **id))
-            .map(|(id, anchor)| (*id, *anchor))
             .collect();
         session.next_memory_id = self.next_memory_id;
         for item in &mut session.history {

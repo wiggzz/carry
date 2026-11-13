@@ -111,10 +111,10 @@ pub struct ResumeState {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ContextCheckpoint {
+struct ContextCheckpoint<C = ContextState> {
     version: u32,
     model: String,
-    context: ContextState,
+    context: C,
     /// Missing from pre-cache-affinity checkpoints; such sessions resume normally.
     #[serde(default)]
     prompt_cache_key: Option<String>,
@@ -133,7 +133,7 @@ pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
             path.display()
         );
     }
-    let context = ContextState::decode(&checkpoint.context.encode()?)?;
+    let context = checkpoint.context.restore()?;
     Ok(ResumeState {
         context,
         model: checkpoint.model,
@@ -152,7 +152,7 @@ fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Resul
     let checkpoint = ContextCheckpoint {
         version: CONTEXT_CHECKPOINT_VERSION,
         model: config.model.clone(),
-        context: state.clone(),
+        context: state,
         prompt_cache_key: config.prompt_cache_key.clone(),
     };
     let bytes = serde_json::to_vec(&checkpoint)?;
@@ -210,14 +210,51 @@ const TOOL_OUTPUT_PREVIEW_BYTES: usize = TOOL_OUTPUT_INLINE_BYTES / 2;
 const BINARY_OUTPUT_OMISSION_REASON: &str =
     "Shell stream is not UTF-8 text or appears binary; inspect its artifact path instead.";
 
-#[derive(Clone, Debug, Serialize)]
-struct ToolOutputPreview {
-    encoding: &'static str,
-    head: String,
-    tail: Option<String>,
-    omitted_bytes: usize,
-    omission_reason: Option<&'static str>,
-    offloaded: bool,
+#[derive(Clone, Debug)]
+enum ToolOutputPreview {
+    Inline(String),
+    Truncated {
+        head: String,
+        tail: String,
+        omitted_bytes: usize,
+    },
+    Binary(usize),
+}
+
+impl ToolOutputPreview {
+    fn offloaded(&self) -> bool {
+        !matches!(self, Self::Inline(_))
+    }
+}
+
+impl Serialize for ToolOutputPreview {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value = match self {
+            Self::Inline(text) => json!({"output": text}),
+            Self::Truncated {
+                head,
+                tail,
+                omitted_bytes,
+            } => {
+                let mut value = json!({
+                    "metadata": {"truncated": true},
+                    "output_head": head,
+                    "output_tail": tail,
+                });
+                if *omitted_bytes > 0 {
+                    value["metadata"]["omitted_bytes"] = json!(omitted_bytes);
+                }
+                value
+            }
+            Self::Binary(bytes) => json!({"metadata": {
+                "encoding": "binary",
+                "truncated": true,
+                "omitted_bytes": bytes,
+                "omission_reason": BINARY_OUTPUT_OMISSION_REASON,
+            }}),
+        };
+        value.serialize(serializer)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -493,8 +530,8 @@ impl CacheTracker {
                 window,
                 native_tokens: quantities.read().unwrap().0,
                 request_tokens: self.pending_request_tokens,
-                history: self.pending_history.clone(),
-                breakpoints: self.pending.clone(),
+                history: std::mem::take(&mut self.pending_history),
+                breakpoints: std::mem::take(&mut self.pending),
             });
         }
         self.pending.clear();
@@ -781,7 +818,7 @@ pub async fn run_interactive_with_events(
 }
 
 async fn run_loop(
-    config: RunConfig,
+    mut config: RunConfig,
     backend: &mut Backend,
     mut input: Option<mpsc::UnboundedReceiver<UserInput>>,
     events: Option<broadcast::Sender<serde_json::Value>>,
@@ -817,10 +854,10 @@ async fn run_loop(
         RunLogger::create_with_events(&config.session_dir, events.clone())?
     };
     if let Some(reason) = trace_recovery {
-        logger.raw_event_silent("trace_recovery", json!({"reason": reason}))?;
+        logger.event_silent("trace_recovery", json!({"reason": reason}))?;
     }
     if let Some(context) = config.resume_context.as_ref() {
-        logger.raw_event(
+        logger.event(
             "session_resumed",
             json!({
                 "cwd": config.cwd,
@@ -843,7 +880,7 @@ async fn run_loop(
             ),
         )?;
     } else {
-        logger.raw_event(
+        logger.event(
             "run_started",
             json!({
                 "cwd": config.cwd,
@@ -866,18 +903,18 @@ async fn run_loop(
 
     let max_read_breakpoints =
         prompt_cache_capabilities.map_or(0, |capabilities| capabilities.max_read_breakpoints);
-    let mut context_state = config.resume_context.clone().unwrap_or_else(|| {
+    let mut context_state = config.resume_context.take().unwrap_or_else(|| {
         ContextState::new_with_max_read_breakpoints(config.prompt.clone(), max_read_breakpoints)
     });
     if resumed && !config.prompt.trim().is_empty() {
         let id = context_state.add_user(config.prompt.clone());
-        logger.raw_event(
+        logger.event(
             "human_message",
             human_message_data(id, &config.prompt, initial_submission_id.as_deref()),
             &format!("  prompt [{id}] submitted"),
         )?;
     } else if !resumed {
-        logger.raw_event(
+        logger.event(
             "human_message",
             human_message_data(1, &config.prompt, initial_submission_id.as_deref()),
             "  prompt [1] submitted",
@@ -909,7 +946,7 @@ async fn run_loop(
         if let Some(max_steps) = config.max_steps
             && turn_step >= max_steps
         {
-            logger.raw_event(
+            logger.event(
                 "run_failed",
                 json!({"reason": "max_steps", "max_steps": max_steps}),
                 &format!("stopped after reaching {max_steps} steps"),
@@ -962,7 +999,7 @@ async fn run_loop(
         );
         protected_until_request.clear();
         let request_started = Instant::now();
-        logger.raw_event_silent(
+        logger.event_silent(
             "model_request",
             json!({
                 "step": step_index,
@@ -1027,13 +1064,13 @@ async fn run_loop(
                 {
                     let usage = crate::openai::extract_usage(&response.raw);
                     metrics.record(&usage, response.latency_ms, response.response_retries);
-                    logger.raw_event_silent("model_response", json!({
+                    logger.event_silent("model_response", json!({
                         "step": step_index, "raw": response.raw, "usage": usage,
                         "latency_ms": response.latency_ms, "response_retries": response.response_retries,
                         "action_valid": false
                     }))?;
                 }
-                logger.raw_event(
+                logger.event(
                     "model_error",
                     json!({
                         "step": step_index,
@@ -1065,7 +1102,7 @@ async fn run_loop(
         metrics.record(&reply.usage, reply.latency_ms, reply.response_retries);
         sent_model_request = true;
         cache.observe_receipt(&reply.raw["usage"]);
-        logger.raw_event(
+        logger.event(
             "model_response",
             json!({
                 "step": step_index,
@@ -1098,10 +1135,10 @@ async fn run_loop(
         }
         log_assistant_output_text(&mut logger, &reply.raw["output"], step_index)?;
 
-        match reply.step.action.kind {
+        let item_id = match reply.step.action.kind {
             ActionKind::Shell => {
                 if let Some(message) = reply.step.action.message.as_deref() {
-                    logger.raw_event(
+                    logger.event(
                         "assistant_message",
                         json!({"step": step_index, "message": message}),
                         &format!("  {message}"),
@@ -1109,7 +1146,7 @@ async fn run_loop(
                 }
                 let command = reply.step.action.command.as_deref().unwrap();
                 let call_id = format!("tool-{step_index}");
-                logger.raw_event(
+                logger.event(
                     "shell_started",
                     json!({"step": step_index, "call_id": call_id, "command": command}),
                     &format!("  $ {command}"),
@@ -1128,37 +1165,51 @@ async fn run_loop(
                 )
                 .await?;
                 let output = function_call_output(&reply.function_call, &result)?;
-                let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                logger.raw_event(
+                let item_id = context_state.add_tool(reply.output_items, output)?;
+                logger.event(
                     "shell_finished",
                     json!({"result": &result, "context_id": item_id}),
                     &terminal_shell_result(&result),
                 )?;
-                let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
-                    context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
-                    context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
-                protected_until_request.push(item_id);
-                protected_until_request.extend(signals.added.iter().copied());
-                maybe_attach_keep_lease_review(
-                    &mut context_state,
-                    &protected_until_request,
-                    &mut cache,
-                    &mut logger,
-                    &config,
-                    item_id,
+                item_id
+            }
+            ActionKind::Finish => {
+                let output = function_output(
+                    &reply.function_call,
+                    "The answer was delivered to the human; the session may continue.",
                 )?;
-                logger.raw_event_silent(
-                    "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
-                )?;
-                persist_context_checkpoint(&config, &context_state)?;
+                context_state.add_tool(reply.output_items, output)?
+            }
+        };
+        let signals = context_state.record_signals(&reply.step.context, item_id);
+        let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
+            context_state.advance_retention_turn();
+            let expired = context_state.resolve_keep_lease_review(&signals.keep);
+            context_state.arm_keep_leases(&signals.keep, lease_turns);
+            expired
+        } else {
+            Vec::new()
+        };
+        protected_until_request.push(item_id);
+        protected_until_request.extend(signals.added.iter().copied());
+        if reply.step.action.kind == ActionKind::Shell || input.is_some() {
+            maybe_attach_keep_lease_review(
+                &mut context_state,
+                &protected_until_request,
+                &mut cache,
+                &mut logger,
+                &config,
+                item_id,
+            )?;
+        }
+        logger.event_silent(
+            "context_signals",
+            json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
+        )?;
+        persist_context_checkpoint(&config, &context_state)?;
 
+        match reply.step.action.kind {
+            ActionKind::Shell => {
                 if let Some(receiver) = input.as_mut()
                     && drain_user_input(receiver, &mut context_state, &mut logger, &config)?.0
                 {
@@ -1182,38 +1233,7 @@ async fn run_loop(
             }
             ActionKind::Finish => {
                 let answer = reply.step.action.answer.clone();
-                let output = function_output(
-                    &reply.function_call,
-                    "The answer was delivered to the human; the session may continue.",
-                )?;
-                let item_id = context_state.add_tool(reply.output_items.clone(), output)?;
-                let signals = context_state.record_signals(&reply.step.context, item_id);
-                let expired_keep_leases = if let Some(lease_turns) = config.keep_lease_turns {
-                    context_state.advance_retention_turn();
-                    let expired = context_state.resolve_keep_lease_review(&signals.keep);
-                    context_state.arm_keep_leases(&signals.keep, lease_turns);
-                    expired
-                } else {
-                    Vec::new()
-                };
-                protected_until_request.push(item_id);
-                protected_until_request.extend(signals.added.iter().copied());
-                if input.is_some() {
-                    maybe_attach_keep_lease_review(
-                        &mut context_state,
-                        &protected_until_request,
-                        &mut cache,
-                        &mut logger,
-                        &config,
-                        item_id,
-                    )?;
-                }
-                logger.raw_event_silent(
-                    "context_signals",
-                    json!({"source_id": item_id, "signals": &signals, "memories": &reply.step.context.remember, "expired_keep_leases": expired_keep_leases}),
-                )?;
-                persist_context_checkpoint(&config, &context_state)?;
-                logger.raw_event(
+                logger.event(
                     if input.is_some() {
                         "turn_finished"
                     } else {
@@ -1291,7 +1311,7 @@ async fn finish_shutdown(
     logger: &mut RunLogger,
     started: Instant,
 ) -> Result<RunOutcome> {
-    logger.raw_event(
+    logger.event(
         "run_failed",
         json!({"reason": "deadline_shutdown", "usage_recorded": metrics.usage}),
         "  deadline reached; stopped without starting more work",
@@ -1351,7 +1371,7 @@ fn append_user_message(
     } else {
         format!("  prompt [{id}] submitted")
     };
-    logger.raw_event(
+    logger.event(
         "human_message",
         human_message_data(id, &message, submission_id.as_deref()),
         &terminal,
@@ -1459,7 +1479,7 @@ fn maybe_attach_keep_lease_review(
     }
     let review = state.attach_due_keep_lease_review_to(host_id);
     if !review.item_ids.is_empty() {
-        logger.raw_event_silent(
+        logger.event_silent(
             "retention_revalidation_requested",
             json!({
                 "item_ids": review.item_ids,
@@ -1485,9 +1505,9 @@ fn maybe_compact(
     let before = crate::savings::token_units(&json!(state.input_items()));
     let change = state.compact(plan);
     let after = crate::savings::token_units(&json!(state.input_items()));
-    cache.mark_compaction(&change.invalidated_generations);
+    cache.mark_compaction(&change.plan.invalidated_generations);
     metrics.record_compaction();
-    logger.raw_event(
+    logger.event(
         "context_compacted",
         json!({
             "trigger": trigger,
@@ -1498,14 +1518,14 @@ fn maybe_compact(
         }),
         &format!(
             "  compact · -{} items / ~{} tok · {} retained · {} rewritten · reuse {} · invalidate {} generations / {} cached tok · next request saves ~{} input-equivalent tok",
-            change.dropped.len(),
-            compact_number(change.dropped_tokens as u64),
-            compact_number(change.retained_tokens as u64),
-            compact_number(change.rewrite_tokens as u64),
-            change.reused_generation.map_or_else(|| "cold".to_owned(), |generation| generation.to_string()),
-            change.invalidated_generations.len(),
-            compact_number(change.invalidated_cache_tokens as u64),
-            compact_number(change.estimated_savings_input_units.round().max(0.0) as u64),
+            change.plan.dropped.len(),
+            compact_number(change.plan.dropped_tokens as u64),
+            compact_number(change.plan.retained_tokens as u64),
+            compact_number(change.plan.rewrite_tokens as u64),
+            change.plan.reused_generation.map_or_else(|| "cold".to_owned(), |generation| generation.to_string()),
+            change.plan.invalidated_generations.len(),
+            compact_number(change.plan.invalidated_cache_tokens as u64),
+            compact_number(change.plan.estimated_savings_input_units.round().max(0.0) as u64),
         ),
     )?;
     Ok(true)
@@ -1513,7 +1533,7 @@ fn maybe_compact(
 
 fn log_assistant_output_text(logger: &mut RunLogger, output: &Value, step: usize) -> Result<()> {
     for message in assistant_output_text(output) {
-        logger.raw_event(
+        logger.event(
             "assistant_message",
             json!({"step": step, "message": message}),
             &format!("  {message}"),
@@ -1776,127 +1796,59 @@ async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn preview_tool_output(output: &[u8]) -> ToolOutputPreview {
     let Ok(text) = std::str::from_utf8(output) else {
-        return omitted_binary_output(output.len());
+        return ToolOutputPreview::Binary(output.len());
     };
     if text.contains('\0') {
-        return omitted_binary_output(output.len());
+        return ToolOutputPreview::Binary(output.len());
     }
 
     if output.len() <= TOOL_OUTPUT_INLINE_BYTES
         && json_string_size(text) <= TOOL_OUTPUT_INLINE_BYTES + 2
     {
-        return ToolOutputPreview {
-            encoding: "utf-8",
-            head: text.to_owned(),
-            tail: None,
-            omitted_bytes: 0,
-            omission_reason: None,
-            offloaded: false,
-        };
+        return ToolOutputPreview::Inline(text.to_owned());
     }
 
     let head_end = bounded_utf8_head_end(text);
     let tail_start = bounded_utf8_tail_start(text);
-    if let (Some(head_end), Some(tail_start)) = (head_end, tail_start)
-        && head_end <= tail_start
-    {
-        return ToolOutputPreview {
-            encoding: "utf-8",
-            head: text[..head_end].to_owned(),
-            tail: Some(text[tail_start..].to_owned()),
-            omitted_bytes: tail_start - head_end,
-            omission_reason: None,
-            offloaded: true,
-        };
-    }
-
-    omitted_binary_output(output.len())
-}
-
-fn omitted_binary_output(output_bytes: usize) -> ToolOutputPreview {
-    ToolOutputPreview {
-        encoding: "binary",
-        head: String::new(),
-        tail: None,
-        omitted_bytes: output_bytes,
-        omission_reason: Some(BINARY_OUTPUT_OMISSION_REASON),
-        offloaded: true,
+    ToolOutputPreview::Truncated {
+        head: text[..head_end].to_owned(),
+        tail: text[tail_start..].to_owned(),
+        omitted_bytes: tail_start - head_end,
     }
 }
 
-fn bounded_utf8_head_end(text: &str) -> Option<usize> {
+fn bounded_utf8_head_end(text: &str) -> usize {
     let mut end = TOOL_OUTPUT_PREVIEW_BYTES.min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    loop {
-        if json_string_size(&text[..end]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
-            return Some(end);
-        }
-        if end == 0 {
-            break;
-        }
+    while json_string_size(&text[..end]) > TOOL_OUTPUT_PREVIEW_BYTES + 2 {
         end -= 1;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
     }
-    None
+    end
 }
 
-fn bounded_utf8_tail_start(text: &str) -> Option<usize> {
+fn bounded_utf8_tail_start(text: &str) -> usize {
     let mut start = text.len().saturating_sub(TOOL_OUTPUT_PREVIEW_BYTES);
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    loop {
-        if json_string_size(&text[start..]) <= TOOL_OUTPUT_PREVIEW_BYTES + 2 {
-            return Some(start);
-        }
-        if start == text.len() {
-            break;
-        }
+    while json_string_size(&text[start..]) > TOOL_OUTPUT_PREVIEW_BYTES + 2 {
         start += 1;
         while !text.is_char_boundary(start) {
             start += 1;
         }
     }
-    None
+    start
 }
 
 fn json_string_size(value: &str) -> usize {
     serde_json::to_string(value)
         .expect("serializing a string cannot fail")
         .len()
-}
-
-fn render_stream_output(preview: &ToolOutputPreview) -> serde_json::Value {
-    let mut metadata = serde_json::Map::new();
-    if preview.encoding != "utf-8" {
-        metadata.insert("encoding".into(), json!(preview.encoding));
-    }
-    if preview.offloaded {
-        metadata.insert("truncated".into(), json!(true));
-    }
-    if preview.omitted_bytes > 0 {
-        metadata.insert("omitted_bytes".into(), json!(preview.omitted_bytes));
-    }
-    if let Some(reason) = preview.omission_reason {
-        metadata.insert("omission_reason".into(), json!(reason));
-    }
-    let mut stream = serde_json::Map::new();
-    if !metadata.is_empty() {
-        stream.insert("metadata".into(), serde_json::Value::Object(metadata));
-    }
-    if preview.omission_reason.is_none() {
-        if let Some(tail) = preview.tail.as_ref() {
-            stream.insert("output_head".into(), json!(preview.head));
-            stream.insert("output_tail".into(), json!(tail));
-        } else {
-            stream.insert("output".into(), json!(preview.head));
-        }
-    }
-    serde_json::Value::Object(stream)
 }
 
 fn render_tool_result(result: &ShellResult) -> String {
@@ -1917,20 +1869,14 @@ fn render_tool_result(result: &ShellResult) -> String {
     if result.stderr_bytes > 0 {
         payload.insert("stderr_bytes".into(), json!(result.stderr_bytes));
     }
-    if result.prompt_output.stdout.offloaded {
+    if result.prompt_output.stdout.offloaded() {
         payload.insert("full_stdout_path".into(), json!(result.stdout_path));
     }
-    if result.prompt_output.stderr.offloaded {
+    if result.prompt_output.stderr.offloaded() {
         payload.insert("full_stderr_path".into(), json!(result.stderr_path));
     }
-    payload.insert(
-        "stdout".into(),
-        render_stream_output(&result.prompt_output.stdout),
-    );
-    payload.insert(
-        "stderr".into(),
-        render_stream_output(&result.prompt_output.stderr),
-    );
+    payload.insert("stdout".into(), json!(&result.prompt_output.stdout));
+    payload.insert("stderr".into(), json!(&result.prompt_output.stderr));
     serde_json::to_string_pretty(&serde_json::Value::Object(payload))
         .expect("serializing a shell result cannot fail")
 }
@@ -2045,6 +1991,29 @@ mod tests {
     use crate::openai::PromptCacheCapabilities;
     include!("run_cache_scope_tests.rs");
     include!("run_cache_refresh_tests.rs");
+
+    fn scripted_config(cwd: PathBuf, session_dir: PathBuf) -> RunConfig {
+        RunConfig {
+            cwd,
+            session_dir,
+            prompt: "Finish the task.".into(),
+            model: "scripted".into(),
+            reasoning_effort: "medium".into(),
+            max_steps: Some(1),
+            default_shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: None,
+            compaction_payoff_requests: 1,
+            compaction_min_payback_percent: 10,
+            compaction_rollout_samples: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 32 * 1024,
+            compaction_neutral_low_watermark_tokens: 24 * 1024,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        }
+    }
 
     #[test]
     fn human_message_event_preserves_submission_identity() {
@@ -2562,19 +2531,22 @@ mod tests {
     fn small_stream_output_stays_inline() {
         let output = b"all stdout";
         let preview = preview_tool_output(output);
-        assert_eq!(preview.encoding, "utf-8");
-        assert_eq!(preview.head, String::from_utf8(output.to_vec()).unwrap());
-        assert!(preview.tail.is_none());
-        assert_eq!(preview.omitted_bytes, 0);
+        assert_eq!(json!(preview), json!({"output": "all stdout"}));
     }
 
     #[test]
     fn exact_inline_byte_boundary_is_not_offloaded() {
         let exact = vec![b'x'; 10 * 1024];
-        assert!(preview_tool_output(&exact).tail.is_none());
+        assert!(matches!(
+            preview_tool_output(&exact),
+            ToolOutputPreview::Inline(_)
+        ));
 
         let over = vec![b'x'; 10 * 1024 + 1];
-        assert!(preview_tool_output(&over).tail.is_some());
+        assert!(matches!(
+            preview_tool_output(&over),
+            ToolOutputPreview::Truncated { .. }
+        ));
     }
 
     #[test]
@@ -2582,35 +2554,72 @@ mod tests {
         let full = "ordinary search result\n".repeat(2_000).into_bytes();
         let preview = preview_tool_output(&full);
 
-        assert_eq!(preview.encoding, "utf-8");
-        assert!(preview.tail.is_some());
-        assert!(preview.omission_reason.is_none());
+        let serialized = json!(preview);
+        assert!(serialized["output_tail"].is_string());
+        assert!(serialized["metadata"].get("encoding").is_none());
+        assert!(serialized["metadata"].get("omission_reason").is_none());
     }
 
     #[test]
     fn utf8_preview_boundaries_do_not_split_code_points() {
         let full = "🦀".repeat((TOOL_OUTPUT_INLINE_BYTES / 4) + 1).into_bytes();
         let preview = preview_tool_output(&full);
-        assert_eq!(preview.encoding, "utf-8");
-        let tail = preview.tail.as_ref().unwrap();
-        assert!(!preview.head.contains('�'));
+        let ToolOutputPreview::Truncated {
+            head,
+            tail,
+            omitted_bytes,
+        } = preview
+        else {
+            panic!("large UTF-8 output must retain text previews");
+        };
+        assert!(!head.contains('�'));
         assert!(!tail.contains('�'));
-        assert_eq!(
-            preview.head.len() + preview.omitted_bytes + tail.len(),
-            full.len()
-        );
+        assert_eq!(head.len() + omitted_bytes + tail.len(), full.len());
+    }
+
+    #[test]
+    fn text_preview_preserves_bytes_and_both_serialized_budgets() {
+        for unit in ["x", "🦀", "\n", "\r\t", "\"\\", "a\u{1f}🦀\n"] {
+            for bytes in [0, 1, TOOL_OUTPUT_PREVIEW_BYTES, TOOL_OUTPUT_INLINE_BYTES] {
+                let text = unit.repeat(bytes / unit.len() + 1);
+                let preview = preview_tool_output(text.as_bytes());
+                match &preview {
+                    ToolOutputPreview::Inline(actual) => {
+                        assert_eq!(actual, &text);
+                        assert!(actual.len() <= TOOL_OUTPUT_INLINE_BYTES);
+                        assert!(json_string_size(actual) <= TOOL_OUTPUT_INLINE_BYTES + 2);
+                    }
+                    ToolOutputPreview::Truncated {
+                        head,
+                        tail,
+                        omitted_bytes,
+                    } => {
+                        assert!(text.starts_with(head));
+                        assert!(text.ends_with(tail));
+                        assert_eq!(head.len() + omitted_bytes + tail.len(), text.len());
+                        for part in [head, tail] {
+                            assert!(part.len() <= TOOL_OUTPUT_PREVIEW_BYTES);
+                            assert!(json_string_size(part) <= TOOL_OUTPUT_PREVIEW_BYTES + 2);
+                        }
+                    }
+                    ToolOutputPreview::Binary(_) => panic!("valid non-NUL UTF-8 is text"),
+                }
+            }
+        }
     }
 
     #[test]
     fn binary_output_is_omitted_from_the_model_payload() {
         let full = vec![0; TOOL_OUTPUT_INLINE_BYTES + 1];
         let preview = preview_tool_output(&full);
-        assert_eq!(preview.encoding, "binary");
-        assert!(preview.head.is_empty());
-        assert!(preview.tail.is_none());
-        assert_eq!(preview.omitted_bytes, full.len());
-        assert_eq!(preview.omission_reason, Some(BINARY_OUTPUT_OMISSION_REASON));
-        assert!(preview.offloaded);
+        assert!(preview.offloaded());
+        assert_eq!(
+            json!(preview),
+            json!({"metadata": {
+                "encoding": "binary", "truncated": true, "omitted_bytes": full.len(),
+                "omission_reason": BINARY_OUTPUT_OMISSION_REASON,
+            }})
+        );
     }
 
     #[test]
@@ -2618,12 +2627,14 @@ mod tests {
         let mut full = vec![b'x'; TOOL_OUTPUT_INLINE_BYTES + 1];
         full[100] = 0xff;
         let preview = preview_tool_output(&full);
-        assert_eq!(preview.encoding, "binary");
-        assert!(preview.head.is_empty());
-        assert!(preview.tail.is_none());
-        assert_eq!(preview.omitted_bytes, full.len());
-        assert_eq!(preview.omission_reason, Some(BINARY_OUTPUT_OMISSION_REASON));
-        assert!(preview.offloaded);
+        assert!(preview.offloaded());
+        assert_eq!(
+            json!(preview),
+            json!({"metadata": {
+                "encoding": "binary", "truncated": true, "omitted_bytes": full.len(),
+                "omission_reason": BINARY_OUTPUT_OMISSION_REASON,
+            }})
+        );
     }
 
     #[tokio::test]
@@ -3036,24 +3047,11 @@ mod tests {
         .unwrap();
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: Some(3),
-                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3119,24 +3117,11 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: Some(2),
                 default_shell_timeout_secs: 5,
                 compaction_mode: CompactionMode::Disabled,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3187,24 +3172,12 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: Some(2),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
                 compaction_payoff_requests: 5,
-                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 4,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(context),
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3250,24 +3223,8 @@ mod tests {
 
         let outcome = run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3300,6 +3257,53 @@ mod tests {
                     .as_str()
                     .is_some_and(|output| output.contains("answer was delivered"))
         }));
+    }
+
+    #[test]
+    fn checkpoint_borrowed_context_preserves_owned_wire_bytes() {
+        let mut context = ContextState::new("first task".into());
+        context.add_user("later task".into());
+        let before = serde_json::to_value(&context).unwrap();
+        let borrowed = serde_json::to_vec(&ContextCheckpoint {
+            version: CONTEXT_CHECKPOINT_VERSION,
+            model: "scripted".into(),
+            context: &context,
+            prompt_cache_key: Some("resume-cache-key".into()),
+        })
+        .unwrap();
+        assert_eq!(serde_json::to_value(&context).unwrap(), before);
+        let owned = serde_json::to_vec(&ContextCheckpoint {
+            version: CONTEXT_CHECKPOINT_VERSION,
+            model: "scripted".into(),
+            context,
+            prompt_cache_key: Some("resume-cache-key".into()),
+        })
+        .unwrap();
+        assert_eq!(borrowed, owned);
+    }
+
+    #[test]
+    fn resume_checkpoint_rejects_invalid_identity_and_version_without_rewriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(CONTEXT_CHECKPOINT_FILE);
+        let valid = json!({
+            "version": CONTEXT_CHECKPOINT_VERSION,
+            "model": "scripted",
+            "context": ContextState::new("first task".into()),
+            "prompt_cache_key": "resume-cache-key"
+        });
+        for invalid_context in [false, true] {
+            let mut checkpoint = valid.clone();
+            if invalid_context {
+                checkpoint["context"]["next_id"] = json!(0);
+            } else {
+                checkpoint["version"] = json!(CONTEXT_CHECKPOINT_VERSION + 1);
+            }
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(load_resume_state(temp.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -3553,24 +3557,9 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace.clone(),
                 prompt: "first task".into(),
-                session_dir: first_session.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
+                ..scripted_config(workspace.clone(), first_session.clone())
             },
             Backend::scripted(&first_steps).await.unwrap(),
         )
@@ -3581,24 +3570,12 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
                 prompt: "second task".into(),
-                session_dir: second_session.clone(),
                 model: resume.model,
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
                 prompt_cache_key,
+                ..scripted_config(workspace, second_session.clone())
             },
             Backend::scripted(&second_steps).await.unwrap(),
         )
@@ -3652,24 +3629,8 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3701,24 +3662,8 @@ mod tests {
 
         let outcome = run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3764,26 +3709,7 @@ mod tests {
         .unwrap();
 
         let outcome = run(
-            RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
-            },
+            scripted_config(workspace, session_dir.clone()),
             Backend::scripted(&steps_file).await.unwrap(),
         )
         .await
@@ -3866,24 +3792,10 @@ mod tests {
 
         let outcome = run_interactive(
             RunConfig {
-                cwd: workspace,
                 prompt: "initial task".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 25,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,
@@ -3924,24 +3836,9 @@ mod tests {
 
         let outcome = run_interactive(
             RunConfig {
-                cwd: workspace,
                 prompt: "initial task".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,

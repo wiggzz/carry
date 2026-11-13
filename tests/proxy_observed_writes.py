@@ -14,15 +14,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class ObservedWrites(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(lambda: self.assertTrue(self.harness.doCleanups(),
-                                               "nested fixture cleanup failed"))
-
+class ObservedWrites(support.FixtureCase):
     def lifecycle(self, *, partition, sse):
         # First dispatch establishes a real frozen route/owner. Only the fixture's
         # cache capability is attested afterward; actual observations must still
@@ -46,15 +38,15 @@ class ObservedWrites(unittest.TestCase):
         def review(*_):
             raise AssertionError("observed-write fixture must not dispatch reviewer work")
 
-        fixture = self.harness.fixture(primary, review)
+        fixture = self.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "synthetic whole-prefix write " * 2000}]
         snapshots, brackets, wires = [], [], []
         paid = 0.0
         for step, (cached, written) in enumerate(receipts):
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                 extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             before = time.time_ns() // 1_000_000_000
             if sse:
                 connection = http.client.HTTPConnection(*proxy.address, timeout=30)
@@ -73,7 +65,7 @@ class ObservedWrites(unittest.TestCase):
                 self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
             after = time.time_ns() // 1_000_000_000
             saved = proxy.saved()
-            records = read_index(self.harness.state / "history.index")["upstream_cache"]
+            records = read_index(self.state / "history.index")["upstream_cache"]
             paid += ((2000 - cached - written) * 2 + cached * .1 + written * 2.5 + 10 * 10) / 1e6
             self.assertEqual(saved["primary"]["calls"], step + 1)
             self.assertEqual(saved["primary"]["cached_tokens"], sum(x[0] for x in receipts[:step + 1]))
@@ -97,7 +89,7 @@ class ObservedWrites(unittest.TestCase):
             proxy.close()
             if step == 0:
                 self.assertEqual(records, [], "unknown gateway has no cache entitlement")
-                checkpoint = next(self.harness.state.glob("*.json"))
+                checkpoint = next(self.state.glob("*.json"))
                 staged = json.loads(checkpoint.read_text())
                 staged["model_resolution"]["primary"]["cache"] = {
                     "minimum_prefix_tokens": 1024, "max_read_breakpoints": 50,

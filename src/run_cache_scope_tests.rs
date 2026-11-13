@@ -27,7 +27,7 @@ fn native_rendered_generation_and_cold_resume_use_existing_context_owner() {
         .plan_compaction(&[], cache.policy_for_history(&context.input_items(), 1, 0))
         .unwrap();
     let first_change = context.compact(first_plan);
-    cache.mark_compaction(&first_change.invalidated_generations);
+    cache.mark_compaction(&first_change.plan.invalidated_generations);
     let first = context.input_items();
     let first_breakpoints = context.rendered_breakpoints();
     assert_eq!(
@@ -80,7 +80,7 @@ fn native_rendered_generation_and_cold_resume_use_existing_context_owner() {
         .plan_compaction(&[], cache.policy_for_history(&context.input_items(), 1, 0))
         .unwrap();
     let second_change = context.compact(second_plan);
-    cache.mark_compaction(&second_change.invalidated_generations);
+    cache.mark_compaction(&second_change.plan.invalidated_generations);
     let current = context.input_items();
     assert!(!current.starts_with(&first));
     assert!(

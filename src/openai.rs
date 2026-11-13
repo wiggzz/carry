@@ -70,6 +70,19 @@ pub struct Usage {
 }
 
 impl Usage {
+    pub(crate) fn cost_at_rates(&self, rates: carry::models::Rates) -> f64 {
+        let cached = self.cached_input_tokens.min(self.input_tokens);
+        let written = self
+            .cache_write_input_tokens
+            .min(self.input_tokens - cached);
+        rates.cost(
+            self.input_tokens - cached - written,
+            cached,
+            written,
+            self.output_tokens,
+        )
+    }
+
     /// Complete validated native partitions. Display counters alone cannot
     /// establish that missing or contradictory receipt data was known zero.
     pub(crate) fn from_receipt(usage: &Value) -> Option<Self> {
@@ -102,17 +115,7 @@ pub(crate) fn receipt_cost_usd(model: &str, raw: &Value) -> Option<f64> {
 /// Modeled USD rates from scripts/swebench_smoke.py and published OpenAI pricing, not a billing quote.
 pub(crate) fn estimated_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     let rates = carry::models::Rates::for_model(model, usage.input_tokens as f64)?;
-    let cached = usage.cached_input_tokens.min(usage.input_tokens);
-    let written = usage
-        .cache_write_input_tokens
-        .min(usage.input_tokens - cached);
-    let ordinary = usage.input_tokens - cached - written;
-    Some(
-        ordinary as f64 * rates.input
-            + cached as f64 * rates.cached
-            + written as f64 * rates.write
-            + usage.output_tokens as f64 * rates.output,
-    )
+    Some(usage.cost_at_rates(rates))
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1003,6 +1006,42 @@ mod tests {
         assert_eq!(estimated_cost_usd("gpt-5.6-luna", &usage), Some(0.258));
         assert_eq!(estimated_cost_usd("custom-model", &usage), None);
         assert_eq!(estimated_cost_usd("gpt-5.6-astra", &usage), None);
+    }
+
+    #[test]
+    fn shared_tariff_math_preserves_model_clamping_and_strict_receipt_validation() {
+        let rates = carry::models::Rates {
+            input: 1.0,
+            cached: 2.0,
+            write: 4.0,
+            output: 8.0,
+        };
+        for (input, cached, written, output, expected) in [
+            (0, 0, 0, 0, 0.0),
+            (100, 0, 0, 3, 124.0),
+            (100, 40, 20, 3, 224.0),
+            (100, 120, 30, 3, 224.0),
+            (100, 40, 120, 3, 344.0),
+            (0, 10, 20, 3, 24.0),
+        ] {
+            let usage = Usage {
+                input_tokens: input,
+                cached_input_tokens: cached,
+                cache_write_input_tokens: written,
+                output_tokens: output,
+                ..Usage::default()
+            };
+            assert_eq!(usage.cost_at_rates(rates), expected);
+            let raw = json!({"input_tokens":input,"output_tokens":output,
+                "input_tokens_details":{"cached_tokens":cached,"cache_write_tokens":written}});
+            let mut ledger = carry::core::UsageLedger::default();
+            let valid = cached <= input && written <= input - cached;
+            assert_eq!(
+                ledger.settle_with_rates("fixture", &raw, true, Some(rates)),
+                valid.then_some(expected)
+            );
+            assert_eq!(ledger.cost_usd, if valid { expected } else { 0.0 });
+        }
     }
 
     #[test]

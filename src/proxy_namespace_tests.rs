@@ -96,7 +96,7 @@ fn assert_namespace_fences(
             different[boundary] = json!("different-boundary");
         }
         let namespace = history::namespace(service, &other_headers, &different).unwrap();
-        let (selected, pin) = history::resolve(service, &namespace, &different).unwrap();
+        let (selected, pin) = history::resolve(service, &namespace, &different, None).unwrap();
         assert_ne!(selected, id, "{boundary} must fence owner lookup");
         drop(pin);
         different["input"] = json!([{"role":"user","content":"unrelated resume"}]);
@@ -123,7 +123,7 @@ fn namespace_owner_restart(initialized: bool) {
     let headers = HeaderMap::new();
     let (mut body, old_namespace, id, frozen) =
         seed_namespace(&service, &headers, true, initialized);
-    let (control, pin) = history::resolve(&service, &old_namespace, &body).unwrap();
+    let (control, pin) = history::resolve(&service, &old_namespace, &body, None).unwrap();
     assert_eq!(control, id);
     drop(pin);
     drop(service);
@@ -138,7 +138,7 @@ fn namespace_owner_restart(initialized: bool) {
         .push(json!({"role":"user","content":"append after restart"}));
     assert_namespace_fences(&service, &headers, &body, &id, &frozen);
     let namespace = history::namespace(&service, &headers, &body).unwrap();
-    let (selected, _pin) = history::resolve(&service, &namespace, &body).unwrap();
+    let (selected, _pin) = history::resolve(&service, &namespace, &body, None).unwrap();
     assert_eq!(
         selected, id,
         "proven append ancestry must retain its paid/free quantity owner"
@@ -228,7 +228,7 @@ fn reviewer_contract_changes_invalidate_advice_not_observed_history() {
             _ => unreachable!(),
         }
         let changed_namespace = history::namespace(&service, &headers, &body).unwrap();
-        let (selected, pin) = history::resolve(&service, &changed_namespace, &body).unwrap();
+        let (selected, pin) = history::resolve(&service, &changed_namespace, &body, None).unwrap();
         let advice = history::advice(&service, &changed_namespace, input).unwrap();
         drop(pin);
         assert_eq!(

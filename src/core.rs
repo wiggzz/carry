@@ -259,10 +259,7 @@ impl UsageLedger {
                 })
         {
             // Token overflow does not erase an independently priceable receipt.
-            let cost = (input - cached - written) as f64 * rates.input
-                + cached as f64 * rates.cached
-                + written as f64 * rates.write
-                + output as f64 * rates.output;
+            let cost = rates.cost(input - cached - written, cached, written, output);
             let total = self.cost_usd + cost;
             if cost.is_finite() && total.is_finite() {
                 self.cost_usd = total;

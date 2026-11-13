@@ -240,7 +240,6 @@ async fn archive_sync_reviewer_stale_reservation_and_primary_fault_preserve_comm
                 request_id: "numeric-primary".into(),
                 candidate: session.clone(),
                 reviewed: session,
-                submitted_ids: Vec::new(),
                 observed_input: outbound["input"].as_array().unwrap().clone(),
                 outbound,
                 native: false,

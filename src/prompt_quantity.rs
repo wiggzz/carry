@@ -1,12 +1,8 @@
 //! Local prompt text quantities. Native opaque payloads have no text-token size.
 use serde_json::Value;
 
-fn sanitized_item(value: &Value, opaque: &mut bool) -> Value {
-    let Some(object) = value.as_object() else {
-        return value.clone();
-    };
-    let kind = object.get("type").and_then(Value::as_str);
-    if matches!(
+fn native_payload(kind: Option<&str>) -> bool {
+    matches!(
         kind,
         Some(
             "input_image"
@@ -17,87 +13,79 @@ fn sanitized_item(value: &Value, opaque: &mut bool) -> Value {
                 | "item_reference"
                 | "computer_screenshot"
         )
-    ) {
-        *opaque = true;
+    )
+}
+
+fn sanitized_array(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(sanitized_item).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn sanitized_item(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let kind = object.get("type").and_then(Value::as_str);
+    if native_payload(kind) {
         // Keep a typed placeholder, never encoded bytes, URLs, or file IDs.
         return serde_json::json!({"type":object["type"]});
     }
-    let encrypted = matches!(kind, Some("reasoning" | "compaction"))
-        && object.contains_key("encrypted_content");
-    *opaque |= encrypted;
-    let mut item = object
-        .iter()
-        .filter(|(key, _)| !encrypted || key.as_str() != "encrypted_content")
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<serde_json::Map<_, _>>();
-    match kind {
-        Some("function_call_output" | "custom_tool_call_output") => {
-            // Typed output arrays can contain native image/file inputs. JSON
-            // objects and strings are quoted tool data, not protocol envelopes.
-            if let Some(Value::Array(output)) = item.get_mut("output") {
-                *output = output
-                    .iter()
-                    .map(|part| sanitized_item(part, opaque))
-                    .collect();
-            }
-            return Value::Object(item);
-        }
-        Some("computer_call_output") => {
-            if let Some(output) = item.get_mut("output") {
-                *output = sanitized_item(output, opaque);
-            }
-            return Value::Object(item);
-        }
-        _ => {}
-    }
-    if let Some(Value::Array(content)) = item.get_mut("content") {
-        *content = content
+    let encrypted = matches!(kind, Some("reasoning" | "compaction"));
+    Value::Object(
+        object
             .iter()
-            .map(|part| sanitized_item(part, opaque))
-            .collect();
-    }
-    Value::Object(item)
+            .filter(|(key, _)| !encrypted || key.as_str() != "encrypted_content")
+            .map(|(key, value)| {
+                let value = match (kind, key.as_str()) {
+                    // Only typed arrays are native tool output; objects and
+                    // strings remain quoted source data, including lookalikes.
+                    (Some("function_call_output" | "custom_tool_call_output"), "output") => {
+                        sanitized_array(value)
+                    }
+                    (Some("computer_call_output"), "output") => sanitized_item(value),
+                    (
+                        Some(
+                            "function_call_output"
+                            | "custom_tool_call_output"
+                            | "computer_call_output",
+                        ),
+                        _,
+                    ) => value.clone(),
+                    (_, "content") => sanitized_array(value),
+                    _ => value.clone(),
+                };
+                (key.clone(), value)
+            })
+            .collect(),
+    )
 }
 
-fn sanitized(value: &Value) -> (Value, bool) {
-    let mut opaque = false;
-    let visible = match value {
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| sanitized_item(item, &mut opaque))
-                .collect(),
-        ),
+fn sanitized(value: &Value) -> Value {
+    match value {
+        Value::Array(_) => sanitized_array(value),
         Value::Object(object) if object.contains_key("input") => Value::Object(
             object
                 .iter()
                 .map(|(key, value)| {
-                    let value = if key == "input" {
-                        if let Value::Array(items) = value {
-                            Value::Array(
-                                items
-                                    .iter()
-                                    .map(|item| sanitized_item(item, &mut opaque))
-                                    .collect(),
-                            )
+                    (
+                        key.clone(),
+                        if key == "input" {
+                            sanitized_array(value)
                         } else {
                             value.clone()
-                        }
-                    } else {
-                        value.clone()
-                    };
-                    (key.clone(), value)
+                        },
+                    )
                 })
                 .collect(),
         ),
-        _ => sanitized_item(value, &mut opaque),
-    };
-    (visible, opaque)
+        _ => sanitized_item(value),
+    }
 }
 
 pub(crate) fn local_text_tokens(value: &Value) -> u64 {
-    let (visible, _) = sanitized(value);
-    let rendered = visible.to_string();
+    let rendered = sanitized(value).to_string();
     #[cfg(test)]
     TOKEN_WORK.with(|work| {
         let (calls, bytes) = work.get();
@@ -112,16 +100,11 @@ fn item_has_opaque(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
-    match object.get("type").and_then(Value::as_str) {
-        Some(
-            "input_image"
-            | "image_url"
-            | "input_audio"
-            | "input_video"
-            | "input_file"
-            | "item_reference"
-            | "computer_screenshot",
-        ) => return true,
+    let kind = object.get("type").and_then(Value::as_str);
+    if native_payload(kind) {
+        return true;
+    }
+    match kind {
         Some("reasoning" | "compaction") if object.contains_key("encrypted_content") => {
             return true;
         }
@@ -155,6 +138,77 @@ pub(crate) fn prompt_has_opaque(value: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_envelopes_and_quoted_data_keep_their_exact_text_projection() {
+        let check = |body: Value, expected: Value, opaque: bool| {
+            let frozen = body.clone();
+            let tokens = tiktoken_rs::o200k_base_singleton()
+                .encode_ordinary(&expected.to_string())
+                .len() as u64;
+            assert_eq!(local_text_tokens(&body), tokens, "{body}");
+            assert_eq!(prompt_has_opaque(&body), opaque, "{body}");
+            assert_eq!(body, frozen);
+        };
+        for kind in [
+            "input_image",
+            "image_url",
+            "input_audio",
+            "input_video",
+            "input_file",
+            "item_reference",
+            "computer_screenshot",
+            "reasoning",
+            "compaction",
+        ] {
+            let native = json!({"type":kind,"encrypted_content":"private payload",
+                "image_url":"private URL","file_id":"private ID","summary":[]});
+            let visible = if matches!(kind, "reasoning" | "compaction") {
+                json!({"type":kind,"image_url":"private URL","file_id":"private ID","summary":[]})
+            } else {
+                json!({"type":kind})
+            };
+            for (body, expected) in [
+                (native.clone(), visible.clone()),
+                (json!([native]), json!([visible])),
+                (
+                    json!({"input":[native],"metadata":{"keep":"ordinary data"}}),
+                    json!({"input":[visible],"metadata":{"keep":"ordinary data"}}),
+                ),
+                (
+                    json!({"role":"user","content":[native]}),
+                    json!({"role":"user","content":[visible]}),
+                ),
+                (
+                    json!({"type":"computer_call_output","output":native}),
+                    json!({"type":"computer_call_output","output":visible}),
+                ),
+            ] {
+                check(body, expected, true);
+            }
+            for tool in ["function_call_output", "custom_tool_call_output"] {
+                check(
+                    json!({"type":tool,"output":[native]}),
+                    json!({"type":tool,"output":[visible]}),
+                    true,
+                );
+                let quoted = json!({"type":tool,"output":native,"content":[native]});
+                check(quoted.clone(), quoted, false);
+            }
+            let malformed = json!({"input":native,"content":[native]});
+            check(malformed.clone(), malformed, false);
+        }
+        for body in [
+            json!(null),
+            json!(7),
+            json!("quoted input_image"),
+            json!({"type":"unknown","encrypted_content":"quoted data"}),
+            json!({"type":"computer_call_output","output":[{"type":"input_image"}]}),
+            json!({"role":"user","content":{"type":"input_image"}}),
+        ] {
+            check(body.clone(), body, false);
+        }
+    }
 
     #[test]
     fn native_payload_sizes_do_not_become_text_tokens() {

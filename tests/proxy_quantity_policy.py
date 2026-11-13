@@ -35,15 +35,7 @@ class Cells(HTMLParser):
             self.cell = None
 
 
-class QuantityPolicy(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(lambda: self.assertTrue(self.harness.doCleanups(),
-                                               'nested fixture cleanup failed'))
-
+class QuantityPolicy(support.FixtureCase):
     def test_unknown_money_does_not_suppress_later_summary_in_either_adapter(self):
         results = {}
         self.evidence['arms'] = results
@@ -64,7 +56,7 @@ class QuantityPolicy(unittest.TestCase):
             inputs = [10000, 300000, 300100]
             for shared in [False, True]:
                 kind = f'{ttl}-{shared}'
-                state = self.harness.state / kind
+                state = self.state / kind
                 state.mkdir()
 
                 def primary(_body, n):
@@ -74,14 +66,14 @@ class QuantityPolicy(unittest.TestCase):
                                                                   'cache_write_tokens': 1000 if n == 2 else 0}}
                     return 200, response
 
-                fixture = self.harness.fixture(primary, lambda *_: self.fail('unexpected reviewer'))
+                fixture = self.fixture(primary, lambda *_: self.fail('unexpected reviewer'))
                 self.addCleanup(lambda fixture=fixture: self.assertEqual(fixture.errors, []))
                 snapshots, estimates, owners = [], [], []
                 previous_files = {}
                 for index, body in enumerate(bodies):
                     proxy = OwnerProxy(state, fixture, shared=shared, mode='audit', wait_reviews=False,
                                        extra_env={'CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS': '1000000'})
-                    self.harness.stack.callback(proxy.close)
+                    self.stack.callback(proxy.close)
                     for name, saved in previous_files.items():
                         self.assertEqual(read_index(state / name), saved,
                                          'restart must not mutate settled quantities or money')
@@ -132,7 +124,7 @@ class QuantityPolicy(unittest.TestCase):
                                  'primaries': fixture.primaries, 'reviews': fixture.reviews}
                 fixture.close()
 
-            directory = self.harness.state / f'report-{ttl}'
+            directory = self.state / f'report-{ttl}'
             session = directory / 'sessions' / f'report-{ttl}'
             session.mkdir(parents=True)
             events = [{'event': 'run_started', 'data': {'model': 'gpt-6.1-sol', 'context_window': 40000,
