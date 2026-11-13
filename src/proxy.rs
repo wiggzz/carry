@@ -1974,7 +1974,6 @@ struct Commit {
     request_id: String,
     candidate: Session,
     reviewed: Session,
-    submitted_ids: Vec<u64>,
     // Canonical caller ancestry is independent of the selected context. Native
     // compaction can clear the latter before this observation is committed.
     observed_input: Vec<Value>,
@@ -2440,11 +2439,14 @@ async fn forward_timed(
             // Only a completed, validated result can authorize a fitting retry.
             let mut bounded = (*service).clone();
             bounded.config.classifier_timeout_secs = bounded.config.classifier_timeout_secs.min(5);
-            let before = session.clone();
             session.review_epoch = next_review_generation();
             session.background_review_pending = true;
             let projection = planning::Projection::canonical(&session);
-            let review_body = review_body_projected(&bounded.config, &session, &projection);
+            let view = crate::proxy_state::ReviewedView::new(
+                &session,
+                &session.groups_for(&projection.omitted),
+            );
+            let review_body = review_body_for_view(&bounded.config, &session, &projection, &view);
             session.last_reviewer_dispatch =
                 Some(dispatch_measurement(&request_id, "reviewer", &review_body));
             settlement::reserve(&service, &mut session, &review_body, false).map_err(|_| {
@@ -2465,7 +2467,9 @@ async fn forward_timed(
             };
             timing.active_phase = "blocking_review";
             let started = Instant::now();
-            run_review(&bounded, &id, &mut session, &projection, &mut run).await;
+            if review_fits_measured(&bounded.config, &session, &review_body) {
+                review_chunk(&bounded, &id, &mut session, &review_body, &view, &mut run).await;
+            }
             timing::Phases::add(&mut timing.blocking_review_us, started);
             timing.active_phase = "preparation";
             session.background_review_pending = false;
@@ -2496,7 +2500,6 @@ async fn forward_timed(
             (candidate, report) = plan(&service.config, &session, &outbound);
             timing::Phases::add(&mut timing.planning_us, started);
             acquired = true;
-            let _ = before;
         }
         let projection = if active && service.config.mode == Mode::Compact {
             candidate.unwrap_or_else(|| planning::Projection::canonical(&session))
@@ -2652,12 +2655,6 @@ async fn forward_timed(
                 failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
             }
         })?;
-        let submitted_ids = session
-            .history
-            .iter()
-            .filter(|i| !projection.omitted.contains(&i.id))
-            .map(|i| i.id)
-            .collect();
         let _ = trace(&service, &id, "primary_submitted", &outbound);
         journal(
             &service,
@@ -2672,7 +2669,6 @@ async fn forward_timed(
             request_id,
             candidate: session,
             reviewed,
-            submitted_ids,
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
             native,
@@ -3218,6 +3214,7 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
     }
 }
 
+#[cfg(test)]
 async fn run_review(
     service: &Service,
     id: &str,
@@ -4530,7 +4527,7 @@ async fn relay(
                     commit.candidate.native_compactions += 1;
                 } else {
                     for item in &mut commit.candidate.history {
-                        if commit.submitted_ids.contains(&item.id) {
+                        if commit.candidate.last_submitted_ids.contains(&item.id) {
                             item.exposed = true;
                         }
                     }

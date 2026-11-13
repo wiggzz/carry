@@ -23,17 +23,24 @@ impl Drop for Proxy {
 // One stdlib HTTP fixture is shared by CI's built binary and the immutable
 // prebuilt baseline. This lets model-free RED evidence execute the exact tests
 // without compiling a second implementation of the regression locally.
+fn python_fixture(script: &str) -> Command {
+    let mut command = Command::new("python3");
+    command
+        .arg("-B")
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join(script),
+        )
+        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"));
+    command
+}
+
 fn state_regression(selector: &str) {
     let evidence = tempfile::tempdir().unwrap();
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_state_regressions.py"
-        ))
+    let output = python_fixture("proxy_state_regressions.py")
         .arg(format!("StateRegressions.test_{selector}"))
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .env("CARRY_TEST_EVIDENCE_DIR", evidence.path())
         .output()
         .expect("Python 3 must run the loopback-only state regression fixture");
@@ -67,13 +74,7 @@ fn state_regression(selector: &str) {
 
 #[test]
 fn durable_retention_accounting_http() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_retention.py"
-        ))
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+    let output = python_fixture("proxy_retention.py")
         .output()
         .expect("Python must exercise the actual retention HTTP boundary");
     assert!(
@@ -86,14 +87,8 @@ fn durable_retention_accounting_http() {
 
 #[test]
 fn dashboard_dispatch_contract() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_dashboard_contract.py"
-        ))
+    let output = python_fixture("proxy_dashboard_contract.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must run the credential-free dashboard fixture");
     assert!(
@@ -112,14 +107,8 @@ fn marginal_planner_preserves_cheaper_valid_warm_projection() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| evidence.path().to_path_buf());
     std::fs::create_dir_all(&output_directory).unwrap();
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_planner_marginal.py"
-        ))
+    let output = python_fixture("proxy_planner_marginal.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .env("CARRY_TEST_EVIDENCE_DIR", &output_directory)
         .output()
         .expect("Python 3 must execute the loopback marginal planner regression");
@@ -311,14 +300,8 @@ fn small_token_budget_memory_admission_preserves_review_progress() {
 
 #[test]
 fn incremental_reviewer_context_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_incremental.py"
-        ))
+    let output = python_fixture("proxy_incremental.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must run the actual-binary incremental reviewer fixture");
     assert!(
@@ -331,14 +314,8 @@ fn incremental_reviewer_context_regressions() {
 
 #[test]
 fn reviewer_independent_primary_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_independence.py"
-        ))
+    let output = python_fixture("proxy_independence.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute reviewer-independent primary HTTP regressions");
     assert!(
@@ -353,14 +330,8 @@ fn reviewer_independent_primary_http_regressions() {
 // timeout regression. The same file runs against the provenance-bound baseline.
 #[test]
 fn pr144_review_behavior_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_review_regressions.py"
-        ))
+    let output = python_fixture("proxy_review_regressions.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound PR144 loopback regressions");
     assert!(
@@ -373,14 +344,8 @@ fn pr144_review_behavior_regressions() {
 
 #[test]
 fn fresh_reasoning_baseline_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_baseline_sizing.py"
-        ))
+    let output = python_fixture("proxy_baseline_sizing.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute fresh reasoning baseline regressions");
     assert!(
@@ -393,14 +358,8 @@ fn fresh_reasoning_baseline_http_regressions() {
 
 #[test]
 fn historical_success_prefix_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_historical_success_prefix.py"
-        ))
+    let output = python_fixture("proxy_historical_success_prefix.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute historical-success prefix controls");
     assert!(
@@ -413,14 +372,8 @@ fn historical_success_prefix_http_regressions() {
 
 #[test]
 fn successful_comparison_population_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_comparison_population.py"
-        ))
+    let output = python_fixture("proxy_comparison_population.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute successful-population accounting controls");
     assert!(
@@ -433,14 +386,8 @@ fn successful_comparison_population_http_regressions() {
 
 #[test]
 fn receipt_calibrated_traditional_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_traditional_estimation.py"
-        ))
+    let output = python_fixture("proxy_traditional_estimation.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute receipt-calibrated traditional HTTP regressions");
     assert!(
@@ -457,14 +404,8 @@ fn repeated_visible_pool_http_regressions() {
     let evidence = std::env::var_os("CARRY_TEST_EVIDENCE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| temporary.path().to_owned());
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_visible_pool.py"
-        ))
+    let output = python_fixture("proxy_visible_pool.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .env("CARRY_TEST_EVIDENCE_DIR", &evidence)
         .output()
         .expect("Python 3 must execute repeated visible occurrence pool regressions");
@@ -522,14 +463,8 @@ fn repeated_visible_pool_http_regressions() {
 // This executes the portable loopback matrix with this source's native binary.
 #[test]
 fn no_op_receipt_parity_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_noop_parity.py"
-        ))
+    let output = python_fixture("proxy_noop_parity.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound no-op receipt parity controls");
     assert!(
@@ -544,14 +479,8 @@ fn no_op_receipt_parity_http_regressions() {
 // route-specific write contract and immutable policy migration are implemented.
 #[test]
 fn cache_write188_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_cache_write_regressions.py"
-        ))
+    let output = python_fixture("proxy_cache_write_regressions.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound cache-write accounting controls");
     assert!(
@@ -566,14 +495,8 @@ fn cache_write188_http_regressions() {
 // intentionally failing write-pricing diagnostic above is still unresolved.
 #[test]
 fn cache_policy188_migration_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_cache_policy_regressions.py"
-        ))
+    let output = python_fixture("proxy_cache_policy_regressions.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound cache-policy migration controls");
     assert!(
@@ -588,14 +511,8 @@ fn cache_policy188_migration_http_regressions() {
 #[test]
 fn native_cache_proof_http_regression() {
     let evidence = tempfile::tempdir().unwrap();
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/native_cache_proof.py"
-        ))
+    let output = python_fixture("native_cache_proof.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .env("CARRY_TEST_EVIDENCE_DIR", evidence.path())
         .output()
         .expect("Python 3 must execute native cache-proof controls");
@@ -612,14 +529,8 @@ fn native_cache_proof_http_regression() {
 #[test]
 fn native_receipt_partitions_and_report_regression() {
     let evidence = tempfile::tempdir().unwrap();
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/native_receipt_partitions.py"
-        ))
+    let output = python_fixture("native_receipt_partitions.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .env("CARRY_TEST_EVIDENCE_DIR", evidence.path())
         .output()
         .expect("Python 3 must execute actual native JSON/SSE receipt and report controls");
@@ -636,14 +547,8 @@ fn native_receipt_partitions_and_report_regression() {
 // transitions through unsupported monetary intervals.
 #[test]
 fn shared_quantity_policy_http_and_report_regression() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_quantity_policy.py"
-        ))
+    let output = python_fixture("proxy_quantity_policy.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound quantity-policy differential");
     std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
@@ -659,14 +564,8 @@ fn shared_quantity_policy_http_and_report_regression() {
 // terminal settlement. The fixture crosses expiry with a real held response.
 #[test]
 fn dispatch_clock_http_regression() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_dispatch_clock.py"
-        ))
+    let output = python_fixture("proxy_dispatch_clock.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound dispatch-clock control");
     assert!(
@@ -681,14 +580,8 @@ fn dispatch_clock_http_regression() {
 // unknown-history initialization is implemented. Never run against a live proxy.
 #[test]
 fn initialization186_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_initialization_regressions.py"
-        ))
+    let output = python_fixture("proxy_initialization_regressions.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound initialization controls");
     assert!(
@@ -706,14 +599,8 @@ fn initialization186_http_regressions() {
 // grant another initialization. Explicit and implicit controls restart each call.
 #[test]
 fn cache_ttl_session_history_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_session_history.py"
-        ))
+    let output = python_fixture("proxy_session_history.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound Session TTL history controls");
     assert!(
@@ -728,14 +615,8 @@ fn cache_ttl_session_history_http_regressions() {
 // Trajectory decoder probes. Current eventless history must restart cold once.
 #[test]
 fn current_history_session_load_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_legacy_history.py"
-        ))
+    let output = python_fixture("proxy_legacy_history.py")
         .arg("-v")
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
         .output()
         .expect("Python 3 must execute source-bound current Session load controls");
     assert!(
@@ -750,13 +631,7 @@ fn current_history_session_load_http_regressions() {
 // continuity follows that actual wire, not the pre-adaptation request.
 #[test]
 fn current_history_adapted_wire_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_legacy_adapter.py"
-        ))
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+    let output = python_fixture("proxy_legacy_adapter.py")
         .output()
         .expect("Python 3 must execute source-bound current adapted-wire controls");
     assert!(
@@ -769,13 +644,7 @@ fn current_history_adapted_wire_http_regressions() {
 
 #[test]
 fn cache_partition_aliases_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_cache_partitions.py"
-        ))
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+    let output = python_fixture("proxy_cache_partitions.py")
         .output()
         .expect("Python 3 must execute actual cache-partition alias controls");
     assert!(
@@ -788,13 +657,7 @@ fn cache_partition_aliases_http_regressions() {
 
 #[test]
 fn observed_write_transport_bounds_http_regressions() {
-    let output = Command::new("python3")
-        .arg("-B")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/proxy_observed_writes.py"
-        ))
-        .env("CARRY_TEST_BINARY", env!("CARGO_BIN_EXE_carry"))
+    let output = python_fixture("proxy_observed_writes.py")
         .output()
         .expect("Python 3 must execute real observed-write producer controls");
     assert!(
