@@ -1252,6 +1252,33 @@ class NativeProviderFixtureTests(unittest.TestCase):
 
 
 class FixtureOwnershipTests(unittest.TestCase):
+    def test_additional_fixture_consumers(self):
+        binary = Path(os.environ.get('CARRY_TEST_BINARY', 'target/debug/carry')).resolve()
+        if not binary.is_file():
+            self.skipTest('requires an existing Carry binary; never builds locally')
+        for module in ('proxy_continuous_trajectory', 'proxy_evidence_archive'):
+            with self.subTest(module=module), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run([sys.executable, '-B', str(
+                    Path(__file__).resolve().parents[1] / 'tests' / (module + '.py')), '-v'],
+                    env={**os.environ, 'CARRY_TEST_BINARY': str(binary),
+                         'CARRY_TEST_EVIDENCE_DIR': directory},
+                    capture_output=True, text=True, timeout=120)
+                print(result.stdout + result.stderr, flush=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertRegex(result.stderr, r'Ran [1-9][0-9]* tests?')
+
+    def test_transitive_adapter_fixture_setup_closes_private_state(self):
+        from proxy_legacy_adapter import LegacyAdapterLoads
+        selector = unittest.defaultTestLoader.getTestCaseNames(LegacyAdapterLoads)[0]
+        case = LegacyAdapterLoads(selector)
+        try:
+            case.setUp()
+            state = case.state
+            self.assertTrue(state.exists())
+        finally:
+            self.assertTrue(case.doCleanups())
+        self.assertFalse(state.exists())
+
     def test_fixture_base_does_not_register_unrelated_regressions(self):
         self.assertEqual(unittest.defaultTestLoader.getTestCaseNames(support.FixtureCase), [])
 
