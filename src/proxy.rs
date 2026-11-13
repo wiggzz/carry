@@ -2198,12 +2198,12 @@ async fn forward_timed(
                 continue;
             }
             if effective.config.mode != Mode::Off && implicit {
-                // The candidate was only a metadata hint. Release its pin
-                // before selecting the actual owner, so a parent-to-child
-                // move does not consume an extra history-owner slot.
-                drop(history_pin.take());
-                let (selected, pin) =
-                    history::resolve(&service, namespace.as_ref().unwrap(), &body)?;
+                let (selected, pin) = history::resolve(
+                    &service,
+                    namespace.as_ref().unwrap(),
+                    &body,
+                    history_pin.take(),
+                )?;
                 if selected != id {
                     // A metadata hint or awaited mutable tip can differ from
                     // the expanded request's owner. Re-resolve under that lock

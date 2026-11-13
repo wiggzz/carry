@@ -43,7 +43,7 @@ async fn queued_owner_survives_expiry_at_reresolution_and_cold_accounting() {
     let body = json!({"model":"gpt-6-luna","input":[{"role":"user","content":"queued history"}],"stream":false});
     let wire = Bytes::from(serde_json::to_vec(&body).unwrap());
     let namespace = history::namespace(&service, &HeaderMap::new(), &body).unwrap();
-    let (owner, setup_pin) = history::resolve(&service, &namespace, &body).unwrap();
+    let (owner, setup_pin) = history::resolve(&service, &namespace, &body, None).unwrap();
     request(service.clone(), wire.clone()).await;
     assert_eq!(captures.recv().await.unwrap(), wire);
     let first = history::restore(&service, &owner).unwrap();
@@ -217,7 +217,7 @@ fn retention_existing_owner_admission_child() {
     let service = checkpoint_service(directory.path());
     let input = vec![json!({"role":"user","content":"retained continuation"})];
     let body = json!({"input":input});
-    let (id, pin) = history::resolve(&service, "admission-namespace", &body).unwrap();
+    let (id, pin) = history::resolve(&service, "admission-namespace", &body, None).unwrap();
     let mut session = Session {
         history_shared: true,
         history_namespace: Some("admission-namespace".into()),
@@ -246,7 +246,7 @@ fn retention_existing_owner_admission_child() {
         )
         .unwrap()
         .expect("existing external-ID candidate"),
-        "resolve" => history::resolve(&service, "admission-namespace", &body).unwrap(),
+        "resolve" => history::resolve(&service, "admission-namespace", &body, None).unwrap(),
         _ => panic!("unknown fixture mode"),
     };
     assert_eq!(selected, id);
@@ -322,7 +322,7 @@ fn retention_oversized_existing_owner_is_backpressure_not_a_cold_miss() {
     session.ingest(&input).unwrap();
     history::committed(&service, "original-owner", &session, None).unwrap();
     let body = json!({"input":input});
-    let (owner, pin) = history::resolve(&service, "oversized-owner", &body).unwrap();
+    let (owner, pin) = history::resolve(&service, "oversized-owner", &body, None).unwrap();
     assert_eq!(owner, "original-owner");
     drop(pin);
     let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
@@ -334,7 +334,7 @@ fn retention_oversized_existing_owner_is_backpressure_not_a_cold_miss() {
         )
         .unwrap();
     service.config.history_max_bytes = u32::try_from(length - 1).unwrap();
-    match history::resolve(&service, "oversized-owner", &body) {
+    match history::resolve(&service, "oversized-owner", &body, None) {
         Err(error) => assert_eq!(error.0, StatusCode::INSUFFICIENT_STORAGE),
         Ok((owner, _)) => panic!("oversized retained owner silently resolved as {owner}"),
     }
@@ -713,7 +713,7 @@ async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store
             .collect::<Vec<_>>();
         let body = json!({"model":"gpt-6-luna","input":input,"stream":false});
         let namespace = history::namespace(&service, &HeaderMap::new(), &body).unwrap();
-        let (id, pin) = history::resolve(&service, &namespace, &body).unwrap();
+        let (id, pin) = history::resolve(&service, &namespace, &body, None).unwrap();
         let mut seed = Session {
             history_shared: true,
             history_namespace: Some(namespace.clone()),
