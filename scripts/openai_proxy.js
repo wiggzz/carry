@@ -39,8 +39,18 @@ function telemetryUsage(value) {
     const details = value[key];
     result[key] = {};
     if (!details || typeof details !== 'object' || Array.isArray(details)) { unknown = true; continue; }
-    if (Object.keys(details).some(k => !names.includes(k))) unknown = true;
+    const allowed = key === 'input_tokens_details' ? [...names, 'cache_write_tokens_details'] : names;
+    if (Object.keys(details).some(k => !allowed.includes(k))) unknown = true;
     for (const name of names) number(details, result[key], name);
+    if (key === 'input_tokens_details' && Object.hasOwn(details, 'cache_write_tokens_details')) {
+      // The flat write tariff covers 30m writes only. Normalize redundant TTL
+      // metadata only when it proves that the entire scalar total is short-TTL.
+      // Unknown/mixed TTLs retain the unpriced marker; never log arbitrary keys.
+      const ttl = details.cache_write_tokens_details;
+      if (!isObject(ttl) || Object.keys(ttl).some(k => !['ttl_30m_tokens', 'ttl_12h_tokens'].includes(k)) ||
+          !Number.isSafeInteger(ttl.ttl_30m_tokens) || ttl.ttl_30m_tokens < 0 ||
+          ttl.ttl_12h_tokens !== 0 || ttl.ttl_30m_tokens !== result[key].cache_write_tokens) unknown = true;
+    }
   }
   // Preserve unknown pricing semantics without retaining unknown payload or keys.
   if (unknown) {

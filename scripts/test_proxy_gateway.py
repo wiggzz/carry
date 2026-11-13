@@ -49,6 +49,69 @@ class Provider:
 
 
 class TrustedGatewayTests(unittest.TestCase):
+    def test_reviewer_30m_write_breakdown_reconciles_through_gateway(self):
+        from decimal import Decimal
+        from scripts import proxy_benchmark
+        # Metering-only replay of retained SCB artifact13993887747's
+        # shadow_completed response; no prompt, credential or paid request.
+        usage = {'input_tokens': 31050, 'input_tokens_details': {
+            'cache_write_tokens': 30539, 'cached_tokens': 0,
+            'cache_write_tokens_details': {'ttl_12h_tokens': 0, 'ttl_30m_tokens': 30539}},
+            'output_tokens': 864, 'output_tokens_details': {'reasoning_tokens': 692},
+            'total_tokens': 31914}
+        reply = {'status': 'completed', 'model': 'gpt-6-luna',
+                 'service_tier': 'default', 'output': [], 'usage': usage}
+        for streaming in (False, True):
+            payload = (('data: '+json.dumps({'type': 'response.completed', 'response': reply})+'\n\n')
+                       if streaming else json.dumps(reply)).encode()
+            with self.subTest(streaming=streaming), Provider(response_bytes=payload) as provider:
+                gateway = Gateway(provider.server.server_port, provider.server.server_port)
+                body = b'{"model":"gpt-6-luna","input":[]}'
+                try:
+                    for token in ('fixture-client', 'fixture-shadow'):
+                        status, raw = gateway.request(body, token=token)
+                        self.assertEqual((status, raw), (200, payload))
+                    self.assertEqual([call['body'] for call in provider.calls], [body, body])
+                finally:
+                    gateway.close()
+                summary = proxy_benchmark.summarize_events(gateway.events)
+                self.assertTrue(summary['ledger_complete'])
+                self.assertEqual(summary['shadow']['completed_requests'], 1)
+                self.assertEqual(summary['shadow']['unpriced_requests'], 0)
+                self.assertEqual(Decimal(str(summary['estimated_total_cost_usd'])),
+                                 2 * Decimal('0.004300475'))
+                self.assertEqual(summary['shadow']['cache_write_input_tokens'], 30539)
+                self.assertEqual(summary['shadow']['ordinary_input_tokens'], 511)
+
+    def test_reviewer_write_metadata_fails_closed_unless_entirely_known_short_ttl(self):
+        from scripts import proxy_benchmark
+        cases = [
+            {'ttl_30m_tokens': 2, 'ttl_12h_tokens': 1},  # no reviewed long-TTL rate
+            {'ttl_30m_tokens': 2, 'ttl_12h_tokens': 0},  # total mismatch
+            {'ttl_30m_tokens': 3},  # missing long-TTL partition
+            {'ttl_30m_tokens': True, 'ttl_12h_tokens': 0},
+            {'ttl_30m_tokens': 3.5, 'ttl_12h_tokens': 0},
+            {'ttl_30m_tokens': -1, 'ttl_12h_tokens': 0},
+            {'ttl_30m_tokens': 3, 'ttl_12h_tokens': 0, CANARY: 0},
+            {'ttl_30m_tokens': 3, 'ttl_12h_tokens': 0, 'ttl_future_tokens': 0},
+            None, [], CANARY,
+        ]
+        for metadata in cases:
+            with self.subTest(metadata=metadata), Provider(value={
+                    'status': 'completed', 'model': 'gpt-6-luna', 'output': [],
+                    'usage': {'input_tokens': 100, 'output_tokens': 2,
+                        'input_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 3,
+                            'cache_write_tokens_details': metadata}}}) as provider:
+                gateway = Gateway(provider.server.server_port, provider.server.server_port)
+                try:
+                    self.assertEqual(gateway.request(b'{"input":[]}')[0], 200)
+                finally:
+                    gateway.close()
+                summary = proxy_benchmark.summarize_events(gateway.events)
+                self.assertIsNone(summary['estimated_total_cost_usd'])
+                self.assertEqual(summary['primary']['unpriced_requests'], 1)
+                self.assertNotIn(CANARY, json.dumps(gateway.events))
+
     def test_catalog_model_identity_survives_telemetry_and_native_pricing(self):
         from scripts import proxy_benchmark
         import shutil
