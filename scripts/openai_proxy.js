@@ -12,7 +12,8 @@ const path = require('node:path');
 const packagedCatalog = path.join(__dirname, 'model_catalog.json');
 const catalogPath = fs.existsSync(packagedCatalog) ? packagedCatalog :
   path.join(__dirname, '../src/model_catalog.json');
-const TELEMETRY_MODELS = new Set(Object.keys(require(catalogPath)));
+const MODEL_CATALOG = require(catalogPath);
+const TELEMETRY_MODELS = new Set(Object.keys(MODEL_CATALOG));
 const TELEMETRY_TIERS = new Set(['auto', 'default', 'standard', 'flex', 'priority', 'scale']);
 function telemetryModel(value) {
   return TELEMETRY_MODELS.has(value) ? value : 'unrecognized';
@@ -38,8 +39,18 @@ function telemetryUsage(value) {
     const details = value[key];
     result[key] = {};
     if (!details || typeof details !== 'object' || Array.isArray(details)) { unknown = true; continue; }
-    if (Object.keys(details).some(k => !names.includes(k))) unknown = true;
+    const allowed = key === 'input_tokens_details' ? [...names, 'cache_write_tokens_details'] : names;
+    if (Object.keys(details).some(k => !allowed.includes(k))) unknown = true;
     for (const name of names) number(details, result[key], name);
+    if (key === 'input_tokens_details' && Object.hasOwn(details, 'cache_write_tokens_details')) {
+      // The flat write tariff covers 30m writes only. Normalize redundant TTL
+      // metadata only when it proves that the entire scalar total is short-TTL.
+      // Unknown/mixed TTLs retain the unpriced marker; never log arbitrary keys.
+      const ttl = details.cache_write_tokens_details;
+      if (!isObject(ttl) || Object.keys(ttl).some(k => !['ttl_30m_tokens', 'ttl_12h_tokens'].includes(k)) ||
+          !Number.isSafeInteger(ttl.ttl_30m_tokens) || ttl.ttl_30m_tokens < 0 ||
+          ttl.ttl_12h_tokens !== 0 || ttl.ttl_30m_tokens !== result[key].cache_write_tokens) unknown = true;
+    }
   }
   // Preserve unknown pricing semantics without retaining unknown payload or keys.
   if (unknown) {
@@ -131,16 +142,118 @@ function usageRecords(body) {
   return values;
 }
 
+// Admission is deliberately conservative: reservations are never refunded by
+// this process. The stopped gateway's complete native journal is settled by the
+// controller's existing native-cost parser before another escrow can be issued.
+function spendingEscrow(trusted, modelBinding) {
+  const limit = process.env.BENCHMARK_BUDGET_PICO_USD;
+  const journal = process.env.BENCHMARK_BUDGET_JOURNAL;
+  const leaseId = process.env.BENCHMARK_BUDGET_LEASE_ID;
+  if (limit == null && journal == null) return null;
+  if (!trusted || modelBinding !== '1' || !/^[a-zA-Z0-9-]{1,64}$/.test(leaseId || '') ||
+      !/^[1-9][0-9]*$/.test(limit || '') || !path.isAbsolute(journal || '')) {
+    throw new Error('invalid protected spending escrow');
+  }
+  const fd = fs.openSync(journal, 'wx', 0o600); // A restart never refunds an accepted attempt.
+  const append = value => {
+    fs.writeFileSync(fd, JSON.stringify(value) + '\n');
+    fs.fsyncSync(fd); // Persist authority before any paid transport.
+  };
+  let remaining = BigInt(limit);
+  append({event: 'escrow', pico_usd: limit, lease_id: leaseId});
+  const scaled = value => {
+    const text = String(value);
+    if (!/^[0-9]+(?:\.[0-9]{1,6})?$/.test(text)) throw new Error('unbounded catalog tariff');
+    const [whole, fraction = ''] = text.split('.');
+    return BigInt(whole) * 1000000n + BigInt(fraction.padEnd(6, '0'));
+  };
+  const bound = model => {
+    const spec = MODEL_CATALOG[model];
+    if (!spec?.rates || !Number.isSafeInteger(spec.context_tokens) ||
+        !Number.isSafeInteger(spec.max_output_tokens)) throw new Error('unbounded model');
+    const rate = spec.rates;
+    const input = [rate.input, rate.cached, rate.write].map(scaled).reduce((a, b) => a > b ? a : b);
+    const im = scaled(Math.max(1, spec.long_context?.input_multiplier ?? 1));
+    const om = scaled(Math.max(1, spec.long_context?.output_multiplier ?? 1));
+    // Rates are USD/million. Scaled rates are exactly pico-USD/token.
+    const numerator = BigInt(spec.context_tokens) * input * im +
+      BigInt(spec.max_output_tokens) * scaled(rate.output) * om;
+    return (numerator + 999999n) / 1000000n;
+  };
+  let frozen = false;
+  return {
+    reserve(id, value) {
+      if (frozen) return false;
+      const amount = bound(value.model);
+      if (amount > remaining) return false;
+      append({event: 'reserved', request_id: id, model: value.model, pico_usd: String(amount)});
+      remaining -= amount;
+      return true;
+    },
+    finish(id, event) {
+      const usage = event.usage;
+      const details = usage?.input_tokens_details;
+      // Quantity completeness only; monetary settlement has one Python owner.
+      if (!Number.isSafeInteger(usage?.input_tokens) || !Number.isSafeInteger(usage?.output_tokens) ||
+          !Number.isSafeInteger(details?.cached_tokens) ||
+          Object.keys(details || {}).some(key => !['cached_tokens', 'cache_write_tokens'].includes(key)) ||
+          details.cached_tokens + (details.cache_write_tokens || 0) > usage.input_tokens ||
+          Object.entries(usage?.output_tokens_details || {}).some(([key, value]) => key !== 'reasoning_tokens' && value !== 0) ||
+          ![null, 'default', 'standard'].includes(event.service_tier)) frozen = true;
+      try { append({event: usage ? 'completed' : 'censored', request_id: id, ...event}); }
+      catch (error) { frozen = true; throw error; }
+    },
+  };
+}
+
+function textOnlyInput(value) {
+  if (typeof value === 'string' || value == null) return true;
+  if (Array.isArray(value)) return value.every(textOnlyInput);
+  if (!isObject(value)) return false;
+  const types = new Set(['message', 'input_text', 'output_text', 'reasoning', 'summary_text',
+    'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output',
+    'compaction_trigger', 'compaction']);
+  if (value.type != null && !types.has(value.type)) return false;
+  return ['content', 'summary', 'output'].every(key => !Object.hasOwn(value, key) || textOnlyInput(value[key]));
+}
+
 function serve(options = {}) {
   const contextProxy = process.env.BENCHMARK_CONTEXT_PROXY === '1';
+  const trustedDirect = process.env.BENCHMARK_TRUSTED_DIRECT === '1';
+  if (trustedDirect && (contextProxy || !process.env.BENCHMARK_PROVIDER_KEY)) {
+    throw new Error('invalid trusted direct gateway configuration');
+  }
+  const trusted = contextProxy || trustedDirect;
+  const modelBinding = process.env.BENCHMARK_MODEL_BINDING;
+  if (modelBinding != null && !['0', '1'].includes(modelBinding)) {
+    throw new Error('invalid benchmark model binding');
+  }
+  const expectedPrimary = process.env.BENCHMARK_EXPECTED_PRIMARY_MODEL;
+  const expectedClassifier = process.env.BENCHMARK_EXPECTED_CLASSIFIER_MODEL;
+  if (modelBinding === '1' && (!trusted || !TELEMETRY_MODELS.has(expectedPrimary) ||
+      !TELEMETRY_MODELS.has(expectedClassifier))) {
+    throw new Error('protected gateway requires exact catalog model expectations');
+  }
   const historyPolicy = process.env.BENCHMARK_CONTEXT_HISTORY_POLICY ?? 'strict';
+  const escrow = spendingEscrow(trusted, modelBinding);
   if (contextProxy && !['strict', 'reset-on-divergence'].includes(historyPolicy)) {
     throw new Error('invalid trusted CARRY_PROXY_HISTORY_POLICY');
   }
   const primaryTransport = options.request || (contextProxy ? http.request : https.request);
   const shadowTransport = options.request || https.request;
+  let carrySession = process.env.BENCHMARK_SESSION_ID;
   const server = http.createServer((request, response) => {
     const parsed = parsedLocalUrl(request.url);
+    if (contextProxy && request.method === 'POST' && parsed?.pathname === '/benchmark/new-conversation') {
+      if (!process.env.BENCHMARK_CONTROL_TOKEN ||
+          request.headers.authorization !== `Bearer ${process.env.BENCHMARK_CONTROL_TOKEN}`) {
+        response.writeHead(401); response.end(); return;
+      }
+      carrySession = require('node:crypto').randomUUID();
+      console.log('BENCHMARK_CONVERSATION ' + JSON.stringify({session_id: carrySession}));
+      response.writeHead(200, {'content-type': 'application/json'});
+      response.end(JSON.stringify({session_id: carrySession})); return;
+    }
     if (!isAllowedRequest(request.method, request.url) || !parsed) {
       response.writeHead(403, {'content-type': 'text/plain'});
       response.end('request target denied\n');
@@ -165,7 +278,9 @@ function serve(options = {}) {
     }
     const shadow = contextProxy && Boolean(process.env.BENCHMARK_SHADOW_TOKEN) &&
       request.headers.authorization === `Bearer ${process.env.BENCHMARK_SHADOW_TOKEN}`;
-    if (contextProxy && !shadow && (!process.env.BENCHMARK_CLIENT_TOKEN ||
+    const primaryUpstream = contextProxy && escrow && Boolean(process.env.BENCHMARK_UPSTREAM_TOKEN) &&
+      request.headers.authorization === `Bearer ${process.env.BENCHMARK_UPSTREAM_TOKEN}`;
+    if (trusted && !shadow && !primaryUpstream && (!process.env.BENCHMARK_CLIENT_TOKEN ||
         request.headers.authorization !== `Bearer ${process.env.BENCHMARK_CLIENT_TOKEN}`)) {
       response.writeHead(401); response.end(); return;
     }
@@ -173,20 +288,20 @@ function serve(options = {}) {
       response.writeHead(403); response.end(); return;
     }
     const headers = cleanHeaders(request.headers);
-    if (contextProxy) {
+    if (trusted) {
       // Trusted per-slot identity. Never forward a caller-selected tenant or branch.
       for (const name of Object.keys(headers)) {
         if (name.startsWith('x-carry-')) delete headers[name];
       }
-      headers.authorization = `Bearer ${shadow ? process.env.BENCHMARK_CLASSIFIER_KEY : process.env.CARRY_PROXY_AUTH_TOKEN}`;
-      if (!shadow) {
-        headers['x-carry-session'] = process.env.BENCHMARK_SESSION_ID;
+      headers.authorization = `Bearer ${trustedDirect ? process.env.BENCHMARK_PROVIDER_KEY : shadow || primaryUpstream ? process.env.BENCHMARK_CLASSIFIER_KEY : process.env.CARRY_PROXY_AUTH_TOKEN}`;
+      if (contextProxy && !shadow && !primaryUpstream) {
+        headers['x-carry-session'] = carrySession;
         headers['x-carry-tenant'] = 'benchmark';
         headers['x-carry-branch'] = 'main';
         headers['x-carry-history-policy'] = historyPolicy;
       }
     }
-    const throughCarry = contextProxy && !shadow;
+    const throughCarry = contextProxy && !shadow && !primaryUpstream;
     const actor = shadow ? 'shadow' : 'primary';
     const requestId = require('node:crypto').randomUUID();
     const started = performance.now();
@@ -194,8 +309,9 @@ function serve(options = {}) {
     let serviceTier = null;
     let nativeCompaction = parsed.pathname === '/v1/responses/compact';
     let ended = false;
+    let reserved = false;
     const emit = (event, extra = {}) => {
-      if (contextProxy) console.log('BENCHMARK_CONTEXT_EVENT ' + JSON.stringify({
+      if (trusted && !primaryUpstream) console.log('BENCHMARK_CONTEXT_EVENT ' + JSON.stringify({
         actor, event, request_id: requestId, model, service_tier: serviceTier,
         native_compaction: nativeCompaction, ...extra,
       }));
@@ -204,11 +320,15 @@ function serve(options = {}) {
     const finish = (usage, extra = {}) => {
       if (ended) return;
       ended = true;
+      if (reserved) {
+        try { escrow.finish(requestId, {model, service_tier: serviceTier, usage: usage || null, ...extra}); }
+        catch (_) { server.close(); response.destroy(); return; }
+      }
       emit(usage ? 'completed' : 'censored', {usage: usage || null,
         latency_ms: Math.round(performance.now() - started), ...extra});
     };
     const forward = raw => {
-      const upstream = (shadow ? shadowTransport : primaryTransport)({
+      const upstream = (shadow || primaryUpstream ? shadowTransport : primaryTransport)({
         hostname: throughCarry ? 'carry-context-proxy' : 'api.openai.com',
         port: throughCarry ? 8787 : 443,
         method: request.method,
@@ -236,7 +356,7 @@ function serve(options = {}) {
         upstreamResponse.on('aborted', () => { finish(null); response.destroy(); });
         upstreamResponse.on('end', () => {
           const body = Buffer.concat(chunks).toString('utf8');
-          if (contextProxy) {
+          if (trusted) {
             let nativeUsage = null;
             let toolCalls = null;
             if (!truncated) {
@@ -268,7 +388,7 @@ function serve(options = {}) {
             }
             finish(nativeUsage, {http_status: upstreamResponse.statusCode, tool_calls: toolCalls});
           }
-          if (!contextProxy && captured <= MAX_TELEMETRY_BYTES) {
+          if (!trusted && captured <= MAX_TELEMETRY_BYTES) {
             for (const usage of usageRecords(body)) {
               // Docker logs are outside the model-controlled agent container; retain
               // only aggregate provider accounting, never prompts or responses.
@@ -289,6 +409,7 @@ function serve(options = {}) {
       else upstream.end(raw);
     };
     if (request.method !== 'POST') {
+      if (escrow) { response.writeHead(403); response.end(); return; }
       forward(null);
       return;
     }
@@ -317,7 +438,23 @@ function serve(options = {}) {
           deny(400); return;
         }
         model = telemetryModel(value.model);
+        if (modelBinding === '1' && value.model !== (shadow ? expectedClassifier : expectedPrimary)) {
+          deny(403); return;
+        }
         serviceTier = telemetryTier(value.service_tier);
+        if (escrow && !throughCarry) {
+          if (!['/v1/responses', '/v1/responses/compact'].includes(parsed.pathname) || parsed.search ||
+              ![null, 'default', 'standard'].includes(serviceTier) ||
+              value.background === true || value.modalities != null || value.audio != null ||
+              value.previous_response_id != null || value.conversation != null ||
+              (value.max_output_tokens != null && (!Number.isSafeInteger(value.max_output_tokens) ||
+                value.max_output_tokens <= 0 || value.max_output_tokens > MODEL_CATALOG[value.model].max_output_tokens)) ||
+              !textOnlyInput(value.input)) {
+            deny(400); return;
+          }
+          if (!escrow.reserve(requestId, value)) { deny(402); return; }
+          reserved = true;
+        }
         nativeCompaction ||= Boolean(value.compaction_trigger) ||
           (Array.isArray(value.input) && value.input.some(item => item?.type === 'compaction_trigger'));
       } catch (_) { deny(400); return; }

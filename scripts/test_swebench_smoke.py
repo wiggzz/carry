@@ -2861,10 +2861,13 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                 (root / name).mkdir()
             def fake_run(command, **_kwargs):
                 if command[:2] == ["docker", "run"]:
+                    mount = next(value for value in command if value.endswith(',dst=/benchmark/output'))
+                    raw = pathlib.Path(mount.split('src=', 1)[1].rsplit(',dst=', 1)[0])
+                    (raw / 'trace.jsonl').write_text(trace, encoding='utf-8')
                     raise subprocess.CalledProcessError(124, command)
                 return mock.Mock(returncode=0, stdout="")
 
-            (root / "output" / "trace.jsonl").write_text(json.dumps({
+            trace = (json.dumps({
                 "event": "model_request", "data": {"step": 1},
             }) + "\n" + json.dumps({
                 "event": "model_response", "data": {"step": 1, "response_retries": 0,
@@ -2875,7 +2878,7 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
                     "cache_write_input_tokens": 10, "output_tokens": 20,
                     "reasoning_tokens": 5, "total_tokens": 120,
                 }},
-            }) + "\n", encoding="utf-8")
+            }) + "\n")
             pricing = self.worker.pricing_for_model("gpt-5.6-luna")
             with mock.patch.object(self.worker.subprocess, "run", side_effect=fake_run):
                 record = self.worker.run_agent(
@@ -2896,9 +2899,11 @@ if (isAllowedRequest('POST', '/v1/responses/../../models')) process.exit(6);
             for name in ("repo", "input", "output"):
                 (root / name).mkdir()
 
-            def fake_run(*_args, **_kwargs):
-                (root / "output" / "final.patch").write_text("diff --git a/a b/a\n", encoding="utf-8")
-                (root / "output" / "result.json").write_text(
+            def fake_run(command, **_kwargs):
+                mount = next(value for value in command if value.endswith(',dst=/benchmark/output'))
+                raw = pathlib.Path(mount.split('src=', 1)[1].rsplit(',dst=', 1)[0])
+                (raw / "final.patch").write_text("diff --git a/a b/a\n", encoding="utf-8")
+                (raw / "result.json").write_text(
                     json.dumps({"response_retries": 4, "usage": {
                         "input_tokens": 100, "cached_input_tokens": 40,
                         "cache_write_input_tokens": 10, "output_tokens": 20,
