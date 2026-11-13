@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.3](https://github.com/wiggzz/carry/compare/v0.21.2...v0.21.3) (2026-11-13)
+
+
+### Code Refactoring
+
+* remove competing context and history owners ([#228](https://github.com/wiggzz/carry/issues/228)) ([9e5b72e](https://github.com/wiggzz/carry/commit/9e5b72ea18812510d684afcaded4bb10dcecbf33))
+
 ## [0.21.2](https://github.com/wiggzz/carry/compare/v0.21.1...v0.21.2) (2026-11-12)
 
 
