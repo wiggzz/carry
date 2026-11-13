@@ -1992,6 +1992,29 @@ mod tests {
     include!("run_cache_scope_tests.rs");
     include!("run_cache_refresh_tests.rs");
 
+    fn scripted_config(cwd: PathBuf, session_dir: PathBuf) -> RunConfig {
+        RunConfig {
+            cwd,
+            session_dir,
+            prompt: "Finish the task.".into(),
+            model: "scripted".into(),
+            reasoning_effort: "medium".into(),
+            max_steps: Some(1),
+            default_shell_timeout_secs: 1,
+            compaction_mode: CompactionMode::Economic,
+            keep_lease_turns: None,
+            compaction_payoff_requests: 1,
+            compaction_min_payback_percent: 10,
+            compaction_rollout_samples: 0,
+            compaction_rollout_stop_probability_percent: 10,
+            compaction_neutral_high_watermark_tokens: 32 * 1024,
+            compaction_neutral_low_watermark_tokens: 24 * 1024,
+            resume_context: None,
+            resume_source: None,
+            prompt_cache_key: None,
+        }
+    }
+
     #[test]
     fn human_message_event_preserves_submission_identity() {
         assert_eq!(
@@ -3024,24 +3047,11 @@ mod tests {
         .unwrap();
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: Some(3),
-                default_shell_timeout_secs: 1,
                 compaction_mode: CompactionMode::Disabled,
                 keep_lease_turns: Some(1),
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3107,24 +3117,11 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: Some(2),
                 default_shell_timeout_secs: 5,
                 compaction_mode: CompactionMode::Disabled,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3175,24 +3172,12 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: Some(2),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
                 compaction_payoff_requests: 5,
-                compaction_min_payback_percent: 10,
                 compaction_rollout_samples: 4,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(context),
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3238,24 +3223,8 @@ mod tests {
 
         let outcome = run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("carry-test-cache-key".into()),
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3588,24 +3557,9 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace.clone(),
                 prompt: "first task".into(),
-                session_dir: first_session.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
                 prompt_cache_key: Some("resumable-cache-affinity".into()),
+                ..scripted_config(workspace.clone(), first_session.clone())
             },
             Backend::scripted(&first_steps).await.unwrap(),
         )
@@ -3616,24 +3570,12 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
                 prompt: "second task".into(),
-                session_dir: second_session.clone(),
                 model: resume.model,
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
-                prompt_cache_key,
+                prompt_cache_key: prompt_cache_key,
+                ..scripted_config(workspace, second_session.clone())
             },
             Backend::scripted(&second_steps).await.unwrap(),
         )
@@ -3687,24 +3629,8 @@ mod tests {
 
         run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3736,24 +3662,8 @@ mod tests {
 
         let outcome = run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3800,24 +3710,7 @@ mod tests {
 
         let outcome = run(
             RunConfig {
-                cwd: workspace,
-                prompt: "Finish the task.".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
-                max_steps: Some(1),
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
         )
@@ -3901,24 +3794,10 @@ mod tests {
 
         let outcome = run_interactive(
             RunConfig {
-                cwd: workspace,
                 prompt: "initial task".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
                 compaction_min_payback_percent: 25,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,
@@ -3959,24 +3838,9 @@ mod tests {
 
         let outcome = run_interactive(
             RunConfig {
-                cwd: workspace,
                 prompt: "initial task".into(),
-                session_dir: session_dir.clone(),
-                model: "scripted".into(),
-                reasoning_effort: "medium".into(),
                 max_steps: None,
-                default_shell_timeout_secs: 1,
-                compaction_mode: CompactionMode::Economic,
-                keep_lease_turns: None,
-                compaction_payoff_requests: 1,
-                compaction_min_payback_percent: 10,
-                compaction_rollout_samples: 0,
-                compaction_rollout_stop_probability_percent: 10,
-                compaction_neutral_high_watermark_tokens: 32 * 1024,
-                compaction_neutral_low_watermark_tokens: 24 * 1024,
-                resume_context: None,
-                resume_source: None,
-                prompt_cache_key: None,
+                ..scripted_config(workspace, session_dir.clone())
             },
             Backend::scripted(&steps_file).await.unwrap(),
             receiver,
