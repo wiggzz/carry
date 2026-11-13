@@ -90,6 +90,75 @@ async fn review_capture_provider() -> (
 }
 
 #[tokio::test]
+async fn exceptional_review_dispatches_the_reserved_view_and_preserves_primary_history() {
+    let (review_url, mut reviews, reviewer) = review_capture_provider().await;
+    let (sender, mut primaries) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::new().route("/primary", post(move |axum::Json(body): axum::Json<Value>| {
+        let sender = sender.clone();
+        async move {
+            sender.send(body).unwrap();
+            axum::Json(json!({"id":"exceptional-primary","status":"completed","output":[],
+                "usage":{"input_tokens":10000,"output_tokens":1,"input_tokens_details":{"cached_tokens":0}}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_url = format!("http://{}/primary", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.upstream_url = primary_url;
+    service.config.classifier_url = Some(review_url);
+    service.config.primary_context_override = Some(4000);
+    service.config.primary_context_tokens = 4000;
+    service.config.primary_output_reserve_tokens = 1;
+    service.config.review_every_requests = 100;
+    service.config.bootstrap_min_input_bytes = 8388608;
+    let service = Arc::new(service);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-carry-session", "exceptional-view".parse().unwrap());
+    let id = identity(&headers).unwrap().unwrap();
+    let mut session = semantic_subject();
+    let input = session.render_primary();
+    let body = json!({"model":"gpt-6-luna","max_output_tokens":1,"input":input,
+        "instructions":"fixed exceptional direction","prompt_cache_key":"exceptional-affinity"});
+    session.history_namespace = Some(history::namespace(&service, &headers, &body).unwrap());
+    session.review_context = cache_base(&body);
+    let expected = review_body(&service.config, &session);
+    save(&service, &id, &session).unwrap();
+    let response = forward_request(
+        service.clone(), headers, Bytes::from(serde_json::to_vec(&body).unwrap()),
+        false, "exceptional-view-request".into(),
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(reviews.try_recv().unwrap(), expected);
+    assert!(reviews.try_recv().is_err(), "one exceptional attempt, no second ordinary review");
+    assert_eq!(primaries.try_recv().unwrap(), body);
+    assert!(primaries.try_recv().is_err());
+    let saved = load(&service, &id).unwrap();
+    assert_eq!(saved.primary.calls, 1);
+    assert_eq!(saved.shadow.calls, 1);
+    assert_eq!(saved.completed_requests, 1);
+    assert_eq!(saved.completed_review_len, input.len());
+    assert_eq!(saved.invalid_reviews, 0);
+    assert!(!saved.background_review_pending && !saved.primary_pending);
+    assert!(saved.primary.cost_usd > 0.0 && saved.shadow.cost_usd > 0.0);
+    assert_eq!(saved.render_primary(), input);
+    assert!(saved.history.iter().all(|item| item.exposed));
+    assert_eq!(saved.last_submitted_ids, saved.history.iter().map(|i| i.id).collect::<Vec<_>>());
+    let events = timing_journal(directory.path(), &id, "exceptional-view-request");
+    assert_eq!(events.iter().filter(|e| e["event"] == "exceptional_review").count(), 1);
+    let mut cold = checkpoint_service(directory.path());
+    cold.config = service.config.clone();
+    let restored = load(&cold, &id).unwrap();
+    assert_eq!(restored.primary.cost_usd, saved.primary.cost_usd);
+    assert_eq!(restored.shadow.cost_usd, saved.shadow.cost_usd);
+    assert_eq!(restored.render_primary(), input);
+    provider.abort();
+    reviewer.abort();
+}
+
+#[tokio::test]
 async fn prospective_review_affinity_equals_actual_dispatch_after_restart_and_key_change() {
     let (url, mut captures, provider) = review_capture_provider().await;
     let directory = tempfile::tempdir().unwrap();
