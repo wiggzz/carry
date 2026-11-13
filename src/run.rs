@@ -3574,7 +3574,7 @@ mod tests {
                 model: resume.model,
                 resume_context: Some(resume.context),
                 resume_source: Some(first_session),
-                prompt_cache_key: prompt_cache_key,
+                prompt_cache_key,
                 ..scripted_config(workspace, second_session.clone())
             },
             Backend::scripted(&second_steps).await.unwrap(),
@@ -3709,9 +3709,7 @@ mod tests {
         .unwrap();
 
         let outcome = run(
-            RunConfig {
-                ..scripted_config(workspace, session_dir.clone())
-            },
+            scripted_config(workspace, session_dir.clone()),
             Backend::scripted(&steps_file).await.unwrap(),
         )
         .await
