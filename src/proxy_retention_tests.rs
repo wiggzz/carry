@@ -2,22 +2,33 @@
 #[tokio::test]
 async fn queued_owner_survives_expiry_at_reresolution_and_cold_accounting() {
     async fn request(service: Arc<Service>, wire: Bytes) {
-        let response = forward_request(service, HeaderMap::new(), wire, false, "queued-expiry".into())
+        let response = forward_request(
+            service,
+            HeaderMap::new(),
+            wire,
+            false,
+            "queued-expiry".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
     }
     let (sent, mut captures) = mpsc::unbounded_channel();
-    let router = Router::new().route("/responses", post(move |body: Bytes| {
-        let sent = sent.clone();
-        async move {
-            sent.send(body).unwrap();
-            axum::Json(json!({"status":"completed","output":[],
+    let router = Router::new().route(
+        "/responses",
+        post(move |body: Bytes| {
+            let sent = sent.clone();
+            async move {
+                sent.send(body).unwrap();
+                axum::Json(json!({"status":"completed","output":[],
                 "usage":{"input_tokens":100,"output_tokens":1,
                     "input_tokens_details":{"cached_tokens":0}}}))
-        }
-    }));
+            }
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/responses", listener.local_addr().unwrap());
     let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -46,16 +57,35 @@ async fn queued_owner_survives_expiry_at_reresolution_and_cold_accounting() {
     let (waiter, mut waits) = mpsc::unbounded_channel();
     *service.lock_waits.lock().unwrap() = Some(waiter);
     let queued = tokio::spawn(request(service.clone(), wire.clone()));
-    assert_eq!(tokio::time::timeout(Duration::from_secs(10), waits.recv()).await.unwrap().unwrap(), owner);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), waits.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        owner
+    );
     drop(setup_pin);
     // Deterministically cross retention after candidate admission, while its
     // primary lock is held. No sleep or production scheduling/clock override.
     let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
-    assert!(db.execute("UPDATE records SET at=1 WHERE owner=?1 AND kind IN ('tips','snapshots')", [&owner]).unwrap() >= 2);
+    assert!(
+        db.execute(
+            "UPDATE records SET at=1 WHERE owner=?1 AND kind IN ('tips','snapshots','owners')",
+            [&owner]
+        )
+        .unwrap()
+            >= 3
+    );
     drop(db);
-    assert!(history::pin(&service, "another-owner").is_err(), "queued pin consumes the one owner slot");
+    assert!(
+        history::pin(&service, "another-owner").is_err(),
+        "queued pin consumes the one owner slot"
+    );
     drop(lock);
-    tokio::time::timeout(Duration::from_secs(10), queued).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(captures.recv().await.unwrap(), wire);
     assert!(captures.try_recv().is_err());
     provider.abort();
@@ -66,23 +96,58 @@ async fn queued_owner_survives_expiry_at_reresolution_and_cold_accounting() {
     let mut cold = checkpoint_service(directory.path());
     cold.config = service.config.clone();
     let cold = Arc::new(cold);
-    let cold_pin = history::pin(&cold, &owner).unwrap();
-    let stats = dashboard_stats(State(cold.clone()), ConnectInfo("127.0.0.1:1".parse().unwrap()),
-        HeaderMap::new(), axum::extract::Query(SessionPage::default())).await.unwrap();
-    let stats: Value = serde_json::from_slice(&axum::body::to_bytes(stats.into_body(), 65536).await.unwrap()).unwrap();
+    let stats = dashboard_stats(
+        State(cold.clone()),
+        ConnectInfo("127.0.0.1:1".parse().unwrap()),
+        HeaderMap::new(),
+        axum::extract::Query(SessionPage::default()),
+    )
+    .await
+    .unwrap();
+    let stats: Value = serde_json::from_slice(
+        &axum::body::to_bytes(stats.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(stats["usage"]["primary"]["calls"], 2);
     assert_eq!(stats["usage"]["primary"]["input_tokens"], 200);
     assert_eq!(stats["usage"]["primary"]["output_tokens"], 2);
-    assert!((stats["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 2.0 * first.primary.cost_usd).abs() < 1e-12);
+    assert!(
+        (stats["usage"]["primary"]["cost_usd"].as_f64().unwrap() - 2.0 * first.primary.cost_usd)
+            .abs()
+            < 1e-12
+    );
+    let accounting = history::accounting(&cold, 0, "", 100).unwrap();
+    let observation = accounting["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|record| record["owner"] == owner)
+        .unwrap();
+    assert_eq!(
+        observation["primary"]["calls"], 2,
+        "already queued request must not split its immutable paid observations into another owner at expiry"
+    );
+    let cold_pin = history::pin(&cold, &owner).unwrap();
     let retained = history::restore(&cold, &owner).unwrap();
-    assert_eq!(retained.primary.calls, 2, "already queued request must not split into another owner at expiry");
+    assert_eq!(
+        retained.primary.calls, 2,
+        "already queued request must not split into another owner at expiry"
+    );
     assert_eq!(retained.primary.input_tokens, 200);
     assert_eq!(retained.primary.output_tokens, 2);
     assert_eq!(retained.primary.unavailable_cost_calls, 0);
     assert!((retained.primary.cost_usd - 2.0 * first.primary.cost_usd).abs() < 1e-12);
     assert_eq!(retained.completed_requests, 2);
-    assert_eq!(retained.render_primary(), body["input"].as_array().unwrap().clone());
-    let (selected, pin) = history::candidate(&cold, &namespace, &body).unwrap().unwrap();
+    assert_eq!(
+        retained.render_primary(),
+        body["input"].as_array().unwrap().clone()
+    );
+    let (selected, pin) = history::candidate(&cold, &namespace, &body)
+        .unwrap()
+        .unwrap();
     assert_eq!(selected, owner);
     drop(pin);
     drop(cold_pin);
