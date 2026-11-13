@@ -11,18 +11,7 @@ import proxy_state_regressions as support
 from proxy_state_regressions import advice_response, completed, ledger, wire
 
 
-class ReviewRegressions(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        # Use the actual selector for per-case durable loopback evidence.
-        self.harness._testMethodName = self._testMethodName
-        self.addCleanup(self.cleanup_harness)
-        self.evidence = self.harness.evidence
-
-    def cleanup_harness(self):
-        self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
-
+class ReviewRegressions(support.FixtureCase):
     @staticmethod
     def seed():
         return [{"role": "user", "content": "durable goal"},
@@ -37,8 +26,7 @@ class ReviewRegressions(unittest.TestCase):
             def review(body, _n):
                 return 200, advice_response({"protected": ledger(body)["eligible_group_ids"],
                                              "removable": [], "memories": []})
-        fixture = self.harness.fixture(primary, review)
-        # Child TestCase cleanup outcomes do not propagate to this TestCase.
+        fixture = super().fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         return fixture
 
@@ -49,7 +37,7 @@ class ReviewRegressions(unittest.TestCase):
             return 200, advice_response({"protected": [2] if observed else [],
                 "removable": [] if observed else [2], "memories": []})
         fixture = self.fixture(review)
-        proxy = self.harness.proxy(fixture, ["--min-payback-percent", "100"])
+        proxy = self.proxy(fixture, ["--min-payback-percent", "100"])
         history = self.seed()
         fields = {"instructions": requirement} if top_level else {}
         if not top_level:
@@ -72,7 +60,7 @@ class ReviewRegressions(unittest.TestCase):
 
     def reviewer_prefix_capture(self, review=None):
         fixture = self.fixture(review)
-        proxy = self.harness.proxy(fixture, ["--min-payback-percent", "100"])
+        proxy = self.proxy(fixture, ["--min-payback-percent", "100"])
         history = [{"role": "user", "content": "Preserve the source prefix exactly."}]
         for n in range(32):
             history.extend([{"role": "assistant", "content": f"Source {n}: " + "evidence " * 32},
@@ -137,7 +125,7 @@ class ReviewRegressions(unittest.TestCase):
 
     def test_image_receipt_preserves_known_observed_cost(self):
         fixture = self.fixture()
-        proxy = self.harness.proxy(fixture, ["--review-every-requests", "100"])
+        proxy = self.proxy(fixture, ["--review-every-requests", "100"])
         history = [{"role": "user", "content": [
             {"type": "input_text", "text": "Read this synthetic image."},
             {"type": "input_image", "image_url": "data:image/png;base64,TEST_ONLY_NOT_DECODED"}]}]
@@ -156,13 +144,13 @@ class ReviewRegressions(unittest.TestCase):
     def test_unchanged_image_comparison_uses_receipt_input_and_survives_restart(self):
         fixture = self.fixture()
         options = ["--review-every-requests", "100"]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         history = [{"role": "user", "content": [
             {"type": "input_text", "text": "Read this synthetic image."},
             {"type": "input_image", "image_url": "data:image/png;base64,TEST_ONLY_NOT_DECODED"}]}]
         self.assertEqual(proxy.send(history)[0], 200)
         proxy.close()
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         _, stats = proxy.request("GET", "/carry/dashboard/stats")
         estimate = stats["sessions"][0]["cost_estimate"]
@@ -232,14 +220,14 @@ class ReviewRegressions(unittest.TestCase):
         # advice authority without inventing a price for opaque reviewer edits.
         options = ["--classifier-cache-policy", "disabled",
                    "--primary-context-tokens", "6000", "--primary-output-reserve-tokens", "1"]
-        proxy = self.harness.proxy(fixture, options + ["--review-every-requests", "100"])
+        proxy = self.proxy(fixture, options + ["--review-every-requests", "100"])
         # Two genuine provider receipts attribute the complete opaque cohort,
         # not ciphertext length or a manufactured per-item token allocation.
         self.assertEqual(proxy.send(history[:3])[0], 200)
         self.assertEqual(proxy.send(history[:6])[0], 200)
         self.assertEqual(len(fixture.reviews), 0)
         proxy.close()
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         protected = proxy.advice()
         self.assertEqual(protected["opinions"].get("2"), "keep")
@@ -258,7 +246,7 @@ class ReviewRegressions(unittest.TestCase):
                          [[4, 5, 6]] if release else [])
         if restart:
             proxy.close()
-            proxy = self.harness.proxy(fixture, options)
+            proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         projected = fixture.primaries[-1]["input"]
         self.assertEqual(proxy.send(history)[0], 200)
@@ -344,7 +332,7 @@ class ReviewRegressions(unittest.TestCase):
 
         fixture = self.fixture(review)
         options = ["--min-payback-percent", "100"]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         for _ in range(3):
             self.assertEqual(proxy.send(self.seed())[0], 200)
         accepted = proxy.advice()
@@ -355,7 +343,7 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(accepted["opinions"].get("2"), "keep")
         self.assertEqual(fixture.primaries[-1]["input"], self.seed())
         proxy.close()
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(self.seed())[0], 200)
         self.evidence.update(accepted=accepted, saved=proxy.saved(), final_advice=proxy.advice(),
                              reviews=fixture.reviews, primaries=fixture.primaries, scripted_advice=True)
@@ -378,7 +366,7 @@ class ReviewRegressions(unittest.TestCase):
             return 200, advice_response(advice)
         fixture = self.fixture(review)
         options = ["--min-payback-percent", "100", "--classifier-cache-policy", "disabled"]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         history = self.seed()
         self.assertNotIn(fact, json.dumps(history))
         self.assertEqual(proxy.send(history)[0], 200)
@@ -394,7 +382,7 @@ class ReviewRegressions(unittest.TestCase):
                          "fact retirement cannot edit original source")
         if restart:
             proxy.close()
-            proxy = self.harness.proxy(fixture, options)
+            proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertEqual(len(fixture.reviews), 3)
         saved = proxy.saved()
@@ -430,7 +418,7 @@ class ReviewRegressions(unittest.TestCase):
             outputs.append(answer["output"])
             return 200, answer
         fixture = self.fixture(review)
-        proxy = self.harness.proxy(fixture, ["--min-payback-percent", "100",
+        proxy = self.proxy(fixture, ["--min-payback-percent", "100",
                                              "--classifier-cache-policy", "disabled"])
         seed = self.seed()[:2]
         for _ in range(2):
@@ -465,11 +453,11 @@ class ReviewRegressions(unittest.TestCase):
         history = self.seed() if eligible else self.seed()[:1]
         options = ["--payoff-requests", "1", "--review-every-requests", str(cadence),
                    "--min-payback-percent", "100"]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
         if restart:
             proxy.close()
-            proxy = self.harness.proxy(fixture, options)
+            proxy = self.proxy(fixture, options)
         before = len(fixture.reviews)
         self.assertEqual(proxy.send(history)[0], 200)
         actual = len(fixture.reviews) - before
@@ -500,7 +488,7 @@ class ReviewRegressions(unittest.TestCase):
             return 200, response
 
         fixture = self.fixture(review, primary)
-        proxy = self.harness.proxy(fixture, ["--payoff-requests", "1"])
+        proxy = self.proxy(fixture, ["--payoff-requests", "1"])
         history = self.seed()
         history[1]["content"] *= 500
         self.assertEqual(proxy.send(history)[0], 200)
@@ -526,7 +514,7 @@ class ReviewRegressions(unittest.TestCase):
                     "encrypted_content": "disposable reviewer reasoning " * 500})
             return 200, answer
         fixture = self.fixture(review)
-        proxy = self.harness.proxy(fixture, ["--payoff-requests", "1"])
+        proxy = self.proxy(fixture, ["--payoff-requests", "1"])
         for _ in range(2):
             self.assertEqual(proxy.send(self.seed())[0], 200)
         before = proxy.saved()
@@ -542,7 +530,7 @@ class ReviewRegressions(unittest.TestCase):
         fixture = self.fixture()
         options = ["--review-replayed-history", "--payoff-requests", "1",
                    "--review-every-requests", "100", "--min-payback-percent", "100"]
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(self.seed(), instructions="BOOTSTRAP_DIRECTION")[0], 200)
         before = proxy.saved()
         self.assertEqual(len(fixture.reviews), 1, "setup executes a real completed bootstrap")
@@ -553,7 +541,7 @@ class ReviewRegressions(unittest.TestCase):
         self.assertNotIn("primary_instruction_version", ledger(body))
         self.assertEqual(proxy.advice()["len"], len(self.seed()))
         proxy.close()
-        proxy = self.harness.proxy(fixture, options)
+        proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(self.seed(), instructions="BOOTSTRAP_DIRECTION")[0], 200)
         after = proxy.saved()
         self.evidence.update(before=before, after=after, reviews=fixture.reviews)
@@ -562,7 +550,7 @@ class ReviewRegressions(unittest.TestCase):
     def output_reserve(self, declared, fallback, expected):
         # Same supported auth.json fixture as subscription_auth/proxy tests;
         # expiry is future and tokens are synthetic, so refresh is unreachable.
-        auth = self.harness.state / "synthetic-codex"
+        auth = self.state / "synthetic-codex"
         auth.mkdir()
         payload = base64.urlsafe_b64encode(wire({"https://api.openai.com/auth": {
             "chatgpt_account_id": "fixture-account"}})).decode().rstrip("=")
@@ -574,7 +562,7 @@ class ReviewRegressions(unittest.TestCase):
             response = completed(response_id=f"codex_{n}")
             return 200, b"data: " + wire({"type": "response.completed", "response": response}) + b"\n\n"
         fixture = self.fixture(primary=primary)
-        proxy = self.harness.proxy(fixture, ["--codex-login", "--codex-home", str(auth),
+        proxy = self.proxy(fixture, ["--codex-login", "--codex-home", str(auth),
             "--primary-context-tokens", "2000", "--primary-output-reserve-tokens", str(fallback),
             "--min-payback-percent", "100"])
         fields = {} if declared is None else {"max_output_tokens": declared}
@@ -609,7 +597,7 @@ class ReviewRegressions(unittest.TestCase):
 
     def unknown_capacity(self, known=False, forced=True):
         fixture = self.fixture()
-        proxy = self.harness.proxy(fixture, ["--primary-context-tokens", "3000",
+        proxy = self.proxy(fixture, ["--primary-context-tokens", "3000",
             "--primary-output-reserve-tokens", "64", "--min-payback-percent", "100"])
         model = "gpt-6-luna" if known else "unknown-fixture-model"
         history = self.seed()

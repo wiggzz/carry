@@ -293,7 +293,8 @@ class Proxy:
         self.process.stderr.close()
 
 
-class StateRegressions(unittest.TestCase):
+class FixtureCase(unittest.TestCase):
+    """Own loopback resources/evidence without inheriting unrelated regressions."""
     def setUp(self):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
@@ -330,6 +331,8 @@ class StateRegressions(unittest.TestCase):
             time.sleep(0.01)
         self.fail("review checkpoint did not reach the required state")
 
+
+class StateRegressions(FixtureCase):
     def continuation(self, failure, restart):
         a = {"role": "user", "content": "A: original goal"}
         o = {"type": "message", "role": "assistant", "content": [

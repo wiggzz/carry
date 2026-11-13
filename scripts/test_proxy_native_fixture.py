@@ -13,6 +13,8 @@ from history_store import read_index
 import subprocess
 import tempfile
 import threading
+from unittest.mock import patch
+import proxy_state_regressions as support
 
 class ShadowContractProvider:
     """Real HTTP wire capture; no model, credentials or synthesized proxy state."""
@@ -1247,6 +1249,62 @@ class NativeProviderFixtureTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as error: call(body)
             self.assertEqual(error.exception.code,400); error.exception.close()
             self.assertEqual(len(fixture.calls),1)
+
+
+class FixtureOwnershipTests(unittest.TestCase):
+    def test_fixture_base_does_not_register_unrelated_regressions(self):
+        self.assertEqual(unittest.defaultTestLoader.getTestCaseNames(support.FixtureCase), [])
+
+    def run_case(self, action):
+        class Case(support.FixtureCase):
+            def runTest(self):
+                action(self)
+        result = unittest.TestResult()
+        Case().run(result)
+        return result
+
+    def test_owned_http_server_and_temporary_state_are_closed(self):
+        observed = {}
+        def action(case):
+            observed['state'] = case.state
+            fixture = case.fixture(lambda body, n: (200, {'body': body, 'call': n}))
+            observed['fixture'] = fixture
+            request = urllib.request.Request(fixture.url + '/v1/responses',
+                data=b'{"synthetic":true}', headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(json.load(response), {'body': {'synthetic': True}, 'call': 1})
+        result = self.run_case(action)
+        self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
+        self.assertFalse(observed['state'].exists())
+        self.assertFalse(observed['fixture'].thread.is_alive())
+        self.assertIsNone(observed['fixture'].server.RequestHandlerClass)
+
+    def test_fixture_error_fails_the_owning_case_after_closing_resources(self):
+        observed = {}
+        def action(case):
+            fixture = case.fixture(lambda *_: (200, {}))
+            fixture.errors.append('synthetic fixture failure')
+            observed['fixture'] = fixture
+            observed['state'] = case.state
+        result = self.run_case(action)
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.errors, [])
+        self.assertIn('synthetic fixture failure', result.failures[0][1])
+        self.assertFalse(observed['fixture'].thread.is_alive())
+        self.assertFalse(observed['state'].exists())
+
+    def test_evidence_uses_actual_selector_before_temporary_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            class Case(support.FixtureCase):
+                def test_owned_selector(self):
+                    self.evidence['state_exists'] = self.state.exists()
+            result = unittest.TestResult()
+            with patch.dict('os.environ', {'CARRY_TEST_EVIDENCE_DIR': directory}):
+                Case('test_owned_selector').run(result)
+            self.assertTrue(result.wasSuccessful(), (result.failures, result.errors))
+            self.assertEqual([p.name for p in Path(directory).iterdir()], ['test_owned_selector.json'])
+            self.assertEqual(json.loads((Path(directory) / 'test_owned_selector.json').read_text()),
+                             {'state_exists': True})
 
 
 if __name__ == '__main__':

@@ -17,17 +17,7 @@ def comparison_snapshot(proxy):
             'request_evidence': copy.deepcopy(proxy.saved()['request_evidence'])}
 
 
-class InitializationRegressions(unittest.TestCase):
-    def setUp(self):
-        self.harness = support.StateRegressions()
-        self.harness.setUp()
-        self.harness._testMethodName = self._testMethodName
-        self.evidence = self.harness.evidence
-        self.addCleanup(self.cleanup_harness)
-
-    def cleanup_harness(self):
-        self.assertTrue(self.harness.doCleanups(), "nested fixture cleanup failed")
-
+class InitializationRegressions(support.FixtureCase):
     def cache_options_history_control(self, initialized):
         # Review5714176642: equivalent spelling and genuine forecast-policy
         # changes cannot rename already summarized native-input history.
@@ -39,7 +29,7 @@ class InitializationRegressions(unittest.TestCase):
             response["usage"] = {"input_tokens": inputs[n - 1], "output_tokens": 0,
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "assistant", "content": "native history cache contract"},
                    {"role": "user", "content": "current"}]
@@ -50,9 +40,9 @@ class InitializationRegressions(unittest.TestCase):
                 history.append({"role": "user", "content": f"append {index}"})
             option = options[index - boundary] if index >= boundary else None
             fields = {} if option is None else {"prompt_cache_options": option}
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             if snapshots:
                 self.assertEqual(comparison_snapshot(proxy), snapshots[-1],
                                  "restart preserves exact history and already settled money")
@@ -109,14 +99,14 @@ class InitializationRegressions(unittest.TestCase):
             }
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "synthetic native receipt initialization tracer"}]
         proxy = support.Proxy(
-            self.harness.state, fixture, mode="audit",
+            self.state, fixture, mode="audit",
             extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"},
         )
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(history, model="gpt-6.1-sol")[0], 200)
         status, stats = proxy.request("GET", "/carry/dashboard/stats")
         self.assertEqual(status, 200)
@@ -153,7 +143,7 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         snapshots, wires, caps = [], [], []
         history = [{"role": "assistant", "content": "owned native-input history contract"},
@@ -162,9 +152,9 @@ class InitializationRegressions(unittest.TestCase):
             if index:
                 history.append({"role": "user", "content": f"append {index}"})
             cap = 2 if change_cap and index >= changed_at else 1
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             if index:
                 self.assertEqual(comparison_snapshot(proxy), snapshots[-1],
                                  "restart must preserve settled quantities and money")
@@ -240,11 +230,11 @@ class InitializationRegressions(unittest.TestCase):
             response['usage'] = {'input_tokens':10000 if n == 1 else 300000,
                                  'output_tokens':0, 'input_tokens_details':{'cached_tokens':0}}
             return 200, response
-        fixture = self.harness.fixture(primary, lambda *_: self.fail('unexpected reviewer'))
+        fixture = self.fixture(primary, lambda *_: self.fail('unexpected reviewer'))
         def start():
-            proxy = support.Proxy(self.harness.state, fixture, mode='audit',
+            proxy = support.Proxy(self.state, fixture, mode='audit',
                 extra_env={'CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS':'1000000'})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             return proxy
         proxy = start()
         history = [{'role':'user','content':'owned current money fixture'}]
@@ -277,7 +267,7 @@ class InitializationRegressions(unittest.TestCase):
 
         def journal_events(proxy):
             events = []
-            for path in (self.harness.state / "diagnostics").glob("*.jsonl"):
+            for path in (self.state / "diagnostics").glob("*.jsonl"):
                 for line in path.read_text().splitlines():
                     try:
                         event = support.json.loads(line)
@@ -303,7 +293,7 @@ class InitializationRegressions(unittest.TestCase):
                 record["error"] = repr(error)
                 record["diagnostics"] = {
                     path.name: path.read_text(errors="replace")[-4096:]
-                    for path in self.harness.state.glob("fixture-*.log")
+                    for path in self.state.glob("fixture-*.log")
                 }
                 raise
             finally:
@@ -324,14 +314,14 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         options = ["--primary-context-tokens", "1048576"]
 
         def start():
-            proxy = support.Proxy(self.harness.state, fixture, extra=options, mode="audit",
+            proxy = support.Proxy(self.state, fixture, extra=options, mode="audit",
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             return proxy
 
         def snapshot(proxy):
@@ -407,13 +397,13 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
 
         def start():
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             return proxy
 
         proxy = start()
@@ -501,7 +491,7 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "assistant", "content": "owned synthetic receipt history"},
                    {"role": "user", "content": "current"}]
@@ -510,7 +500,7 @@ class InitializationRegressions(unittest.TestCase):
         for index in range(5):
             if index:
                 if migrate and index == 3:
-                    checkpoint = next(self.harness.state.glob("*.json"))
+                    checkpoint = next(self.state.glob("*.json"))
                     saved = json.loads(checkpoint.read_text())
                     # Synthetic future policy identity only, not a new tariff.
                     # The recorded ledger and complete old digest stay intact.
@@ -519,9 +509,9 @@ class InitializationRegressions(unittest.TestCase):
                     resolution["scenario_cache_policy"]["version"] = 3
                     checkpoint.write_text(json.dumps(saved))
                 history.append({"role": "user", "content": f"append {index}"})
-            proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+            proxy = support.Proxy(self.state, fixture, mode="audit",
                                   extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-            self.harness.stack.callback(proxy.close)
+            self.stack.callback(proxy.close)
             if index:
                 self.assertEqual(comparison_snapshot(proxy), snapshots[-1],
                                  "restart must not rewrite prior trajectory or money")
@@ -601,7 +591,7 @@ class InitializationRegressions(unittest.TestCase):
                     self.cells.append(self.cell)
                     self.cell = None
 
-        session = self.harness.state / "sessions" / "noop-native"
+        session = self.state / "sessions" / "noop-native"
         session.mkdir(parents=True)
         body = {"model": "gpt-6.1-sol", "input": [{"role": "user", "content": "native quantity differs from local"}]}
         events = [{"event": "run_started", "data": {"model": "gpt-6.1-sol",
@@ -618,8 +608,8 @@ class InitializationRegressions(unittest.TestCase):
                  "cached_input_tokens": cached, "cache_write_input_tokens": written}, "raw": {"output": []}}}])
             expected += ((incoming-cached-written)*2 + cached*.1 + written*2.5 + 100*10) / 1e6
             (session / "trace.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
-            output = self.harness.state / f"noop-native-{index}.html"
-            env = {"PATH": "", "HOME": str(self.harness.state)}
+            output = self.state / f"noop-native-{index}.html"
+            env = {"PATH": "", "HOME": str(self.state)}
             if "TMPDIR" in os.environ:
                 env["TMPDIR"] = os.environ["TMPDIR"]
             result = subprocess.run([os.environ["CARRY_TEST_BINARY"], "report", "cost", "--sessions",
@@ -669,7 +659,7 @@ class InitializationRegressions(unittest.TestCase):
                     self.rows.append(self.row)
                     self.row = None
 
-        session = self.harness.state / "sessions" / "owned186"
+        session = self.state / "sessions" / "owned186"
         session.mkdir(parents=True)
         request = {"model": "gpt-6.1-sol", "input": [
             {"role": "assistant", "content": " evidence" * 260000},
@@ -684,10 +674,10 @@ class InitializationRegressions(unittest.TestCase):
                       "raw": {"output": []}}},
         ]
         (session / "trace.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
-        output = self.harness.state / "cost.html"
+        output = self.state / "cost.html"
         # Report CLI normally opens a browser: an empty child PATH makes the
         # opener unavailable, without launching one or modifying host settings.
-        env = {"PATH": "", "HOME": str(self.harness.state)}
+        env = {"PATH": "", "HOME": str(self.state)}
         if "TMPDIR" in os.environ:
             env["TMPDIR"] = os.environ["TMPDIR"]
         result = subprocess.run([os.environ["CARRY_TEST_BINARY"], "report", "cost", "--sessions",
@@ -740,7 +730,7 @@ class InitializationRegressions(unittest.TestCase):
                     self.cells.append(self.cell)
                     self.cell = None
 
-        session = self.harness.state / "sessions" / "fixed-floor186"
+        session = self.state / "sessions" / "fixed-floor186"
         session.mkdir(parents=True)
         body = {"model": "gpt-6.1-sol", "instructions": " fixed" * 40000,
                 "tools": [{"type": "function", "name": "owned", "description": "fixed tool",
@@ -765,8 +755,8 @@ class InitializationRegressions(unittest.TestCase):
             if step == 1:
                 continue
             (session / "trace.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
-            output = self.harness.state / f"fixed-floor-{step}.html"
-            env = {"PATH": "", "HOME": str(self.harness.state)}
+            output = self.state / f"fixed-floor-{step}.html"
+            env = {"PATH": "", "HOME": str(self.state)}
             if "TMPDIR" in os.environ:
                 env["TMPDIR"] = os.environ["TMPDIR"]
             result = subprocess.run([os.environ["CARRY_TEST_BINARY"], "report", "cost", "--sessions",
@@ -796,12 +786,12 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+        proxy = support.Proxy(self.state, fixture, mode="audit",
                               extra=["--primary-context-tokens", "50000"],
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": "old synthetic history"},
                    {"role": "user", "content": "current"}]
         self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=cap)[0], 200)
@@ -848,14 +838,14 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         extra = ["--primary-context-tokens", "50000"]
         if reserve is not None:
             extra.extend(["--primary-output-reserve-tokens", str(reserve)])
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit", extra=extra,
+        proxy = support.Proxy(self.state, fixture, mode="audit", extra=extra,
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": "old synthetic history"},
                    {"role": "user", "content": "current"}]
         fields = {} if cap is None else {"max_output_tokens": cap}
@@ -914,12 +904,12 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+        proxy = support.Proxy(self.state, fixture, mode="audit",
                               extra=["--primary-context-tokens", "1048576"],
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": " evidence" * 200000},
                    {"role": "user", "content": [
                        {"type": "input_text", "text": "current image request"},
@@ -970,12 +960,12 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+        proxy = support.Proxy(self.state, fixture, mode="audit",
                               extra=["--primary-context-tokens", "1048576"],
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": " evidence" * 200000},
                    {"role": "user", "content": "current request"}]
         self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=100000)[0], 200)
@@ -1001,12 +991,12 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+        proxy = support.Proxy(self.state, fixture, mode="audit",
                               extra=["--primary-context-tokens", "1048576"],
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": " evidence" * 60000},
                    {"role": "user", "content": " current" * 200000}]
         # Protected input fits the ordinary economic input budget by itself,
@@ -1036,12 +1026,12 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+        proxy = support.Proxy(self.state, fixture, mode="audit",
                               extra=["--primary-context-tokens", "1048576"],
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": " evidence" * 6000},
                    {"role": "user", "content": " current" * 256000}]
         self.assertEqual(proxy.send(history, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
@@ -1066,12 +1056,12 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+        proxy = support.Proxy(self.state, fixture, mode="audit",
                               extra=["--primary-context-tokens", "1048576"],
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": " evidence" * 6000},
                    {"role": "user", "content": "current protected request"}]
         tools = [{"type": "function", "name": "owned", "description": " fixed" * 256000,
@@ -1099,12 +1089,12 @@ class InitializationRegressions(unittest.TestCase):
                                  "input_tokens_details": {"cached_tokens": 0}}
             return 200, response
 
-        fixture = self.harness.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
-        proxy = support.Proxy(self.harness.state, fixture, mode="audit",
+        proxy = support.Proxy(self.state, fixture, mode="audit",
                               extra=["--primary-context-tokens", "1048576"],
                               extra_env={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "1000000"})
-        self.harness.stack.callback(proxy.close)
+        self.stack.callback(proxy.close)
         history = [{"role": "assistant", "content": " evidence" * 6000},
                    {"role": "user", "content": "current protected request"}]
         instructions = " fixed" * 256000

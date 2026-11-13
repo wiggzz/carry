@@ -3,11 +3,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class BaselineSizing(unittest.TestCase):
-    setUp = support.StateRegressions.setUp
-    record_evidence = support.StateRegressions.record_evidence
-    fixture = support.StateRegressions.fixture
-    proxy = support.StateRegressions.proxy
+class BaselineSizing(support.FixtureCase):
 
     def test_fresh_reasoning_without_increment_is_unknown_until_native_measurement(self):
         reasoning = {"type": "reasoning", "summary": [],

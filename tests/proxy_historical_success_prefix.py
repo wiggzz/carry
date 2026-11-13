@@ -19,10 +19,7 @@ class IndexedProxy(support.Proxy):
         self.close()
 
 
-class HistoricalSuccessPrefix(unittest.TestCase):
-    setUp = support.StateRegressions.setUp
-    record_evidence = support.StateRegressions.record_evidence
-    fixture = support.StateRegressions.fixture
+class HistoricalSuccessPrefix(support.FixtureCase):
 
     def test_seed_preserves_successful_window_across_failures_save_and_restart(self):
         def primary(_body, n):

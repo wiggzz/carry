@@ -6,10 +6,7 @@ import unittest
 import proxy_state_regressions as support
 
 
-class VisiblePool(unittest.TestCase):
-    setUp = support.StateRegressions.setUp
-    record_evidence = support.StateRegressions.record_evidence
-    fixture = support.StateRegressions.fixture
+class VisiblePool(support.FixtureCase):
 
     def test_repeated_visible_initial_pool_prices_after_indexed_restart(self):
         self.check_initial_pool(repeated=True)

@@ -62,10 +62,7 @@ class TransparentProxy(Proxy):
         return {"background_review_pending": False}
 
 
-class TransparentHistory(unittest.TestCase):
-    setUp = regressions.StateRegressions.setUp
-    record_evidence = regressions.StateRegressions.record_evidence
-    fixture = regressions.StateRegressions.fixture
+class TransparentHistory(regressions.FixtureCase):
 
     def proxy(self, fixture, options, *, wait_reviews=True):
         proxy = TransparentProxy(self.state, fixture, options, wait_reviews=wait_reviews)
