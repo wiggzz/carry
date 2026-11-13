@@ -111,10 +111,10 @@ pub struct ResumeState {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ContextCheckpoint {
+struct ContextCheckpoint<C = ContextState> {
     version: u32,
     model: String,
-    context: ContextState,
+    context: C,
     /// Missing from pre-cache-affinity checkpoints; such sessions resume normally.
     #[serde(default)]
     prompt_cache_key: Option<String>,
@@ -133,7 +133,7 @@ pub fn load_resume_state(session_dir: &Path) -> Result<ResumeState> {
             path.display()
         );
     }
-    let context = ContextState::decode(&checkpoint.context.encode()?)?;
+    let context = checkpoint.context.restore()?;
     Ok(ResumeState {
         context,
         model: checkpoint.model,
@@ -152,7 +152,7 @@ fn persist_context_checkpoint(config: &RunConfig, state: &ContextState) -> Resul
     let checkpoint = ContextCheckpoint {
         version: CONTEXT_CHECKPOINT_VERSION,
         model: config.model.clone(),
-        context: state.clone(),
+        context: state,
         prompt_cache_key: config.prompt_cache_key.clone(),
     };
     let bytes = serde_json::to_vec(&checkpoint)?;
@@ -3288,6 +3288,53 @@ mod tests {
                     .as_str()
                     .is_some_and(|output| output.contains("answer was delivered"))
         }));
+    }
+
+    #[test]
+    fn checkpoint_borrowed_context_preserves_owned_wire_bytes() {
+        let mut context = ContextState::new("first task".into());
+        context.add_user("later task".into());
+        let before = serde_json::to_value(&context).unwrap();
+        let borrowed = serde_json::to_vec(&ContextCheckpoint {
+            version: CONTEXT_CHECKPOINT_VERSION,
+            model: "scripted".into(),
+            context: &context,
+            prompt_cache_key: Some("resume-cache-key".into()),
+        })
+        .unwrap();
+        assert_eq!(serde_json::to_value(&context).unwrap(), before);
+        let owned = serde_json::to_vec(&ContextCheckpoint {
+            version: CONTEXT_CHECKPOINT_VERSION,
+            model: "scripted".into(),
+            context,
+            prompt_cache_key: Some("resume-cache-key".into()),
+        })
+        .unwrap();
+        assert_eq!(borrowed, owned);
+    }
+
+    #[test]
+    fn resume_checkpoint_rejects_invalid_identity_and_version_without_rewriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(CONTEXT_CHECKPOINT_FILE);
+        let valid = json!({
+            "version": CONTEXT_CHECKPOINT_VERSION,
+            "model": "scripted",
+            "context": ContextState::new("first task".into()),
+            "prompt_cache_key": "resume-cache-key"
+        });
+        for invalid_context in [false, true] {
+            let mut checkpoint = valid.clone();
+            if invalid_context {
+                checkpoint["context"]["next_id"] = json!(0);
+            } else {
+                checkpoint["version"] = json!(CONTEXT_CHECKPOINT_VERSION + 1);
+            }
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(load_resume_state(temp.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

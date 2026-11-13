@@ -210,14 +210,19 @@ impl ContextState {
         }
     }
 
+    #[cfg(test)]
     pub fn encode(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(self)?)
     }
 
+    #[cfg(test)]
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut state: Self = serde_json::from_slice(bytes)?;
+        Self::restore(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn restore(mut self) -> Result<Self> {
         // Upgrade legacy memories, preserving explicit drops and recorded lease releases.
-        for item in &mut state.items {
+        for item in &mut self.items {
             if item.kind == ContextItemKind::Memory
                 && item.signal != RetentionSignal::Drop
                 && !item.keep_lease_expired
@@ -225,11 +230,11 @@ impl ContextState {
                 item.retention = Retention::Protected;
             }
         }
-        let max_id = state.items.iter().map(|item| item.id).max().unwrap_or(0);
-        if state.next_id < max_id {
+        let max_id = self.items.iter().map(|item| item.id).max().unwrap_or(0);
+        if self.next_id < max_id {
             bail!("persisted context next_id is behind its item IDs");
         }
-        Ok(state)
+        Ok(self)
     }
 
     pub fn add_user(&mut self, content: String) -> u64 {
