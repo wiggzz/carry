@@ -433,93 +433,19 @@ and totals are marked incomplete. Cost values are standard API equivalents, not 
 charges, invoices, or measured savings; unpriced calls make the total unavailable
 while the known priced subtotal remains visible.
 
-The separate **cost comparison scenario** follows the main savings estimator's
-frozen-trajectory approach: compare Carry's retained input against restoring
-its removed context until a conventional threshold-triggered summary. Both
-branches use the same local token estimates for inputs and the same recorded
-output tokens. Carry includes reviewer calls (priced uncached); the
-traditional branch pays for hypothetical summary calls. A negative saving is
-shown as a loss, not clamped to zero, and percentages use traditional scenario
-cost as the denominator—not actual provider spend.
+The backend owns comparison eligibility and aggregation; the UI does not
+recalculate savings. The headline sums available **complete session windows**,
+with included/unavailable window counts. Strict priced-subset diagnostics are
+separate, not substitutes for an unavailable window. Missing amounts display
+`Unavailable`; valid zero and negative savings remain numeric. Coverage counters
+and the separate all-attempt native ledger remain visible even when a comparison
+is unavailable. These are conditional API-equivalent estimates, not measured
+savings or subscription charges.
 
-Assumptions are displayed: 272,000-token window, 16,384 reserve, 20,000 recent
-tokens retained and a 1,000-token summary. The conventional scenario checks after
-every completed primary response, including tool calls: local input plus output
-above 255,616 units triggers a summary before the next request. It does not wait
-for an agent turn to end. This is not a hard provider-token cap: the first
-observed prompt or one large input/output increment can already exceed the
-threshold. The simulated summary never changes real Carry requests, and an
-upgrade does not replay or repair accumulated historical estimates.
-Cache reuse assumes matching route/key/settings, append-compatible
-prefixes and a 30-minute expiry; the restored branch's literal prefix after a
-Carry edit is unknown, so its frozen-size reuse is conditional. These are not
-reconstructed client/provider compaction or cache guarantees. Summaries could
-change subsequent actions, quality or rereads; the scenario does not model that.
-Both scenario totals remain separate from the observed native-usage ledger.
-
-Scenario state survives restart. Unsuccessful primary and reviewer attempts are
-excluded under the successful-request policy; later successful requests continue
-the simulation. Completed calls without comparable pricing—missing usage, unknown
-rates/cache behavior, or native image/audio/video content—are omitted from the
-comparison rather than invalidating the whole session. An omitted primary adds
-neither its Carry cost nor its traditional cost. Known reviewer expense remains
-charged to Carry; an unpriced reviewer is omitted and counted separately because
-it has **no traditional counterpart**, so its missing cost does not cancel.
-
-These are **priced-subset estimates**, not claims that missing costs are zero or
-that the full-trajectory saving is exact. Omitted primary costs are assumed to
-roughly offset; context-dependent prices and caches can differ, and percentages
-use a smaller denominator. Omitted reviewer costs can overstate savings. The
-dashboard labels partial comparisons and separately counts omitted calls so
-pricing/usage coverage can be improved without hiding the available comparison.
-No comparable priced primary observations still means `Unavailable`, not zero.
-Untracked history or an invalid scenario can still make a comparison unavailable.
-Unsupported persisted accounting formats are rejected, not migrated to another
-failure policy. A pending background review
-temporarily withholds the monetary comparison until its outcome is recorded;
-its coverage counters remain visible. The upgrade does not replay raw traces or
-invent missing receipts to reconstruct historical comparisons.
-
-The backend owns savings eligibility and aggregation. Session `cost_estimate`
-objects contain numeric monetary fields for available comparisons and `null`
-monetary fields otherwise, with coverage counters retained for diagnostics; there
-is no public `priced` flag. Top-level `cost_estimate` contains the aggregate
-`carry_cost`, `traditional_cost`, `savings`, `savings_percent`, `included_sessions`,
-`excluded_sessions`, and `excluded_failed_calls`. `excluded_unpriced_calls` counts
-omitted completed primary/reviewer calls; `excluded_unpriced_reviewer_calls` is
-the reviewer-only subset, not an additional count. These omission counters include
-unavailable/pending sessions as well, so coverage problems do not disappear when
-a session cannot contribute money. Historical checkpoints that predate these
-counters expose only a conservative lower bound from overlapping coverage reasons;
-exact historical reviewer attribution is unavailable. New omissions are counted
-exactly. Existing coverage reasons and native usage ledgers remain separately
-available for diagnosis. Only available session
-comparisons contribute to monetary totals; excluded sessions also count unreadable
-checkpoints. With
-no available comparisons, amounts are `null`, not zero. Valid zero and negative
-savings remain numeric. The UI formats these backend values without filtering or
-recalculating savings; null amounts display `Unavailable`. Excluded sessions
-remain in usage totals and the session list. Scenario fields never disclose the
-prior prompt kept privately for cache matching; session title excerpts are
-disclosed above.
-See [the proxy history contract](proxy-fork-continuity.md) for background review
-and request-time projections.
-
-Review modes (`compact`/`audit`) accept full-history input or a delta referencing
-the latest completed `previous_response_id` in the explicit session/branch. Unknown
-or stale IDs return 409; an explicit rebase retires the continuation. The proxy
-reconstructs history and sends full retained input upstream, without
-`previous_response_id`. Conversation handles and background requests are rejected.
-The successful response's saved input frontier survives a failed primary;
-retrying the identical delta expands that parent once, including across restart.
-An empty or revised delta after failure is not guaranteed to replace the failed
-suffix in a strict explicit session: retry it identically or choose a new branch.
-Legacy checkpoints with a response ID but no saved frontier reject delta
-continuation; an ordinary compatible full-history request can establish a new
-successful frontier.
-Reviewer memories are small atomic facts: they activate when any source is removed
-and are inserted after the latest source group’s last member, retained or removed. The
-proxy renders the retained primary history, including any previously applied
-rewrites, into the outbound `input`. `off` forwards the caller's wire request
-unchanged, including a caller-supplied `previous_response_id`; the proxy does
-not automatically build server-side response chains in any mode.
+See [receipt-anchored quantities and cost comparisons](reasoning-quantity.md) for
+the successful population, stats-time replay, assumptions and unknowns, and
+[the history contract](proxy-fork-continuity.md) for observed response/conversation
+IDs, reversible projections, background review and restart. After a failed
+explicit-session delta, retry the identical delta or choose a new branch; a
+revised suffix need not satisfy strict prefix matching. `off` remains opaque
+forwarding, including caller-supplied continuation references.

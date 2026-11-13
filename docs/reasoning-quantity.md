@@ -77,6 +77,15 @@ unavailable session windows and strict versus inferred quantity coverage.
 Missing chronology, successful money or consistent population proof leaves the
 relevant comparison unavailable. All-attempt totals cannot fill those gaps.
 
+The conventional scenario uses the shared `Scenario` policy: the catalog's
+ordinary context window, a 16,384-unit reserve, 20,000 recent units and a 1,000-unit
+summary by default. It checks after every successful primary response, including
+tool calls, not only agent-turn completion; initial admission also accounts for
+the requested output allowance and fixed/protected floor. These modeled
+transitions do not constrain real requests or reconstruct actual client summaries.
+Cache assumptions follow the frozen scenario contract, not a blanket live-hit or
+30-minute guarantee.
+
 The alternative assumes the same outputs and tool sequence; it never reprices
 original paid receipts. Behavioral accounting/restart controls do not establish
 predictive accuracy, statistical confidence bounds or real-provider causal savings.
