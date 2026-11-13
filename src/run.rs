@@ -530,8 +530,8 @@ impl CacheTracker {
                 window,
                 native_tokens: quantities.read().unwrap().0,
                 request_tokens: self.pending_request_tokens,
-                history: self.pending_history.clone(),
-                breakpoints: self.pending.clone(),
+                history: std::mem::take(&mut self.pending_history),
+                breakpoints: std::mem::take(&mut self.pending),
             });
         }
         self.pending.clear();
