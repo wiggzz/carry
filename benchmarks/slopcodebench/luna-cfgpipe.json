@@ -1,0 +1,21 @@
+{
+  "phase": "official problem/checkpoint selection frozen; runtime images, prompt and grading-policy preparation still pending; no model dispatch",
+  "selection_rationale": "first lexicographic ordinary official problem root, selected before any SCB model outcome; complete ordered checkpoint sequence",
+  "runner_commit": "af5a9cbc311605b5cceb80200ca9832bdff2d7b1",
+  "problems_commit": "9cd9ca3a51c3d3e2a99d2488a25baf73a2204451",
+  "problem_tree_sha": "76e7313b7594277d6347fffb850d54e01a30bc45",
+  "problem": "cfgpipe",
+  "checkpoints": [
+    "checkpoint_1",
+    "checkpoint_2",
+    "checkpoint_3",
+    "checkpoint_4",
+    "checkpoint_5",
+    "checkpoint_6"
+  ],
+  "expected_checkpoint_arm_outcomes": 12,
+  "primary_model": "gpt-6-luna",
+  "primary_reasoning": "medium",
+  "reviewer_model": "gpt-6-luna",
+  "reviewer_reasoning": "low"
+}

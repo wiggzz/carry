@@ -1,5 +1,11 @@
 # Opt-in Codex and Pi proxy trials
 
+For matched **Codex raw (`disabled`) versus Carry (`compact`)** on SWE-bench
+and the official SlopCodeBench runner, use the
+[paired benchmark operator guide](paired-codex-benchmarks.md). It reuses these
+workers and accounting, with prepared runtime, consent and fixed-denominator
+gates; `off` remains a separate transport diagnostic.
+
 `carry proxy` sits between a native HTTP Responses client and its provider. `off` forwards without review; `audit` performs paid shadow review without selecting a rewritten primary context; `compact` enables the proxy planner. These modes are experiments, not a claim of savings or client compatibility established by unit tests.
 
 The benchmark default is **`disabled`**, which selects the direct lanes without a Carry sidecar or reviewer. The shared benchmark gateway now validates and buffers POST bodies before forwarding, rejects hosted/malformed tools, and enforces a 16 MiB admission limit in both direct and active-proxy lanes; `disabled` does not preserve the former direct gateway's streaming/admission behavior. `disabled` and proxy `off` are distinct treatments. Compare `off` versus `compact` on the same candidate, tasks, model, effort, client configuration and native-compaction settings. Measure `disabled` versus `off` separately as transport overhead.

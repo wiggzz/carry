@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import re
 import runpy
+import json
+import os
 from collections.abc import MutableMapping
 from importlib.metadata import version
 from typing import Any
@@ -47,6 +49,28 @@ def install_sympy_parser(parsers: MutableMapping[str, Any]) -> None:
     parsers["sympy/sympy"] = parse_log_sympy_fail_closed
 
 
+def install_prepared_runtime(images: dict[str, str]) -> None:
+    """Replace only the Docker spawn boundary, not official grading or scripts.
+
+    A measured paired lane supplies the resolver's exact alias->config-ID map.
+    No pull/build fallback or evaluator egress is permitted in this mode.
+    """
+    from swebench.harness import docker_build
+    if not images or any(not isinstance(k, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', v)
+                         for k, v in images.items()):
+        raise ValueError('prepared evaluator map requires immutable local image IDs')
+    def spawn(test_spec, client, run_id, logger, nocache, force_rebuild=False):
+        del logger, nocache
+        expected = images.get(test_spec.instance_image_key)
+        if force_rebuild or expected is None or client.images.get(test_spec.instance_image_key).id != expected:
+            raise RuntimeError('official evaluator prepared image missing or changed; builds/pulls forbidden')
+        return client.containers.create(image=expected, name=test_spec.get_instance_container_name(run_id),
+            user='root', detach=True, entrypoint=[], command='tail -f /dev/null', platform=test_spec.platform,
+            network_mode='none', cap_drop=['ALL'], security_opt=['no-new-privileges'],
+            pids_limit=512, mem_limit='4g', nano_cpus=2_000_000_000)
+    docker_build.build_container = spawn
+
+
 def main() -> None:
     """Install the compatibility parser, then execute the official evaluator CLI."""
     if version("swebench") != "4.1.0":
@@ -55,6 +79,8 @@ def main() -> None:
     from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
 
     install_sympy_parser(MAP_REPO_TO_PARSER)
+    if 'CARRY_SWEBENCH_PREPARED_IMAGES' in os.environ:
+        install_prepared_runtime(json.loads(os.environ['CARRY_SWEBENCH_PREPARED_IMAGES']))
     evaluator_path = getattr(run_evaluation, "__file__", None)
     if not evaluator_path:
         raise RuntimeError("pinned SWE-bench evaluator module has no source path")

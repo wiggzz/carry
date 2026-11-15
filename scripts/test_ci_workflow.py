@@ -15,18 +15,31 @@ class CiWorkflowTests(unittest.TestCase):
     def test_final_check_requires_all_lanes_to_succeed(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
         gate = workflow['jobs']['ci-status']
-        self.assertEqual(set(gate['needs']), {'test', 'integration', 'native', 'python', 'infra'})
+        self.assertEqual(set(gate['needs']), {'test', 'integration', 'native', 'python', 'infra', 'scb-protected-fixture'})
         step = gate['steps'][0]
         self.assertEqual(set(step['env'].values()),
                          {'${{ needs.' + lane + '.result }}' for lane in gate['needs']})
         for results in itertools.product(('success', 'failure', 'cancelled', 'skipped', ''), repeat=5):
             with self.subTest(results=results):
-                env = {**os.environ, **dict(zip(
+                env = {**os.environ, 'SCB_RESULT': 'success', **dict(zip(
                     ('RUST_RESULT', 'PYTHON_RESULT', 'INFRA_RESULT', 'INTEGRATION_RESULT', 'NATIVE_RESULT'), results))}
                 result = subprocess.run(['bash', '-euo', 'pipefail', '-c', step['run']],
                                         env=env, capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode == 0, results == ('success',) * 5,
                                  result.stdout + result.stderr)
+
+    def test_protected_lane_failure_cancel_skip_and_missing_fail_actual_guard(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        gate = workflow['jobs']['ci-status']
+        step = gate['steps'][0]
+        for result in ('success', 'failure', 'cancelled', 'skipped', ''):
+            with self.subTest(result=result):
+                env = {**os.environ, **{key: 'success' for key in step['env']}, 'SCB_RESULT': result}
+                executed = subprocess.run(['bash', '-euo', 'pipefail', '-c', step['run']],
+                    env=env, capture_output=True, timeout=5)
+                self.assertEqual(executed.returncode == 0, result == 'success')
+        self.assertIn('scb-protected-fixture', gate['needs'])
+        self.assertEqual(step['env']['SCB_RESULT'], '${{ needs.scb-protected-fixture.result }}')
 
     def test_binary_contract_lane_fails_before_tests_if_binary_is_missing(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())

@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "runner_repository": "https://github.com/SprocketLab/slop-code-bench",
+  "runner_commit": "af5a9cbc311605b5cceb80200ca9832bdff2d7b1",
+  "problems_repository": "https://github.com/gabeorlanski/scb-problems",
+  "problems_commit": "9cd9ca3a51c3d3e2a99d2488a25baf73a2204451",
+  "report_module": "src/slop_code/evaluation/report.py",
+  "report_sha256": "5243b72604cee806491934e742f5b6312f778720dd7fd89abd35443d3d7de19e"
+}
