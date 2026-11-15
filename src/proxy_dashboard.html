@@ -308,7 +308,7 @@ function coverageChips(e){
  if(q?.unavailable_quantity_calls)chips.push(fmt(q.unavailable_quantity_calls)+' calls lack quantity evidence');
  if(q?.comparison_scope==='matched_subset_not_whole_session')chips.push(Object.prototype.hasOwnProperty.call(e,'whole_window')?'Strict quantity reference is partial (diagnostic)':'Matched subtotal · not whole session');
  if(e?.excluded_unpriced_calls)chips.push(fmt(e.excluded_unpriced_calls)+(Object.prototype.hasOwnProperty.call(e,'whole_window')?' calls outside strict reference':' comparison calls excluded'));
- if(e?.excluded_failed_calls)chips.push(fmt(e.excluded_failed_calls)+' failed calls excluded');
+ if(e?.excluded_failed_calls)chips.push(fmt(e.excluded_failed_calls)+' legacy failed attempts lack receipt/comparator');
  if(e?.coverage?.prior_untracked_calls)chips.push(fmt(e.coverage.prior_untracked_calls)+' prior attempts lack complete outcome/history evidence');
  if(e?.legacy_sessions)chips.push(fmt(e.legacy_sessions)+(Object.prototype.hasOwnProperty.call(e,'whole_window')?' legacy diagnostic sessions':' legacy sessions excluded'));
  if(e?.in_flight_sessions)chips.push('In-flight costs pending');
@@ -320,13 +320,13 @@ function comparisonScopeNote(root,e){
  if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
   const w=e.whole_window;
   const subset=e.whole_window_scope==='available_session_windows_only';
-  note(root,w?(subset?'Complete session windows · '+fmt(e.whole_window_included_sessions)+' histories included · '+fmt(e.whole_window_unavailable_sessions)+' excluded':'Whole accounting window · successful completions only')+' · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
+  note(root,w?(subset?'Complete session windows · '+fmt(e.whole_window_included_sessions)+' histories included · '+fmt(e.whole_window_unavailable_sessions)+' excluded':'Whole accounting window · all provider attempts')+' · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
   if(w&&(w.trajectory?.initial_compactions??e.initial_compactions)>0)note(root,'Traditional starts after a free initial compaction','comparison-scope card-note');
   return;
  }
  const q=e?.quantity_evidence,scope=q?.comparison_scope;
  const total=q?.total_primary_responses??e?.coverage?.primary_responses;
- const label=scope==='matched_subset_not_whole_session'?'Matched subtotal · not whole session':scope==='matched_completed_primary_window'?'Matched completed primary window':'Comparison scope unavailable';
+ const label=scope==='matched_subset_not_whole_session'?'Matched subtotal · not whole session':scope==='matched_all_outcome_attempt_window'?'Matched all-outcome attempt window':scope==='matched_completed_primary_window'?'Matched completed primary window':'Comparison scope unavailable';
  const coverage=e?.matched_primary_responses!=null&&total!=null?' · '+fmt(e.matched_primary_responses)+' / '+fmt(total)+' primary responses matched':'';
  note(root,label+coverage,'comparison-scope card-note');
 }
@@ -365,8 +365,8 @@ function renderSession(s){
  if(e?.counterfactual_cache_policy||e?.accounting_basis){const accounting=disclosure('accounting:'+s.id,'Accounting details','session-accounting');if(e.counterfactual_cache_policy)inspectionMetric(accounting,'Comparison cache policy',e.counterfactual_cache_policy);if(e.accounting_basis)inspectionMetric(accounting,'Accounting basis',e.accounting_basis);if(e.quantity_evidence){inspectionMetric(accounting,'Quantity estimates',e.quantity_evidence.version===1?'Receipt blocks + native-increment residual allocations':'Legacy receipt quantities','No calibrated interval; same outputs and tool sequence assumed');inspectionMetric(accounting,'Historical quantity policy',e.quantity_evidence.historical_policy_scope,fmt(e.quantity_evidence.legacy_priced_calls||0)+' legacy priced calls · no retrospective repricing')}details.append(accounting)}
  if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
  const whole=disclosure('whole:'+s.id,'Whole-window estimate assumptions','whole-window-assumptions');
- inspectionMetric(whole,'Historical inference',e.whole_window?.assumption?.replaceAll('_',' ')||'Actual money/window unavailable', 'Continuous request-by-request traditional trajectory; successful completed outcomes only, failed attempts excluded symmetrically. At most one free initial compaction for an already oversized first tracked input; subsequent summaries are charged. Same outputs and tool sequence; conditional cache and explicit quantity estimates. Observed cost separately includes all paid attempts. Not measured or causal savings; no calibrated interval.');
- inspectionMetric(whole,'Strict matched diagnostics',money(e.carry_cost)+' Carry / '+money(e.traditional_cost)+' traditional','Original subset evidence; not the headline');details.append(whole);
+ inspectionMetric(whole,'Historical inference',e.whole_window?.assumption?.replaceAll('_',' ')||'Actual money/window unavailable', 'Continuous request-by-request traditional trajectory; all known-priced outcomes, including failed primary/reviewer attempts. Failed outputs do not advance retained history; unknown legacy failures remain unknown. At most one free initial compaction for an already oversized first tracked input; subsequent summaries are charged. Same outputs and tool sequence; conditional cache and explicit quantity estimates. Observed cost separately includes all paid attempts. Not measured or causal savings; no calibrated interval.');
+ inspectionMetric(whole,'All-outcome accounting',money(e.carry_cost)+' Carry / '+money(e.traditional_cost)+' traditional','Receipt-priced Carry; comparison requires complete same-attempt evidence');details.append(whole);
  }
  details.append(transcriptView(s));el.append(details);return el;
 }
@@ -399,9 +399,9 @@ async function refresh(after=pageAfter){
   $('usage-strip').replaceChildren();
   for(const text of [count(sum(primary,'calls'),'primary call'),count(sum(shadow,'calls'),'reviewer call'),fmt(sum(all,'input_tokens'))+' input tokens',fmt(sum(all,'output_tokens'))+' output tokens',...coverageChips(estimate)])note($('usage-strip'),text,'chip');
   $('cost-cards').replaceChildren(card('With Carry',money(headline?.carry_cost)),card('Traditional',money(headline?.traditional_cost)),card('Strict-evidence exclusions (diagnostic)',fmt(estimate.excluded_unpriced_calls||0)));
-  $('accounting-detail').textContent=fmt(estimate.matched_primary_responses)+' matched primary responses · completed calls only';
+  $('accounting-detail').textContent=fmt(estimate.matched_primary_responses)+' matched primary attempts · all outcomes';
   const scenario=data.cost_scenario;
-  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill. Quantities may be estimated; no calibrated interval. Same outputs and tool sequence assumed. Traditional is replayed chronologically from frozen request observations; explicitly inferred quantities are identified separately. Missing successful money or historical evidence leaves the comparison unavailable. Summary/cache effects use the saved scenario; historical money is not repriced. Not measured or causal savings.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
+  $('assumptions').textContent='Provider receipts + frozen API rates. Traditional is a modeled alternative, not a bill. Quantities may be estimated; no calibrated interval. Same outputs and tool sequence assumed. Traditional is replayed chronologically from frozen request observations; explicitly inferred quantities are identified separately. Missing receipt money or same-attempt historical evidence leaves the comparison unavailable. Summary/cache effects use the saved scenario; historical money is not repriced. Not measured or causal savings.'+(scenario?' Window '+fmt(scenario.context_window)+' · reserve '+fmt(scenario.reserve)+' · keep '+fmt(scenario.keep_recent)+' · summary '+fmt(scenario.summary):'');
   $('config').textContent='Mode '+(data.mode||'—')+' · '+(data.auth||'—')+' auth · reviewer '+(data.classifier_model||'—')+' / '+(data.classifier_effort||'—')+' · cache '+(data.reviewer_cache_mode||'—');
   $('usage').replaceChildren(...[['Primary',primary],['Reviewer',shadow]].map(([name,ledgers])=>{
    const calls=sum(ledgers,'calls'),missing=sum(ledgers,'unavailable_cost_calls');

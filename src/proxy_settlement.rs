@@ -90,6 +90,17 @@ pub(super) fn reserve(
             primary,
         )
     })?;
+    // The subscription transport permits exactly one 401 refresh retry. Both
+    // physical provider receipts must fit before the first paid dispatch.
+    let attempts =
+        if service.config.codex_login && (primary || service.config.classifier_url.is_none()) {
+            2
+        } else {
+            1
+        };
+    let evidence = evidence
+        .checked_mul(attempts)
+        .ok_or_else(|| std::io::Error::other("retry receipt representation overflow"))?;
     // Include the complete changed field envelope, rather than assuming any
     // existing numeric digit widths or missing optional fields remain fixed.
     let bytes = size_bound(&fields)?.checked_add(evidence).ok_or_else(|| {

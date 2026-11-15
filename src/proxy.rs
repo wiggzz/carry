@@ -207,6 +207,8 @@ struct Service {
     // changed-direction checkpoint can be published. Cleared on settlement.
     #[cfg(test)]
     lock_waits: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    #[cfg(test)]
+    codex_token_url: Option<String>,
     _directory_lock: Arc<File>,
 }
 
@@ -405,6 +407,8 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         text_quantities: Default::default(),
         #[cfg(test)]
         lock_waits: Arc::new(std::sync::Mutex::new(None)),
+        #[cfg(test)]
+        codex_token_url: None,
         _directory_lock: Arc::new(directory_lock),
     });
     history::initialize(&service)?;
@@ -455,6 +459,10 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         .route("/carry/metrics", get(metrics))
         .route("/carry/dashboard", get(dashboard))
         .route("/carry/dashboard/stats", get(dashboard_stats))
+        .route(
+            "/carry/dashboard/comparison/{id}",
+            get(dashboard_comparison),
+        )
         .route("/carry/dashboard/accounting", get(dashboard_accounting))
         .route(
             "/carry/dashboard/transcript/{id}",
@@ -763,6 +771,35 @@ fn save_published(
 }
 
 fn save_publication(
+    service: &Service,
+    id: &str,
+    session: &Session,
+    paid_only: bool,
+    publish: impl FnOnce(&Session, &history::Publication) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let result = save_publication_inner(service, id, session, paid_only, publish);
+    if let Some(evidence) = &session.request_evidence {
+        evidence.visit_latest_receipts(|receipt| {
+            logging::phase_summary(
+                service,
+                id,
+                receipt
+                    .parent_request_id
+                    .as_deref()
+                    .unwrap_or(&receipt.request_id),
+                None,
+                &json!({"schema_version":2,"stage":"receipt_persistence",
+                    "role":receipt.role,"attempt_id":receipt.request_id,
+                    "durable":result.is_ok(),"paid_only":paid_only,
+                    "usage_present":receipt.usage.get("input_tokens").is_some(),
+                    "pricing_available":receipt.cost.is_some()}),
+            );
+        });
+    }
+    result
+}
+
+fn save_publication_inner(
     service: &Service,
     id: &str,
     session: &Session,
@@ -1633,6 +1670,39 @@ struct SessionPage {
     after_id: String,
     limit: Option<usize>,
 }
+#[derive(Default, serde::Deserialize)]
+struct ComparisonQuery {
+    #[serde(default)]
+    strategy: crate::savings::SummaryStrategy,
+}
+async fn dashboard_comparison(
+    State(service): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ComparisonQuery>,
+) -> Result<Response, Failure> {
+    authorize_dashboard(&service, &headers, peer)?;
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(failure(StatusCode::BAD_REQUEST, "invalid owner"));
+    }
+    let view = history::ReadView::new(&service);
+    let session = load_dashboard_accounting(&service, &id, &view)
+        .map_err(|_| failure(StatusCode::NOT_FOUND, "accounting owner unavailable"))?;
+    let evidence = session
+        .request_evidence
+        .as_ref()
+        .ok_or_else(|| failure(StatusCode::CONFLICT, "comparison facts unavailable"))?;
+    let estimate = evidence
+        .snapshot_with_summary(query.strategy)
+        .dashboard(session.primary_pending || session.background_review_pending);
+    let mut response = axum::Json(estimate).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    Ok(response)
+}
+
 async fn dashboard_stats(
     State(service): State<Arc<Service>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1954,18 +2024,36 @@ async fn native_compact(
 struct ReviewRun {
     background: bool,
     request_id: String,
-    receipts: Vec<ReviewReceipt>,
+    receipts: Vec<ClientReceipt>,
     accepted: bool,
 }
 
-struct ReviewReceipt {
-    model: String,
-    usage: Option<Value>,
-    write_tariff_known: bool,
-    standard: bool,
-    // Usage can be present on failed/incomplete terminals, or absent on a
-    // completed one. Keep this independent from both usage and advice validity.
-    completed: bool,
+fn settle_failed_primary(
+    session: &mut Session,
+    body: &Value,
+    route: &str,
+    receipt: &ClientReceipt,
+) {
+    let settled = receipt.settle(&mut session.primary);
+    session.failed_primaries += 1;
+    if let Some(evidence) = &mut session.request_evidence {
+        // A numeric view of the received record, not invented output/history.
+        let numeric = json!({"usage":receipt.usage,"status":receipt.provider_status});
+        evidence.primary_receipt(
+            crate::proxy_savings::PrimaryObservation {
+                body,
+                response: &numeric,
+                measurements: Some(&session.primary_input),
+                route,
+                at: receipt.forecast.at,
+                standard: receipt.standard,
+                resolved: receipt.resolved.as_ref(),
+                cost: settled,
+            },
+            Some(receipt.clone()),
+            false,
+        );
+    }
 }
 
 struct Commit {
@@ -2017,7 +2105,9 @@ async fn forward_request(
         &mut phases,
     )
     .await;
-    if let Some(phases) = &mut phases {
+    if let Some(phases) = &mut phases
+        && phases.outcome == "dropped_before_terminal"
+    {
         phases.outcome = if phases.preparation_done_us.is_none() {
             "rejected"
         } else {
@@ -2588,14 +2678,28 @@ async fn forward_timed(
             .as_ref()
             .map(|_| continuation_wire.as_ref().unwrap_or(&canonical_wire));
         let mut measurement = dispatch_measurement(&request_id, "primary", &outbound);
-        measurement.outgoing_input_tokens = counts.projected(
-            &outbound,
-            source,
-            &session.primary_input,
-            &service.config.upstream_url,
-            resolved,
-        );
-        measurement.basis = "shared_input_estimates_not_native_usage_or_capacity".into();
+        let forecast = match source {
+            Some(source) => session.primary_input.projected_estimate(
+                &outbound,
+                source,
+                &service.config.upstream_url,
+                resolved,
+            ),
+            None => session.primary_input.known_estimate(
+                &outbound,
+                &service.config.upstream_url,
+                resolved,
+            ),
+        };
+        measurement.outgoing_input_tokens =
+            counts.count_with(&outbound, || forecast.map(|input| input.tokens));
+        measurement.basis = forecast.map_or("unavailable".into(), |input| {
+            serde_json::to_value(input.basis)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
         // A caller fragment must not inherit an expanded prompt's quantity.
         measurement.caller_input_tokens = session
             .primary_input
@@ -2719,18 +2823,66 @@ async fn forward_timed(
             service.config.model_resolution.as_ref().map(|p| &p.primary),
             carry::models::cache_write_tariff_known(&outbound),
         );
+        attempt.freeze(
+            &outbound,
+            &endpoint,
+            commit
+                .as_ref()
+                .and_then(|c| c.candidate.last_primary_dispatch.as_ref()),
+        );
         timing.preparation_done_us = Some(timing.elapsed_us());
         timing.native_attempt_id = Some(attempt.id.clone());
+        let mut retry_receipts = Vec::with_capacity(1);
         let response = if service.config.codex_login {
-            send_codex(&service, &endpoint, &outbound, false, None, Some(timing)).await
-        } else {
-            timing.dispatch();
-            let response = request.send().await.map_err(anyhow::Error::from);
-            if let Ok(response) = &response {
-                timing.headers(response.status());
+            match tokio::time::timeout(
+                Duration::from_secs(service.config.request_timeout_secs),
+                send_codex(
+                    &service,
+                    &endpoint,
+                    &outbound,
+                    false,
+                    None,
+                    Some(&mut *timing),
+                    &attempt,
+                    &mut retry_receipts,
+                ),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    timing.failed("primary_deadline_expired");
+                    Err(anyhow::anyhow!("primary request deadline"))
+                }
             }
-            response
+        } else {
+            match request.build() {
+                Ok(request) => {
+                    timing.dispatch();
+                    let response = service
+                        .client
+                        .execute(request)
+                        .await
+                        .map_err(anyhow::Error::from);
+                    if let Ok(response) = &response {
+                        timing.response_headers(response);
+                    }
+                    response
+                }
+                Err(error) => Err(error.into()),
+            }
         };
+        let dispatched = timing.attempt_count() > retry_receipts.len();
+        if let Some(base) = &mut attempt.receipt {
+            base.transport_ordinal = retry_receipts.len() as u8;
+        }
+        if let Some(commit) = &mut commit {
+            for receipt in &retry_receipts {
+                timing.receipt(receipt);
+                settle_failed_primary(&mut commit.candidate, &outbound, &endpoint, receipt);
+                settle_failed_primary(&mut commit.reviewed, &outbound, &endpoint, receipt);
+            }
+        }
         match response {
             Ok(upstream) => {
                 attempt.timing = phases.take();
@@ -2764,19 +2916,33 @@ async fn forward_timed(
                 }
                 Ok(response)
             }
-            Err(_) => {
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+                    phases.as_mut().unwrap().transport_error(error);
+                } else if phases.as_ref().unwrap().outcome == "dropped_before_terminal" {
+                    phases
+                        .as_mut()
+                        .unwrap()
+                        .failed("auth_or_request_preparation_error");
+                }
                 let started = Instant::now();
                 if let Some(mut commit) = commit {
                     commit.reviewed.last_failure = Some(json!({"at": now(),
                     "request_id": commit.request_id, "reason": "upstream transport or timeout"}));
                     commit.reviewed.primary_pending = false;
-                    commit.reviewed.failed_primaries += 1;
                     finish_measurement(&mut commit.reviewed.last_primary_dispatch, None, false);
-                    if let Some(trajectory) = &mut commit.reviewed.request_evidence {
-                        trajectory.failed_call();
+                    if dispatched
+                        && let Some(receipt) =
+                            attempt.receipt(None, phases.as_ref().unwrap().outcome, None, false)
+                    {
+                        phases.as_mut().unwrap().receipt(&receipt);
+                        settle_failed_primary(
+                            &mut commit.reviewed,
+                            &commit.outbound,
+                            &service.config.upstream_url,
+                            &receipt,
+                        );
                     }
-                    commit.reviewed.primary.calls += 1;
-                    commit.reviewed.primary.unavailable_cost_calls += 1;
                     if save(&service, &commit.id, &commit.reviewed).is_err() {
                         let _ = save_paid_accounting(
                             &service,
@@ -2810,7 +2976,9 @@ async fn forward_timed(
                 }
                 attempt.finish(None, "transport_or_timeout");
                 timing::Phases::add(&mut phases.as_mut().unwrap().settlement_us, started);
-                phases.as_mut().unwrap().outcome = "transport_error";
+                if phases.as_ref().unwrap().outcome == "dropped_before_terminal" {
+                    phases.as_mut().unwrap().outcome = "upstream_transport_error";
+                }
                 Err(failure(
                     StatusCode::BAD_GATEWAY,
                     "upstream transport failed",
@@ -3160,29 +3328,9 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
         current.reviewer_input = reviewed.reviewer_input.clone();
     }
     for receipt in &run.receipts {
-        let resolved = before.model_resolution.as_ref().map(|p| &p.reviewer);
-        let settled = if let Some(usage) = &receipt.usage {
-            current.shadow.settle_with_rates(
-                &receipt.model,
-                usage,
-                receipt.standard,
-                receipt_rates(&receipt.model, usage, resolved, receipt.write_tariff_known),
-            )
-        } else {
-            current.shadow.calls += 1;
-            current.shadow.unavailable_cost_calls += 1;
-            None
-        };
+        receipt.settle(&mut current.shadow);
         if let Some(t) = &mut current.request_evidence {
-            if receipt.completed {
-                t.reviewer_usage_settled(
-                    receipt.usage.as_ref().unwrap_or(&Value::Null),
-                    receipt.standard,
-                    settled,
-                );
-            } else {
-                t.failed_reviewer_call();
-            }
+            t.reviewer_receipt(receipt.clone());
         }
     }
     current.invalid_reviews += reviewed
@@ -3301,7 +3449,7 @@ async fn review_chunk(
         .model_resolution
         .as_ref()
         .map(|p| &p.reviewer);
-    let attempt = Attempt::start(
+    let mut attempt = Attempt::start(
         "shadow",
         &service.config.classifier_model,
         false,
@@ -3326,25 +3474,39 @@ async fn review_chunk(
         .take()
         .filter(|record| run.background && record.request_id == run.request_id)
         .unwrap_or_else(|| dispatch_measurement(&review_attempt_id, "reviewer", body));
-    measurement.outgoing_input_tokens = session
-        .reviewer_input
-        .estimate(
-            body,
-            service
-                .config
-                .classifier_url
-                .as_deref()
-                .unwrap_or(&service.config.upstream_url),
-            resolved,
-        )
-        .map(|input| input.tokens);
-    measurement.basis = "receipt_first_or_local_visible_text_not_encoded_native_payloads".into();
+    let forecast = session.reviewer_input.estimate(
+        body,
+        service
+            .config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&service.config.upstream_url),
+        resolved,
+    );
+    measurement.outgoing_input_tokens = forecast.map(|input| input.tokens);
+    measurement.basis = forecast.map_or("unavailable".into(), |input| {
+        serde_json::to_value(input.basis)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
     measurement.request_id = review_attempt_id.clone();
     measurement.parent_request_id = Some(run.request_id.clone());
     measurement.at = dispatched_at;
     session.last_reviewer_dispatch = Some(measurement);
+    attempt.freeze(
+        body,
+        service
+            .config
+            .classifier_url
+            .as_deref()
+            .unwrap_or(&service.config.upstream_url),
+        session.last_reviewer_dispatch.as_ref(),
+    );
     timing.preparation_done_us = Some(timing.elapsed_us());
     timing.native_attempt_id = Some(attempt.id.clone());
+    let mut retry_receipts = Vec::with_capacity(1);
     let observed = async {
         let response = if codex_reviewer {
             send_codex(
@@ -3354,6 +3516,8 @@ async fn review_chunk(
                 true,
                 Some(&wire_log),
                 Some(&mut timing),
+                &attempt,
+                &mut retry_receipts,
             )
             .await
         } else {
@@ -3374,58 +3538,109 @@ async fn review_chunk(
             Ok(response) => {
                 let status = response.status();
                 if !codex_reviewer {
-                    timing.headers(status);
+                    timing.response_headers(&response);
                 }
                 diagnostic["http_status"] = json!(status.as_u16());
-                if status.is_success() {
-                    if codex_reviewer {
-                        observed_sse(response, &mut timing).await.ok().flatten()
-                    } else {
-                        bounded_timed(response, 4 * 1024 * 1024, Some(&mut timing))
-                            .await
-                            .ok()
-                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    }
+                if !status.is_success() {
+                    timing.outcome = "upstream_http_error";
+                }
+                let result = if codex_reviewer {
+                    observed_sse(response, &mut timing).await
                 } else {
-                    // Private trace gets only bounded identifier tokens, never provider prose or raw bodies.
-                    if let Ok(bytes) = bounded_timed(response, 16 * 1024, Some(&mut timing)).await
-                        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-                    {
-                        for (field, token) in crate::proxy_sse::safe_error(&value["error"])
-                            .as_object()
-                            .unwrap()
-                        {
-                            diagnostic[format!("error_{field}")] = token.clone();
+                    bounded_timed(response, 4 * 1024 * 1024, Some(&mut timing))
+                        .await
+                        .map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                };
+                match result {
+                    Ok(value) => {
+                        if status.is_success() && value.is_none() {
+                            timing.outcome = "missing_terminal_or_invalid_json";
                         }
+                        value
                     }
-                    None
+                    Err(error) => {
+                        if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+                            timing.transport_error(error);
+                        } else {
+                            timing.outcome = "body_limit_or_protocol_error";
+                        }
+                        None
+                    }
                 }
             }
-            Err(_) => None,
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+                    timing.transport_error(error);
+                } else {
+                    timing.outcome = "auth_or_request_preparation_error";
+                }
+                None
+            }
         }
     };
     // A single budget includes auth-lock waits, refresh/retry and body reads.
     // Cancelling this future still reaches the censored receipt path below.
-    let value = tokio::time::timeout(
+    let value = match tokio::time::timeout(
         Duration::from_secs(service.config.classifier_timeout_secs),
         observed,
     )
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(value) => value,
+        Err(_) => {
+            timing.failed("review_deadline_expired");
+            None
+        }
+    };
+    let dispatched = timing.attempt_count() > retry_receipts.len();
+    if let Some(base) = &mut attempt.receipt {
+        base.transport_ordinal = retry_receipts.len() as u8;
+    }
+    for receipt in retry_receipts {
+        timing.receipt(&receipt);
+        receipt.settle(&mut session.shadow);
+        if let Some(evidence) = &mut session.request_evidence {
+            evidence.reviewer_receipt(receipt.clone());
+        }
+        if run.background {
+            run.receipts.push(receipt);
+        }
+    }
+    let provider_completed = value.as_ref().is_some_and(|v| v["status"] == "completed")
+        && diagnostic["http_status"]
+            .as_u64()
+            .is_some_and(|s| (200..300).contains(&s));
+    if timing.outcome == "dropped_before_terminal" && value.is_some() {
+        timing.outcome = "observed";
+    }
     let settlement_started = Instant::now();
     timing.active_phase = "settlement";
-    timing.outcome = if value.is_some() {
-        "observed"
-    } else {
-        "timeout_transport_or_http_error"
-    };
     let mut valid = false;
     finish_measurement(
         &mut session.last_reviewer_dispatch,
         value.as_ref(),
-        value.as_ref().is_some_and(|v| v["status"] == "completed"),
+        provider_completed,
     );
+    if dispatched {
+        let receipt = attempt
+            .receipt(
+                value.as_ref(),
+                timing.outcome,
+                diagnostic["http_status"].as_u64().map(|s| s as u16),
+                false,
+            )
+            .unwrap();
+        timing.receipt(&receipt);
+        receipt.settle(&mut session.shadow);
+        if let Some(t) = &mut session.request_evidence {
+            t.reviewer_receipt(receipt.clone());
+        }
+        if run.background {
+            run.receipts.push(receipt);
+        }
+    } else if let Some(measurement) = &mut session.last_reviewer_dispatch {
+        measurement.outcome = "not_dispatched".into();
+    }
     session.review_feedback_generation = session.review_epoch;
     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":"review did not complete with a valid JSON advice object; return the required schema"}]});
     if let Some(value) = value {
@@ -3436,27 +3651,8 @@ async fn review_chunk(
             diagnostic[format!("error_{field}")] = token.clone();
         }
         attempt.finish(Some(&value), "observed");
-        if run.background {
-            run.receipts.push(ReviewReceipt {
-                model: service.config.classifier_model.clone(),
-                usage: Some(numeric_review_usage(&value["usage"])),
-                write_tariff_known: carry::models::cache_write_tariff_known(body),
-                standard: value.get("service_tier").is_none_or(|v| v == "default"),
-                completed: value["status"] == "completed",
-            });
-        }
-        let settled = session.shadow.settle_with_rates(
-            &service.config.classifier_model,
-            &value["usage"],
-            value.get("service_tier").is_none_or(|v| v == "default"),
-            receipt_rates(
-                &service.config.classifier_model,
-                &value["usage"],
-                resolved,
-                carry::models::cache_write_tariff_known(body),
-            ),
-        );
-        if value["status"] == "completed" {
+
+        if provider_completed {
             session.reviewer_input.observe(
                 body,
                 &value["usage"],
@@ -3469,18 +3665,7 @@ async fn review_chunk(
                 dispatched_at,
             );
         }
-        if let Some(trajectory) = &mut session.request_evidence {
-            if value["status"] == "completed" {
-                trajectory.reviewer_usage_settled(
-                    &value["usage"],
-                    value.get("service_tier").is_none_or(|v| v == "default"),
-                    settled,
-                );
-            } else {
-                trajectory.failed_reviewer_call();
-            }
-        }
-        if value["status"] == "completed"
+        if provider_completed
             && let Ok(cache) = history::observe_cache(
                 service,
                 body,
@@ -3519,7 +3704,7 @@ async fn review_chunk(
                 &diagnostic,
             );
         }
-        if let Some(advice) = reviewer_advice(&value) {
+        if provider_completed && let Some(advice) = reviewer_advice(&value) {
             let reviewed = view
                 .groups()
                 .flat_map(|g| g.members.iter().copied())
@@ -3578,20 +3763,6 @@ async fn review_chunk(
                 carry::models::cache_write_tariff_known(body),
             ),
         );
-        if run.background {
-            run.receipts.push(ReviewReceipt {
-                model: String::new(),
-                usage: None,
-                write_tariff_known: false,
-                standard: false,
-                completed: false,
-            });
-        }
-        session.shadow.calls += 1;
-        session.shadow.unavailable_cost_calls += 1;
-        if let Some(trajectory) = &mut session.request_evidence {
-            trajectory.failed_reviewer_call();
-        }
     }
     if !valid {
         session.invalid_reviews += 1;
@@ -3707,6 +3878,8 @@ async fn send_codex(
     reviewer: bool,
     wire_log: Option<&logging::ReviewWire<'_>>,
     mut timing: Option<&mut timing::Phases>,
+    owner: &Attempt,
+    retry_receipts: &mut Vec<ClientReceipt>,
 ) -> Result<reqwest::Response> {
     let home = service
         .config
@@ -3717,12 +3890,18 @@ async fn send_codex(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("invalid Codex cache key"))?;
     let request_id = crate::openai::new_prompt_cache_key();
+    if let Some(timing) = &mut timing {
+        timing.auth_started();
+    }
     let mut credential = {
         let _guard = session_lock(service, "codex-auth").await;
         crate::auth::load_auth(home)
             .await?
             .ok_or_else(|| anyhow::anyhow!("run `carry login`"))?
     };
+    if let Some(timing) = &mut timing {
+        timing.auth_finished();
+    }
     for attempt in 0..2 {
         let request = service.client.post(endpoint).json(body);
         let request = if reviewer {
@@ -3741,15 +3920,48 @@ async fn send_codex(
         }
         let response = service.client.execute(request).await?;
         if let Some(timing) = &mut timing {
-            timing.headers(response.status());
+            timing.response_headers(&response);
         }
         if response.status() != StatusCode::UNAUTHORIZED || attempt == 1 {
             return Ok(response);
         }
+        // The 401 was a real provider attempt. Retain its unknown receipt
+        // before awaiting a body/auth refresh so a deadline cannot erase it.
+        let mut receipt = owner
+            .receipt(None, "http_unauthorized", Some(401), false)
+            .unwrap();
+        receipt.request_id = format!("{}-auth0", owner.id);
+        retry_receipts.push(receipt);
+        let value = bounded_timed(response, 4 * 1024 * 1024, timing.as_deref_mut())
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if let Some(receipt) = retry_receipts.last_mut() {
+            receipt.observe(
+                value.as_ref(),
+                "http_unauthorized",
+                Some(401),
+                false,
+                owner.started.elapsed().as_millis() as u64,
+                owner.write_tariff_known,
+            );
+        }
+        if let Some(timing) = &mut timing {
+            timing.auth_started();
+        }
         let _guard = session_lock(service, "codex-auth").await;
-        credential = crate::auth::refresh_auth(home)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("run `carry login`"))?;
+        #[cfg(not(test))]
+        let refreshed = crate::auth::refresh_auth(home).await;
+        #[cfg(test)]
+        let refreshed = if let Some(url) = &service.codex_token_url {
+            crate::auth::refresh_auth_at(home, url).await
+        } else {
+            crate::auth::refresh_auth(home).await
+        };
+        credential = refreshed?.ok_or_else(|| anyhow::anyhow!("run `carry login`"))?;
+        if let Some(timing) = &mut timing {
+            timing.auth_finished();
+        }
     }
     unreachable!()
 }
@@ -3764,6 +3976,10 @@ async fn observed_sse(
     while let Some(chunk) = response.chunk().await? {
         timing.first_body(&chunk);
         observer.feed(&chunk);
+        if observer.observed.is_some() {
+            timing.body_complete();
+            return Ok(observer.observed);
+        }
     }
     timing.body_complete();
     Ok(observer.observed)
@@ -4209,7 +4425,12 @@ fn receipt_rates(
     }
 }
 
+#[path = "proxy_client_receipt.rs"]
+pub(crate) mod client_receipt;
+use client_receipt::ClientReceipt;
+
 struct Attempt {
+    receipt: Option<ClientReceipt>,
     id: String,
     actor: &'static str,
     model: String,
@@ -4231,6 +4452,7 @@ impl Attempt {
         write_tariff_known: bool,
     ) -> Self {
         let attempt = Self {
+            receipt: None,
             id: format!(
                 "{}-{}-{}",
                 std::process::id(),
@@ -4248,6 +4470,34 @@ impl Attempt {
         };
         attempt.emit("started", json!({}));
         attempt
+    }
+
+    fn freeze(
+        &mut self,
+        body: &Value,
+        route: &str,
+        measurement: Option<&crate::proxy_state::DispatchMeasurement>,
+    ) {
+        self.receipt = Some(ClientReceipt::dispatch(self, body, route, measurement));
+    }
+
+    fn receipt(
+        &self,
+        response: Option<&Value>,
+        outcome: &str,
+        status: Option<u16>,
+        disconnected: bool,
+    ) -> Option<ClientReceipt> {
+        let mut receipt = self.receipt.clone()?;
+        receipt.observe(
+            response,
+            outcome,
+            status,
+            disconnected,
+            self.started.elapsed().as_millis() as u64,
+            self.write_tariff_known,
+        );
+        Some(receipt)
     }
 
     fn emit(&self, event: &str, details: Value) {
@@ -4306,18 +4556,8 @@ impl Attempt {
                 safe_usage[field] = Value::Object(details);
             }
         }
-        let mut priced = carry::core::UsageLedger::default();
-        priced.observe_with_rates(
-            &self.model,
-            usage,
-            self.standard && response.get("service_tier").is_none_or(|v| v == "default"),
-            receipt_rates(
-                &self.model,
-                usage,
-                self.resolved.as_ref(),
-                self.write_tariff_known,
-            ),
-        );
+        let received = self.receipt(Some(response), "receipt_observed", None, false);
+        let priced = received.as_ref().and_then(|receipt| receipt.cost);
         let tools = response["output"]
             .as_array()
             .into_iter()
@@ -4326,9 +4566,9 @@ impl Attempt {
             .count();
         self.emit("completed", json!({
             "usage": safe_usage, "latency_ms": self.started.elapsed().as_millis() as u64,
-            "tool_calls": tools, "service_tier": response.get("service_tier").cloned().unwrap_or(json!("default")),
-            "response_status": response.get("status").cloned().unwrap_or(Value::Null),
-            "cost_available": priced.unavailable_cost_calls == 0
+            "tool_calls": tools, "service_tier": received.as_ref().and_then(|r| r.service_tier.as_ref()),
+            "response_status": received.as_ref().and_then(|r| r.provider_status.as_ref()),
+            "cost_available": priced.is_some()
         }));
     }
 }
@@ -4353,16 +4593,40 @@ async fn relay(
         let mut observer = Observer::default();
         let mut json_observer = JsonObserver::default();
         let mut complete_transport = false;
+        let mut downstream_disconnected = false;
+        let relay_timeout = Duration::from_secs(
+            commit
+                .as_ref()
+                .map_or(120, |c| c.service.config.request_timeout_secs),
+        );
+        // The original operation deadline includes auth/retries. A caller close
+        // must not reset it or grant another full body/send timeout.
+        let relay_deadline = tokio::time::Instant::now()
+            + relay_timeout.saturating_sub(
+                attempt
+                    .as_ref()
+                    .map_or(Duration::ZERO, |a| a.started.elapsed()),
+            );
         let mut stream_end = "upstream stream ended before completion";
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(relay_deadline) => {
+                    stream_end = "upstream_timeout";
+                    if let Some(timing) = &mut timing { timing.failed("upstream_timeout"); }
+                    break;
+                },
                 _ = async {
                     if let Some(converted) = &mut converted {
                         converted.closed().await;
                     } else {
                         sender.closed().await;
                     }
-                } => { stream_end = "client disconnected before completion"; break; },
+                }, if !downstream_disconnected => {
+                    // Paid dispatch owns settlement; a caller close must not
+                    // cancel the bounded upstream receipt drain.
+                    downstream_disconnected = true;
+                    continue;
+                },
                 chunk = upstream.chunk() => match chunk {
                     Ok(Some(chunk)) => {
                         if let Some(timing) = &mut timing { timing.first_body(&chunk); }
@@ -4372,11 +4636,11 @@ async fn relay(
                             && commit.service.config.verbose {
                             logging::raw_chunk(&commit.service, &commit.id, chunk.as_ref());
                         }
-                        if converted.is_none() {
+                        if converted.is_none() && !downstream_disconnected {
                             let started = Instant::now();
-                            let disconnected = sender.send(Ok(chunk)).await.is_err();
+                            let disconnected = !matches!(tokio::time::timeout_at(relay_deadline, sender.send(Ok(chunk))).await, Ok(Ok(())));
                             if let Some(timing) = &mut timing { timing::Phases::add(&mut timing.relay_send_wait_us, started); }
-                            if disconnected { stream_end = "client disconnected before completion"; break; }
+                            if disconnected { downstream_disconnected = true; }
                         }
                     }
                     Ok(None) => {
@@ -4384,9 +4648,12 @@ async fn relay(
                         if let Some(timing) = &mut timing { timing.body_complete(); }
                         break;
                     }
-                    Err(_) => {
-                        stream_end = "upstream stream error or timeout";
-                        let _ = sender.send(Err(std::io::Error::other("upstream stream failed"))).await;
+                    Err(error) => {
+                        if let Some(timing) = &mut timing { timing.transport_error(&error); }
+                        stream_end = if error.is_timeout() { "upstream_timeout" } else { "upstream_stream_error" };
+                        if !downstream_disconnected {
+                            let _ = tokio::time::timeout_at(relay_deadline, sender.send(Err(std::io::Error::other("upstream stream failed")))).await;
+                        }
                         break;
                     }
                 }
@@ -4394,16 +4661,22 @@ async fn relay(
         }
         let settlement_started = Instant::now();
         if let Some(timing) = &mut timing {
-            timing.active_phase = "settlement";
             timing.outcome = if !status.is_success() {
                 "http_error"
             } else if complete_transport {
                 "complete"
             } else if stream_end == "client disconnected before completion" {
                 "client_disconnected"
+            } else if stream_end == "upstream_timeout" {
+                "upstream_timeout"
+            } else if stream_end == "upstream_stream_error" {
+                "upstream_stream_error"
             } else {
-                "stream_error"
+                "upstream_early_eof"
             };
+            if timing.outcome != "complete" {
+                timing.failure_phase_for_body();
+            }
         }
         let sse_completed = observer.completed();
         let mut conversion_allowed = sse_completed;
@@ -4412,13 +4685,37 @@ async fn relay(
         } else {
             json_observer.observed()
         };
+        if complete_transport && status.is_success() && observed.is_none() {
+            if let Some(timing) = &mut timing {
+                timing.failed("missing_provider_terminal");
+            }
+        }
+        let receipt = attempt.as_ref().and_then(|a| {
+            a.receipt(
+                observed.as_ref(),
+                if complete_transport && observed.is_none() {
+                    "eof_without_terminal"
+                } else if complete_transport {
+                    "eof"
+                } else if stream_end == "upstream_timeout" {
+                    "upstream_timeout"
+                } else {
+                    "early_eof_or_stream_error"
+                },
+                Some(status.as_u16()),
+                downstream_disconnected,
+            )
+        });
+        if let (Some(timing), Some(receipt)) = (&mut timing, &receipt) {
+            timing.receipt(receipt);
+        }
         if let Some(attempt) = attempt {
             attempt.finish(
                 observed.as_ref(),
                 if complete_transport {
                     "observed"
                 } else {
-                    "cancelled_or_stream_failure"
+                    stream_end
                 },
             );
         }
@@ -4437,7 +4734,7 @@ async fn relay(
                 "primary",
                 observed.as_ref(),
                 &commit.outbound,
-                status.is_success() && complete_transport && standard(&commit.outbound),
+                standard(&commit.outbound),
             );
             let completed = observed.as_ref().is_some_and(|v| {
                 if commit.native {
@@ -4464,25 +4761,15 @@ async fn relay(
                     true,
                 );
                 let value = observed.as_ref().unwrap();
-                let model = commit.outbound["model"].as_str().unwrap_or("");
                 let resolved = commit
                     .service
                     .config
                     .model_resolution
                     .as_ref()
                     .map(|p| &p.primary);
-                let settled = commit.candidate.primary.settle_with_rates(
-                    model,
-                    &value["usage"],
-                    standard(&commit.outbound)
-                        && value.get("service_tier").is_none_or(|v| v == "default"),
-                    receipt_rates(
-                        model,
-                        &value["usage"],
-                        resolved,
-                        carry::models::cache_write_tariff_known(&commit.outbound),
-                    ),
-                );
+                let settled = receipt
+                    .as_ref()
+                    .and_then(|r| r.settle(&mut commit.candidate.primary));
                 if !commit.native {
                     commit.candidate.primary_input.observe(
                         &commit.outbound,
@@ -4503,17 +4790,21 @@ async fn relay(
                     } else {
                         value
                     };
-                    trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
-                        body: &commit.outbound,
-                        response,
-                        measurements: Some(&commit.candidate.primary_input),
-                        route: &commit.service.config.upstream_url,
-                        at: commit.dispatched_at,
-                        standard: standard(&commit.outbound)
-                            && value.get("service_tier").is_none_or(|v| v == "default"),
-                        resolved,
-                        cost: settled,
-                    });
+                    trajectory.primary_receipt(
+                        crate::proxy_savings::PrimaryObservation {
+                            body: &commit.outbound,
+                            response,
+                            measurements: Some(&commit.candidate.primary_input),
+                            route: &commit.service.config.upstream_url,
+                            at: commit.dispatched_at,
+                            standard: standard(&commit.outbound)
+                                && value.get("service_tier").is_none_or(|v| v == "default"),
+                            resolved,
+                            cost: settled,
+                        },
+                        receipt.clone(),
+                        true,
+                    );
                 }
                 if commit.native {
                     commit.candidate.reset_active();
@@ -4610,31 +4901,24 @@ async fn relay(
                 );
                 commit.reviewed.primary_pending = false;
                 commit.reviewed.failed_primaries += 1;
+                let settled = receipt
+                    .as_ref()
+                    .and_then(|r| r.settle(&mut commit.reviewed.primary));
                 if let Some(trajectory) = &mut commit.reviewed.request_evidence {
-                    trajectory.failed_call();
-                }
-                if let Some(value) = &observed {
-                    let model = commit.outbound["model"].as_str().unwrap_or("");
-                    commit.reviewed.primary.observe_with_rates(
-                        model,
-                        &value["usage"],
-                        standard(&commit.outbound)
-                            && value.get("service_tier").is_none_or(|v| v == "default"),
-                        receipt_rates(
-                            model,
-                            &value["usage"],
-                            commit
-                                .service
-                                .config
-                                .model_resolution
-                                .as_ref()
-                                .map(|p| &p.primary),
-                            carry::models::cache_write_tariff_known(&commit.outbound),
-                        ),
+                    trajectory.primary_receipt(
+                        crate::proxy_savings::PrimaryObservation {
+                            body: &commit.outbound,
+                            response: observed.as_ref().unwrap_or(&Value::Null),
+                            measurements: Some(&commit.reviewed.primary_input),
+                            route: &commit.service.config.upstream_url,
+                            at: commit.dispatched_at,
+                            standard: receipt.as_ref().is_some_and(|r| r.standard),
+                            resolved: receipt.as_ref().and_then(|r| r.resolved.as_ref()),
+                            cost: settled,
+                        },
+                        receipt.clone(),
+                        false,
                     );
-                } else {
-                    commit.reviewed.primary.calls += 1;
-                    commit.reviewed.primary.unavailable_cost_calls += 1;
                 }
                 if save(&commit.service, &commit.id, &commit.reviewed).is_err() {
                     let _ = save_paid_accounting(
@@ -4744,6 +5028,7 @@ mod tests {
             text_quantities: Default::default(),
             #[cfg(test)]
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
+            codex_token_url: None,
         }
     }
 
@@ -5478,6 +5763,7 @@ mod tests {
     include!("proxy_qualified_producer_tests.rs");
     include!("proxy_settlement_tests.rs");
     include!("proxy_cancellation_tests.rs");
+    include!("proxy_client_receipt_tests.rs");
     mod namespace_controls {
         include!("proxy_namespace_tests.rs");
     }

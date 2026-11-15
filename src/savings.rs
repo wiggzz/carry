@@ -34,6 +34,49 @@ impl PrimaryHistory {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryStrategy {
+    ReplacementCold,
+    AppendedHistory,
+    #[default]
+    ConservativeLower,
+}
+impl SummaryStrategy {
+    /// Conditional API-equivalent requests, not native compact endpoint billing.
+    /// Both include a declared uncached instruction allowance, and generated
+    /// summary output never receives input cache credit. Return unknown when a
+    /// requested strategy cannot be priced rather than substituting its peer.
+    pub fn price(
+        self,
+        retired: u64,
+        full: u64,
+        warm_prefix: Option<u64>,
+        mut price: impl FnMut(u64, u64) -> Option<f64>,
+    ) -> Option<f64> {
+        const INSTRUCTION_TOKENS: u64 = 64;
+        let cold = || retired.checked_add(INSTRUCTION_TOKENS);
+        match self {
+            Self::ReplacementCold => price(cold()?, 0),
+            Self::AppendedHistory => price(
+                full.checked_add(INSTRUCTION_TOKENS)?,
+                warm_prefix?.min(full),
+            ),
+            Self::ConservativeLower => {
+                let cold = price(cold()?, 0);
+                let warm = warm_prefix.and_then(|cached| {
+                    price(full.checked_add(INSTRUCTION_TOKENS)?, cached.min(full))
+                });
+                match (cold, warm) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Scenario {
     pub context_window: u64,

@@ -1034,12 +1034,12 @@ class StateRegressions(FixtureCase):
         self.evidence.update(stats=stats, checkpoint=proxy.saved())
         estimate = session["cost_estimate"]
         self.assertEqual(session["completed_requests"], 3)
-        self.assertEqual(estimate["coverage"]["primary_responses"], 3)
+        self.assertEqual(estimate["coverage"]["primary_responses"], 4)
         self.assertEqual(estimate["coverage"]["failed_calls"], 1)
-        self.assert_estimate_available(estimate, True, "one failure must not hide later successful-request savings")
-        self.assertEqual(estimate["traditional_compactions"], 1,
-                         "the successful-only conventional scenario must keep advancing after a failure")
-        self.assertGreater(estimate["summary_cost"], 0)
+        self.assert_estimate_available(estimate, False, "unknown failed money cannot be silently excluded")
+        self.assertEqual(estimate['traditional_compactions'], 1, 'successful continuation still advances the hypothetical summary cursor')
+        self.assertEqual(estimate["observed_primary_cost"], session["primary"]["cost_usd"])
+        self.assertIsNone(estimate["whole_window"])
         self.assertEqual(len(fixture.primaries), 4)
         self.assertEqual(fixture.reviews, [])
         self.assertEqual(session["primary"]["unavailable_cost_calls"], 1,
@@ -1132,16 +1132,16 @@ class StateRegressions(FixtureCase):
                 self.assertEqual(fixture.primaries, [fixture.primaries[0]] * 3)
                 self.assertEqual(fixture.reviews, [])
                 for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost"):
-                    self.assertEqual(failed[field], before[field], field)
+                    self.assertIsNone(failed[field], field)
+                self.assertEqual(failed['observed_primary_cost'], before['observed_primary_cost'])
                 self.assertEqual(session["primary"]["calls"], 3)
                 self.assertEqual(session["primary"]["unavailable_cost_calls"], 1)
                 estimate = session["cost_estimate"]
-                self.assertEqual(estimate["coverage"]["primary_responses"], 2)
+                self.assertEqual(estimate["coverage"]["primary_responses"], 3)
                 self.assertEqual(estimate["coverage"]["failed_calls"], 1)
                 result = estimate
-                self.assertAlmostEqual(result["carry_cost"], 2 * before["carry_cost"], delta=1e-12)
-                self.assertAlmostEqual(result["traditional_cost"], result["carry_cost"], delta=1e-12)
-                self.assert_estimate_available(estimate, True, "current failed-attempt policy has one owner")
+                self.assertAlmostEqual(result["observed_primary_cost"], 2 * before["carry_cost"], delta=1e-12)
+                self.assert_estimate_available(estimate, False, "legacy selector cannot make unknown money free")
                 self.assertEqual(estimate.get("excluded_failed_calls", 0), 1)
 
     def test_failed_primary_terminals_do_not_mutate_successful_scenario(self):
@@ -1199,14 +1199,23 @@ class StateRegressions(FixtureCase):
                 self.assertIs(dispatch['forced'], False)
                 self.assertEqual(dispatch['input_reduction_estimate'], 0)
                 # A dispatched attempt is not a successful fact or cursor advance.
-                self.assertEqual(appended[1], 'FailedPrimary')
-                for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost"):
-                    self.assertEqual(before[field], after[field], field)
+                facts = appended[1]['Primary']['facts']
+                self.assertFalse(facts['completed'])
+                self.assertEqual(facts['receipt']['role'], 'primary')
+                self.assertEqual(facts['retained'], 0)
+                known = terminal in ('failed', 'incomplete')
+                if known:
+                    self.assertGreater(after['observed_primary_cost'], before['observed_primary_cost'])
+                    self.assertEqual(after['traditional_compactions'], before['traditional_compactions'])
+                else:
+                    self.assertEqual(after['observed_primary_cost'], before['observed_primary_cost'])
+                    self.assertIsNone(after['whole_window'])
                 estimate = session["cost_estimate"]
-                self.assertEqual(estimate["coverage"]["primary_responses"], 2)
+                self.assertEqual(estimate["coverage"]["primary_responses"], 3)
                 self.assertEqual(estimate["coverage"]["failed_calls"], 1)
-                self.assert_estimate_available(estimate, True, "failed primary terminal must not poison successful scenario")
-                self.assertEqual(estimate["excluded_failed_calls"], 1)
+                self.assert_estimate_available(estimate, known, "known receipts compare; unknown money stays unavailable")
+                self.assertEqual(estimate["excluded_failed_calls"], int(not known))
+                self.assertEqual(estimate['observed_primary_cost'], session['primary']['cost_usd'])
                 self.assertEqual(session["primary"]["calls"], 3)
                 self.assertEqual(session["primary"]["unavailable_cost_calls"],
                                  1 if terminal in ("transport", "http_error") else 0)
@@ -1258,29 +1267,31 @@ class StateRegressions(FixtureCase):
                     self.assertEqual(session["shadow"]["calls"], 1, "review spend merges exactly once")
                     estimate = session["cost_estimate"]
                     excluded = terminal in ("failed", "incomplete", "transport", "http_error")
-                    self.assertEqual(estimate["coverage"]["reviewer_responses"], 0 if excluded else 1,
-                                     "failed reviewer terminal with usage is not a successful response")
+                    self.assertEqual(estimate["coverage"]["reviewer_responses"], 1,
+                                     "every dispatched reviewer attempt is counted regardless of terminal success")
                     self.assertEqual(estimate["coverage"]["failed_calls"], 1 if excluded else 0)
-                    self.assertEqual(estimate["coverage"]["missing_usage"], 1 if terminal == "missing_usage" else 0)
-                    self.assert_estimate_available(estimate, True,
-                                     "omit failed or unpriced reviewer calls without hiding priced primary pairs")
+                    missing = terminal in ('transport', 'http_error', 'missing_usage')
+                    self.assertEqual(estimate["coverage"]["missing_usage"], int(missing))
+                    self.assert_estimate_available(estimate, not missing,
+                                     "known failed reviewer money belongs in actual; missing usage is not free")
                     aggregate = stats["cost_estimate"]
-                    self.assertEqual(aggregate["included_sessions"], 1)
-                    self.assertEqual(aggregate["excluded_sessions"], 0)
-                    self.assertEqual(estimate.get("excluded_unpriced_calls"), int(terminal == "missing_usage"))
-                    self.assertEqual(estimate.get("excluded_unpriced_reviewer_calls"), int(terminal == "missing_usage"))
-                    self.assertEqual(aggregate["excluded_unpriced_calls"], int(terminal == "missing_usage"))
+                    self.assertEqual(aggregate["included_sessions"], int(not missing))
+                    self.assertEqual(aggregate["excluded_sessions"], int(missing))
+                    self.assertEqual(estimate.get("excluded_unpriced_calls"), int(missing))
+                    self.assertEqual(estimate.get("excluded_unpriced_reviewer_calls"), int(missing))
+                    self.assertEqual(aggregate["excluded_unpriced_calls"], int(missing))
                     for field in ("carry_cost", "traditional_cost", "savings", "savings_percent"):
                         if estimate[field] is None:
                             self.assertIsNone(aggregate[field])
                         else:
                             self.assertAlmostEqual(aggregate[field], estimate[field], delta=1e-12,
                                                    msg="real completed background reviewer spend belongs in backend totals")
-                    if terminal == "missing_usage":
-                        self.assertEqual(estimate["reviewer_cost"], 0, "known reviewer expense only; missing expense is separately counted")
+                    if missing:
+                        self.assertIsNone(estimate["reviewer_cost"])
+                        self.assertIsNone(estimate['observed_reviewer_cost'])
                     else:
-                        self.assertEqual(estimate["reviewer_cost"] > 0,
-                                         terminal in ("invalid_advice", "refusal"))
+                        self.assertEqual(estimate['observed_reviewer_cost'], session['shadow']['cost_usd'])
+                        self.assertGreater(estimate["reviewer_cost"], 0)
                     # Observed metering remains independent, including metered failures.
                     self.assertEqual(session["shadow"]["unavailable_cost_calls"],
                                      1 if terminal in ("transport", "http_error", "missing_usage") else 0)

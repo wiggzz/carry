@@ -407,7 +407,11 @@ fn retention_invalid_predecessor_record_types_preserve_original_authority() {
 
 #[test]
 fn retention_json_history_with_omitted_maps_preserves_original_authority() {
-    for maps in [vec!["transcripts"], vec!["snapshots"], vec!["transcripts", "snapshots"]] {
+    for maps in [
+        vec!["transcripts"],
+        vec!["snapshots"],
+        vec!["transcripts", "snapshots"],
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("history.index");
         let mut index = json!({"format":"carry-prefix-history-v4", "nodes":{}, "tips":{}, "reviews":{}, "transcripts":{}, "snapshots":{}, "upstream_cache":[]});
@@ -638,7 +642,8 @@ fn retention_current_store_preserves_money_bindings_and_rejects_capacity_atomica
         let path = directory.path().join("history.index");
         let original = history::fixture::read_index(&path);
         service.config.history_disk_bytes = 65536;
-        let rejected = history::committed(&service, "predecessor-owner", &loaded, None).unwrap_err();
+        let rejected =
+            history::committed(&service, "predecessor-owner", &loaded, None).unwrap_err();
         assert_eq!(rejected.kind(), std::io::ErrorKind::StorageFull);
         assert_eq!(history::fixture::read_index(&path), original);
         service.config.history_disk_bytes = 8 * 1024 * 1024;
@@ -663,6 +668,15 @@ fn retention_current_store_preserves_money_bindings_and_rejects_capacity_atomica
 
 #[tokio::test]
 async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store_pressure() {
+    real_primary_receipt_under_pressure("completed").await;
+}
+
+#[tokio::test]
+async fn retention_failed_provider_receipts_keep_known_money_under_full_store_pressure() {
+    real_primary_receipt_under_pressure("failed").await;
+}
+
+async fn real_primary_receipt_under_pressure(provider_status: &'static str) {
     let (sent, mut captures) = mpsc::unbounded_channel();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let provider_calls = calls.clone();
@@ -674,7 +688,7 @@ async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store
             // A genuine complete receipt, but an output node above the unchanged
             // per-record bound. Normal semantic publication must fail; only the
             // bounded numeric settlement may use the admitted owner's promise.
-            let response = json!({"id":format!("paid-fallback-{n}"),"status":"completed",
+            let response = json!({"id":format!("paid-fallback-{n}"),"status":provider_status,
                 "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"o".repeat(70000)}]}],
                 "usage":{"input_tokens":10000,"output_tokens":7,"input_tokens_details":{"cached_tokens":9000}}});
             let (release, wait) = tokio::sync::oneshot::channel();
@@ -838,18 +852,30 @@ async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store
         let events = timing_journal(directory.path(), id, label);
         let failures = events
             .iter()
-            .filter(|event| event["event"] == "primary_checkpoint_failed")
+            .filter(|event| {
+                event["event"]
+                    == if provider_status == "completed" {
+                        "primary_checkpoint_failed"
+                    } else {
+                        "primary_failed"
+                    }
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             failures.len(),
             1,
             "qualify actual production fallback, not only direct settlement"
         );
-        assert_eq!(failures[0]["data"]["candidate_committed"], false);
+        if provider_status == "completed" {
+            assert_eq!(failures[0]["data"]["candidate_committed"], false);
+        } else {
+            assert_eq!(failures[0]["data"]["candidate_discarded"], true);
+            assert_eq!(durable.primary.calls, 1);
+        }
         outcomes.push(
             json!({"id":id,"primary":durable.primary,"pending":durable.primary_pending,
             "completed":durable.completed_requests,"failed":durable.failed_primaries,
-            "fallback":failures[0]["data"]["accounting_committed"]}),
+            "fallback":if provider_status == "completed" {failures[0]["data"]["accounting_committed"].clone()} else {json!(durable.primary.calls == 1)}}),
         );
     }
     let accounting = history::accounting(&restarted, 0, "", 100).unwrap();
@@ -874,8 +900,11 @@ async fn retention_concurrent_real_primaries_keep_paid_fallback_under_full_store
         assert_eq!(outcome["primary"]["cached_tokens"], 9000);
         assert_eq!(outcome["primary"]["unavailable_cost_calls"], 0);
         assert!((outcome["primary"]["cost_usd"].as_f64().unwrap() - 0.0001935).abs() < 1e-12);
-        assert_eq!(outcome["completed"], 1);
-        assert_eq!(outcome["failed"], 0);
+        assert_eq!(
+            outcome["completed"],
+            u64::from(provider_status == "completed")
+        );
+        assert_eq!(outcome["failed"], u64::from(provider_status != "completed"));
         let records = accounting["records"]
             .as_array()
             .unwrap()

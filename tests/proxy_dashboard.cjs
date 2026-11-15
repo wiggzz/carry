@@ -383,6 +383,13 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.ok(!visibleText(root).includes('Matched subtotal'));
   }
   // Whole-window producer facts deliberately disagree with strict diagnostics.
+  recent.cost_estimate.quantity_evidence.comparison_scope='matched_all_outcome_attempt_window';
+  data.cost_estimate.quantity_evidence.comparison_scope='matched_all_outcome_attempt_window';
+  await refresh();
+  for(const root of [byClass(recentRow,'session-savings'),elements.get('cards').children[1]]) {
+    assert.match(visibleText(root),/Matched all-outcome attempt window/);
+    assert.ok(!visibleText(root).includes('completed primary window'));
+  }
   // The renderer must never derive a total from matched rows or local ratios.
   recent.cost_estimate.whole_window={carry_cost:15,traditional_cost:24,savings:9,savings_percent:37.5,
     primary_responses:6,inferred_primary_responses:5,assumption:'matched_cost_ratio'};
@@ -392,7 +399,8 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.equal(cards().get('Estimated savings'),'$90.000000 (37.5%)');
   assert.match(visibleText(byClass(recentRow,'session-savings')),/\$9\.000000 \(37\.5%\)/);
   assert.match(visibleText(elements.get('cards').children[1]),/Whole accounting window/);
-  assert.match(visibleText(elements.get('cards').children[1]),/successful completions only/);
+  assert.match(visibleText(elements.get('cards').children[1]),/all provider attempts/);
+  assert.ok(!visibleText(elements.get('cards').children[1]).includes('successful completions only'));
   assert.match(visibleText(elements.get('cards').children[0]),/all paid attempts/);
   assert.match(visibleText(byClass(recentRow,'session-savings')),/5 inferred/);
   // An explicitly scoped complete-window subtotal is not an all-history total.

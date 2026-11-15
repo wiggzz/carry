@@ -1143,7 +1143,8 @@ mod tests {
             .unwrap();
         assert_eq!(versions.len(), 128);
         assert!(versions.windows(2).all(|p| p[0] != p[1]));
-        let chronological = evidence.replay_snapshot(true);
+        let chronological =
+            evidence.replay_snapshot(true, crate::savings::SummaryStrategy::default());
         assert_eq!(chronological.coverage.primary_responses, 128);
         assert!(
             chronological.cache_policy_boundaries.is_empty(),
@@ -1152,7 +1153,7 @@ mod tests {
         // Bounded strict suffix diagnostics still disclose their version changes.
         assert_eq!(
             evidence
-                .replay_snapshot(false)
+                .replay_snapshot(false, crate::savings::SummaryStrategy::default())
                 .cache_policy_boundaries
                 .len(),
             127

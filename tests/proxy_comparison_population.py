@@ -1,4 +1,4 @@
-"""Success-scoped comparisons over real loopback dispatch/settlement/restart.
+"""All-outcome comparisons over real loopback dispatch/settlement/restart.
 
 CARRY_TEST_BINARY=/absolute/carry python3 -B tests/proxy_comparison_population.py -v
 Paid ledgers remain all-attempt; no providers, production state or credentials.
@@ -11,7 +11,7 @@ import proxy_state_regressions as support
 
 class ComparisonPopulation(support.FixtureCase):
 
-    def test_failed_attempts_do_not_censor_or_price_successful_comparisons(self):
+    def test_all_outcome_money_requires_same_attempt_comparator_and_unknown_is_not_free(self):
         for failure in ('transport', 'unpriced_terminal', 'priced_terminal'):
             with self.subTest(failure=failure):
                 state = self.state / failure
@@ -70,20 +70,28 @@ class ComparisonPopulation(support.FixtureCase):
                 self.assertEqual(restarted['cost_estimate'], stats['cost_estimate'])
                 for snapshot in (stats, restarted):
                     row = snapshot['sessions'][0]['cost_estimate']
-                    self.assertEqual(row['coverage']['primary_responses'], 2)
+                    self.assertEqual(row['coverage']['primary_responses'], 3)
                     self.assertEqual(row['coverage']['failed_calls'], 1)
-                    self.assertEqual(row['matched_primary_responses'], 2)
-                    self.assertAlmostEqual(row['carry_cost'], successful_cost, places=12)
+                    self.assertEqual(row['matched_primary_responses'], 3 if failure == 'priced_terminal' else 2)
+                    self.assertAlmostEqual(row['observed_primary_cost'], saved['primary']['cost_usd'], places=12)
+                    if failure != 'priced_terminal':
+                        self.assertIsNone(row['carry_cost'])
+                        self.assertIsNone(row['traditional_cost'])
+                        self.assertIsNone(row['whole_window'])
+                        self.assertIsNone(snapshot['cost_estimate']['whole_window'])
+                        self.assertEqual(row['unavailable_primary_cost_calls'], 1)
+                        continue
+                    self.assertAlmostEqual(row['carry_cost'], saved['primary']['cost_usd'], places=12)
                     for estimate in (row, snapshot['cost_estimate']):
                         whole = estimate['whole_window']
                         self.assertIsInstance(whole, dict,
-                                              'a failed attempt must not censor successful money')
-                        self.assertEqual(whole['primary_responses'], 2)
-                        self.assertAlmostEqual(whole['carry_cost'], successful_cost, places=12)
-                        self.assertAlmostEqual(whole['traditional_cost'], successful_cost, places=12)
+                                              'a priced failed attempt belongs to both unchanged-input branches')
+                        self.assertEqual(whole['primary_responses'], 3)
+                        self.assertAlmostEqual(whole['carry_cost'], saved['primary']['cost_usd'], places=12)
+                        self.assertAlmostEqual(whole['traditional_cost'], saved['primary']['cost_usd'], places=12)
                         self.assertAlmostEqual(whole['savings'], 0, places=12)
                     self.assertEqual(row['quantity_evidence']['comparison_scope'],
-                                     'matched_completed_primary_window')
+                                     'matched_all_outcome_attempt_window')
     def test_reviewer_failures_are_symmetric_but_invalid_completed_advice_is_paid(self):
         for terminal in ('priced_failed', 'unknown_failed', 'invalid_completed'):
             with self.subTest(terminal=terminal):
@@ -112,11 +120,17 @@ class ComparisonPopulation(support.FixtureCase):
                 self.assertEqual(saved['shadow']['unavailable_cost_calls'], int(terminal == 'unknown_failed'))
                 self.assertEqual(saved['shadow']['cost_usd'] > 0, terminal != 'unknown_failed')
                 estimate = before['sessions'][0]['cost_estimate']
-                self.assertEqual(estimate['coverage']['reviewer_responses'], int(terminal == 'invalid_completed'))
+                self.assertEqual(estimate['coverage']['reviewer_responses'], 1)
                 self.assertEqual(estimate['coverage']['failed_calls'], int(terminal != 'invalid_completed'))
-                expected = saved['primary']['cost_usd'] + (saved['shadow']['cost_usd'] if terminal == 'invalid_completed' else 0)
-                self.assertAlmostEqual(estimate['whole_window']['carry_cost'], expected, places=12)
-                self.assertAlmostEqual(estimate['whole_window']['traditional_cost'], saved['primary']['cost_usd'], places=12)
+                expected = saved['primary']['cost_usd'] + saved['shadow']['cost_usd']
+                if terminal == 'unknown_failed':
+                    self.assertIsNone(estimate['observed_reviewer_cost'])
+                    self.assertIsNone(estimate['whole_window'])
+                    self.assertEqual(estimate['unavailable_reviewer_cost_calls'], 1)
+                else:
+                    self.assertEqual(estimate['observed_reviewer_cost'], saved['shadow']['cost_usd'])
+                    self.assertAlmostEqual(estimate['whole_window']['carry_cost'], expected, places=12)
+                    self.assertAlmostEqual(estimate['whole_window']['traditional_cost'], saved['primary']['cost_usd'], places=12)
                 proxy.close()
                 proxy = support.Proxy(state, fixture, options)
                 self.stack.callback(proxy.close)

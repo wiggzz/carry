@@ -36,6 +36,20 @@ fn python_fixture(script: &str) -> Command {
     command
 }
 
+#[test]
+fn all_outcome_client_receipts_and_failure_telemetry_http() {
+    let output = python_fixture("proxy_receipt_accounting.py")
+        .arg("-v")
+        .output()
+        .expect("Python must run the credential-free client receipt loopback fixture");
+    assert!(
+        output.status.success(),
+        "receipt loopback failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn state_regression(selector: &str) {
     let evidence = tempfile::tempdir().unwrap();
     let output = python_fixture("proxy_state_regressions.py")

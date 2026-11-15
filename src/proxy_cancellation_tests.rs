@@ -45,7 +45,9 @@ async fn cancelled_queued_caller_never_dispatches_after_owner_unlock() {
     assert_eq!(session.shadow.calls, 0);
     assert!(!session.primary_pending);
     let record = timing_record(directory.path(), &id, "queued-cancel");
-    assert_eq!(record["data"]["outcome"], "cancelled");
+    assert_eq!(record["data"]["outcome"], "dropped_before_terminal");
+    assert_eq!(record["data"]["actual_dispatch"], false);
+    assert_eq!(record["data"]["explicit_local_cancellation"], Value::Null);
     assert_eq!(record["data"]["attempts"], json!([]));
     provider.abort();
 }
@@ -175,7 +177,8 @@ async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
             .dashboard(false),
     )
     .unwrap();
-    assert_eq!(dashboard["whole_window"]["primary_responses"], 1);
+    assert_eq!(dashboard["whole_window"], Value::Null);
+    assert_eq!(dashboard["observed_primary_cost"], seed.primary.cost_usd);
     assert_eq!(dashboard["excluded_failed_calls"], 1);
     let mut restarted = checkpoint_service(directory.path());
     restarted.config = service.config.clone();
@@ -209,6 +212,10 @@ async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
     )
     .unwrap();
     assert_eq!(dashboard["coverage"]["prior_untracked_calls"], 0);
-    assert_eq!(dashboard["whole_window"]["primary_responses"], 2);
+    assert_eq!(dashboard["whole_window"], Value::Null);
+    assert_eq!(
+        dashboard["observed_primary_cost"],
+        2.0 * seed.primary.cost_usd
+    );
     provider.abort();
 }

@@ -26,6 +26,10 @@ struct PromptWitness {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct PrimaryFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<crate::proxy::client_receipt::ClientReceipt>,
+    #[serde(default = "completed_default")]
+    pub completed: bool,
     pub configuration: String,
     pub contract: HistoryContract,
     pub model: String,
@@ -57,6 +61,10 @@ pub(super) struct PrimaryFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prompt: Option<PromptWitness>,
 }
+fn completed_default() -> bool {
+    true
+}
+
 impl PrimaryFacts {
     pub(super) fn input_len(&self) -> Option<usize> {
         self.input
@@ -178,6 +186,8 @@ impl PrimaryFacts {
         // Count only the protected/fixed semantic floor, never the full native
         // input. These quantities are shared prompt evidence, not forecasts.
         Self {
+            receipt: None,
+            completed: response["status"] == "completed",
             prompt: None,
             configuration: receipts::configuration(body, route, resolved),
             contract: HistoryContract::extract(body, route, resolved, Scenario::default()),
@@ -249,6 +259,8 @@ enum Observation {
         edited: bool,
     },
     Reviewer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<crate::proxy::client_receipt::ClientReceipt>,
         usage: Value,
         standard: bool,
         cost: Option<f64>,
@@ -416,7 +428,11 @@ impl RequestEvidence {
         let (mut primary, mut reviewer, mut successes) = (0u64, 0u64, 0u64);
         for observation in &self.observations {
             match observation {
-                Observation::Primary { .. } | Observation::Unmodeled { .. } => {
+                Observation::Primary { facts, .. } => {
+                    primary += 1;
+                    successes += u64::from(facts.completed);
+                }
+                Observation::Unmodeled { .. } => {
                     primary += 1;
                     successes += 1;
                 }
@@ -529,6 +545,9 @@ impl RequestEvidence {
                 semantic: "0".repeat(64),
                 prior_prefix: Some((0, "0".repeat(64), "0".repeat(64))),
             });
+            facts.receipt = Some(crate::proxy::client_receipt::ClientReceipt::shape(
+                body, resolved,
+            ));
             facts.native = Some(Usage::default());
             facts.retained = Some(0);
             facts.retained_visible = Some(0);
@@ -551,6 +570,9 @@ impl RequestEvidence {
             }
         } else {
             Observation::Reviewer {
+                receipt: Some(crate::proxy::client_receipt::ClientReceipt::shape(
+                    body, resolved,
+                )),
                 usage: receipts::review_usage_shape(),
                 standard: true,
                 cost: Some(0.0),
@@ -701,12 +723,45 @@ impl RequestEvidence {
         }
         self.observations.push(observation);
     }
+    pub(crate) fn visit_latest_receipts(
+        &self,
+        mut visit: impl FnMut(&crate::proxy::client_receipt::ClientReceipt),
+    ) {
+        let (mut primary, mut reviewer) = (false, false);
+        for event in self.observations.iter().rev() {
+            match event {
+                Observation::Primary { facts, .. } if !primary => {
+                    primary = true;
+                    if let Some(receipt) = &facts.receipt {
+                        visit(receipt);
+                    }
+                }
+                Observation::Reviewer { receipt, .. } if !reviewer => {
+                    reviewer = true;
+                    if let Some(receipt) = receipt {
+                        visit(receipt);
+                    }
+                }
+                _ => {}
+            }
+            if primary && reviewer {
+                break;
+            }
+        }
+    }
     pub fn snapshot(&self) -> Estimate {
-        let mut strict = self.replay_snapshot(false);
-        let numeric = self.replay_snapshot(true);
+        self.snapshot_with_summary(crate::savings::SummaryStrategy::default())
+    }
+    pub(crate) fn snapshot_with_summary(
+        &self,
+        strategy: crate::savings::SummaryStrategy,
+    ) -> Estimate {
+        let mut strict = self.replay_snapshot(false, strategy);
+        let numeric = self.replay_snapshot(true, strategy);
         if self.archive.is_some() && !numeric.archive_unavailable {
             // Actual successful-money population survives semantic retention.
             // Strict matched quantities remain suffix diagnostics, never scaled.
+            strict.carry_cost = numeric.carry_cost;
             strict.observed_primary_cost = numeric.observed_primary_cost;
             strict.observed_reviewer_cost = numeric.observed_reviewer_cost;
             strict.unavailable_primary_cost_calls = numeric.unavailable_primary_cost_calls;
@@ -717,6 +772,7 @@ impl RequestEvidence {
             strict.coverage.prior_untracked_calls = numeric.coverage.prior_untracked_calls;
             strict.excluded_failed_calls = numeric.excluded_failed_calls;
         }
+        strict.calibration = numeric.calibration.clone();
         strict.chronological = numeric.chronological;
         strict.rewrites = numeric.rewrites;
         if numeric.archive_unavailable || self.numeric_lost {
@@ -726,7 +782,7 @@ impl RequestEvidence {
         strict
     }
 
-    fn replay_snapshot(&self, infer: bool) -> Estimate {
+    fn replay_snapshot(&self, infer: bool, strategy: crate::savings::SummaryStrategy) -> Estimate {
         let mut inferred_history = false;
         let mut inferred_calls = 0;
         let mut inferred_cost = 0.0;
@@ -738,6 +794,7 @@ impl RequestEvidence {
         let mut replay = Replay {
             scenario: self.scenario,
             chronological: infer,
+            summary_strategy: strategy,
             ..Replay::default()
         };
         let prior_untracked = if infer && self.archive.is_some() {
@@ -793,6 +850,9 @@ impl RequestEvidence {
                 } => {
                     rewrites.prior_unknown |= !dispatched;
                     dispatched = false;
+                    if let Some(receipt) = &facts.receipt {
+                        replay.result.calibration.observe(receipt);
+                    }
                     let mut expanded = facts.as_ref().clone();
                     if Self::expand(facts, &mut wire, &mut semantic) {
                         expanded.input = Some(wire.clone());
@@ -838,7 +898,19 @@ impl RequestEvidence {
                     usage,
                     standard,
                     cost,
-                } => replay.observed_reviewer(usage, *standard, *cost),
+                    receipt,
+                } => {
+                    if let Some(receipt) = receipt {
+                        replay.result.calibration.observe(receipt);
+                    }
+                    if receipt
+                        .as_ref()
+                        .is_some_and(|r| r.provider_status.as_deref() != Some("completed"))
+                    {
+                        replay.result.coverage.failed_calls += 1;
+                    }
+                    replay.observed_reviewer(usage, *standard, *cost);
+                }
                 Observation::FailedPrimary => {
                     rewrites.prior_unknown |= !dispatched;
                     dispatched = false;
@@ -914,6 +986,13 @@ impl RequestEvidence {
                 old.observed_reviewer_cost,
                 old.coverage.reviewer_responses,
             );
+            // Retain every already-known paid contribution even when this
+            // prefix lacks the inputs required to reconstruct its alternative.
+            estimate.carry_cost += old
+                .observed_primary_cost
+                .unwrap_or((old.carry_cost - old.reviewer_cost).max(0.0))
+                + old.observed_reviewer_cost.unwrap_or(old.reviewer_cost);
+            estimate.reviewer_cost += old.observed_reviewer_cost.unwrap_or(old.reviewer_cost);
             estimate.unavailable_primary_cost_calls += old.unavailable_primary_cost_calls;
             estimate.unavailable_reviewer_cost_calls += old.unavailable_reviewer_cost_calls;
             estimate.coverage.primary_responses += old.coverage.primary_responses;
@@ -989,8 +1068,20 @@ impl RequestEvidence {
         self.restoration = restoration;
         self.edited = edited;
     }
+    pub(crate) fn reviewer_receipt(
+        &mut self,
+        receipt: crate::proxy::client_receipt::ClientReceipt,
+    ) {
+        self.append(Observation::Reviewer {
+            usage: receipt.usage.clone(),
+            standard: receipt.standard,
+            cost: receipt.cost,
+            receipt: Some(receipt),
+        });
+    }
     pub fn reviewer_usage_settled(&mut self, usage: &Value, standard: bool, cost: Option<f64>) {
         self.append(Observation::Reviewer {
+            receipt: None,
             usage: receipts::numeric_review_usage(usage),
             standard,
             cost,
@@ -1039,10 +1130,15 @@ impl RequestEvidence {
         });
     }
     pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
-        if primary.response["status"] != "completed" {
-            self.failed_call();
-            return;
-        }
+        let completed = primary.response["status"] == "completed";
+        self.primary_receipt(primary, None, completed);
+    }
+    pub(crate) fn primary_receipt(
+        &mut self,
+        primary: PrimaryObservation<'_>,
+        receipt: Option<crate::proxy::client_receipt::ClientReceipt>,
+        completed: bool,
+    ) {
         let member = self
             .observations
             .iter()
@@ -1063,17 +1159,27 @@ impl RequestEvidence {
                     facts.retained_visible?,
                 ))
             });
-        let facts = PrimaryFacts::extract(
+        let mut facts = PrimaryFacts::extract(
             primary,
             member,
             self.scenario,
             self.restoration.map(|e| e.tokens),
         );
+        facts.receipt = receipt;
+        facts.completed = completed;
+        if !completed {
+            // Failed outputs never advance the hypothetical retained history.
+            facts.semantic_output = None;
+            facts.retained = Some(0);
+        }
         self.append(Observation::Primary {
             facts: Box::new(facts),
             restoration: self.restoration,
             edited: self.edited,
         });
+        if !completed {
+            self.retain_numeric_terminal();
+        }
     }
 }
 

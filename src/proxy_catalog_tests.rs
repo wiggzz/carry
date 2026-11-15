@@ -2,6 +2,25 @@
 // Rates in snapshots are USD per MILLION; planner results are dollars.
 use super::*;
 
+fn frozen_reviewer_receipt(
+    model: &str,
+    usage: Value,
+    resolved: Option<&ResolvedModel>,
+    write_tariff_known: bool,
+) -> ClientReceipt {
+    let body = json!({"model":model,"input":[]});
+    let mut attempt = Attempt::start("shadow", model, false, true, resolved, write_tariff_known);
+    attempt.freeze(&body, "synthetic-catalog-contract", None);
+    attempt
+        .receipt(
+            Some(&json!({"status":"completed","usage":usage})),
+            "eof",
+            Some(200),
+            false,
+        )
+        .unwrap()
+}
+
 #[test]
 fn cache_write191_dispatch_frozen_lifetime_censors_only_new_written_receipts() {
     let (config, mut before, _) = fixture(Rates {
@@ -36,13 +55,12 @@ fn cache_write191_dispatch_frozen_lifetime_censors_only_new_written_receipts() {
                 + 10.0 * rates.output;
         }
         let run = ReviewRun {
-            receipts: vec![ReviewReceipt {
-                model,
-                usage: Some(usage),
-                write_tariff_known: known,
-                standard: true,
-                completed: true,
-            }],
+            receipts: vec![frozen_reviewer_receipt(
+                &model,
+                usage,
+                before.model_resolution.as_ref().map(|p| &p.reviewer),
+                known,
+            )],
             ..ReviewRun::default()
         };
         // A newer paid owner cannot reprice the dispatch contract or lifetime.
@@ -90,13 +108,12 @@ fn joined191192_unpriced_write_settlement_keeps_independent_cache_observations()
         );
         assert_eq!(rates.is_none(), written > 0);
         let run = ReviewRun {
-            receipts: vec![ReviewReceipt {
-                model,
-                usage: Some(usage),
-                write_tariff_known: false,
-                standard: true,
-                completed: true,
-            }],
+            receipts: vec![frozen_reviewer_receipt(
+                &model,
+                usage,
+                before.model_resolution.as_ref().map(|p| &p.reviewer),
+                false,
+            )],
             ..ReviewRun::default()
         };
         settle_review(&mut current, &before, &reviewed, &run);
@@ -178,15 +195,12 @@ fn stale_background_receipts_keep_the_dispatched_frozen_tariff_not_current_slug_
     current.review_epoch += 1; // advice stale; the already paid receipt still counts
     current.model_resolution.as_mut().unwrap().reviewer.rates = None;
     let run = ReviewRun {
-        receipts: vec![ReviewReceipt {
-            model: config.classifier_model.clone(),
-            write_tariff_known: true,
-            usage: Some(
-                json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":10}}),
-            ),
-            standard: true,
-            completed: true,
-        }],
+        receipts: vec![frozen_reviewer_receipt(
+            &config.classifier_model,
+            json!({"input_tokens":100,"output_tokens":1,"input_tokens_details":{"cached_tokens":10}}),
+            before.model_resolution.as_ref().map(|p| &p.reviewer),
+            true,
+        )],
         ..ReviewRun::default()
     };
     settle_review(&mut current, &before, &reviewed, &run);

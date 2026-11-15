@@ -9,17 +9,20 @@ const REVIEW_USAGE_FIELDS: [&str; 5] = [
     "cache_write_input_tokens",
     "cache_creation_input_tokens",
 ];
-const REVIEW_USAGE_DETAILS: [&str; 4] = [
+const REVIEW_USAGE_DETAILS: [&str; 7] = [
     "cached_tokens",
     "cache_write_tokens",
     "cache_creation_tokens",
     "audio_tokens",
+    "image_tokens",
+    "text_tokens",
+    "reasoning_tokens",
 ];
 const REVIEW_USAGE_CONTAINERS: [&str; 2] = ["input_tokens_details", "output_tokens_details"];
 
 /// Complete possible shape of the same bounded numeric projection, for
 /// pre-dispatch representation admission only.
-pub(super) fn review_usage_shape() -> Value {
+pub(crate) fn review_usage_shape() -> Value {
     let mut shape = json!({});
     for field in REVIEW_USAGE_FIELDS {
         shape[field] = json!(0);
@@ -38,13 +41,21 @@ pub(crate) fn numeric_review_usage(usage: &Value) -> Value {
     let mut result = json!({});
     for field in REVIEW_USAGE_FIELDS {
         if let Some(value) = usage.get(field) {
-            result[field] = value.as_u64().map_or(json!(-1), |n| json!(n));
+            result[field] = if value.is_number() {
+                value.clone()
+            } else {
+                json!(-1)
+            };
         }
     }
     for field in REVIEW_USAGE_CONTAINERS {
         for key in REVIEW_USAGE_DETAILS {
             if let Some(value) = usage[field].get(key) {
-                result[field][key] = value.as_u64().map_or(json!(-1), |n| json!(n));
+                result[field][key] = if value.is_number() {
+                    value.clone()
+                } else {
+                    json!(-1)
+                };
             }
         }
     }
@@ -116,7 +127,7 @@ fn digest<T: Serialize + ?Sized>(value: &T) -> String {
     format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
 }
 
-pub(super) fn configuration(body: &Value, route: &str, resolved: Option<&ResolvedModel>) -> String {
+pub(crate) fn configuration(body: &Value, route: &str, resolved: Option<&ResolvedModel>) -> String {
     let mut base = body.clone();
     if let Some(object) = base.as_object_mut() {
         // These do not affect model-visible input. Everything else is fenced,
@@ -244,6 +255,10 @@ impl Replay {
     }
 
     pub(super) fn observed_facts(&mut self, body: &PrimaryFacts) {
+        if !body.completed {
+            self.observed_failed_primary(body);
+            return;
+        }
         let primary = body;
         let at = body.at;
         let resolved = body.resolved.as_ref();
@@ -703,14 +718,40 @@ impl Replay {
             }
         };
         let summary_cost = if let Some(kept) = kept {
-            modeled_cost(
-                model,
-                &Usage {
-                    input_tokens: total.saturating_sub(kept),
-                    output_tokens: self.scenario.summary,
-                    ..Usage::default()
+            // Only the previously rendered main INPUT is eligible. This request's
+            // output and the appended summary instruction are new uncached input.
+            let warm_prefix = match mode {
+                carry::models::ScenarioCacheMode::Implicit
+                    if minimum.is_some_and(|min| traditional >= min) && ttl > 0 =>
+                {
+                    self.receipts
+                        .modeled_cache
+                        .eligible_at(&body.cache_scope, at, traditional)
+                }
+                carry::models::ScenarioCacheMode::Disabled => Some(0),
+                _ => None,
+            };
+            self.summary_strategy.price(
+                total.saturating_sub(kept),
+                total,
+                warm_prefix,
+                |input, cached| {
+                    Some(
+                        crate::savings::scenario_input_cost_with_mode(
+                            model,
+                            input,
+                            cached,
+                            minimum,
+                            mode,
+                            |model, usage| modeled_cost(model, usage, resolved),
+                        )? + scenario_output_cost_resolved(
+                            model,
+                            input,
+                            self.scenario.summary,
+                            resolved,
+                        )?,
+                    )
                 },
-                resolved,
             )
         } else {
             Some(0.0)
@@ -719,8 +760,7 @@ impl Replay {
         // admission. An unavailable tariff excludes money without losing the
         // successful native cursor or granting another free initialization.
         self.result.initial_compactions += u64::from(initialized_now);
-        if let (Some((carry, traditional_cost)), Some(summary_cost)) = (pair, summary_cost) {
-            self.result.carry_cost += carry;
+        if let (Some((_, traditional_cost)), Some(summary_cost)) = (pair, summary_cost) {
             self.result.traditional_cost += traditional_cost + summary_cost;
             self.result.summary_cost += summary_cost;
             self.priced_primary_responses += 1;
@@ -755,6 +795,76 @@ impl Replay {
         receipts.anchor = Some(anchor);
     }
 
+    /// Same-attempt comparator: attempted input and billed output, but no
+    /// invented retry, successful output retention, summary or cache write.
+    fn observed_failed_primary(&mut self, body: &PrimaryFacts) {
+        self.result.coverage.failed_calls += 1;
+        let (native, observed, billable) = self.record_primary_observation(body, body.cost);
+        let pair = native
+            .as_ref()
+            .filter(|_| billable && self.projection_known)
+            .and_then(|native| {
+                let input = self.history.input(native.input_tokens, self.restored);
+                let resolved = body.resolved.as_ref();
+                let minimum = resolved
+                    .and_then(|r| r.scenario_cache_policy.as_ref())
+                    .and_then(|p| p.minimum_prefix_tokens);
+                let cached = match body.cache_mode {
+                    carry::models::ScenarioCacheMode::Implicit => self
+                        .receipts
+                        .modeled_cache
+                        .eligible_at(&body.cache_scope, body.at, input)
+                        .map(|n| {
+                            if minimum.is_some_and(|min| n >= min) {
+                                n
+                            } else {
+                                0
+                            }
+                        }),
+                    carry::models::ScenarioCacheMode::Disabled => Some(0),
+                    _ => None,
+                };
+                self.history.price_primary(observed, || {
+                    // A hypothetical retry/summary required by this branch is
+                    // unsupported, not free and not copied from actual expense.
+                    let budget = self.scenario.initial_input_budget(
+                        body.allowance,
+                        resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
+                    );
+                    if input > budget {
+                        return None;
+                    }
+                    let input_cost = crate::savings::scenario_input_cost_with_mode(
+                        &body.model,
+                        input,
+                        cached?,
+                        minimum,
+                        body.cache_mode,
+                        |model, usage| modeled_cost(model, usage, resolved),
+                    )?;
+                    Some(
+                        input_cost
+                            + scenario_output_cost_resolved(
+                                &body.model,
+                                input,
+                                native.output_tokens,
+                                resolved,
+                            )?,
+                    )
+                })
+            });
+        if let Some((_, traditional)) = pair {
+            self.result.traditional_cost += traditional;
+            self.priced_primary_responses += 1;
+        } else {
+            self.result.excluded_failed_calls += 1;
+            self.result.excluded_unpriced_calls += 1;
+        }
+        // The input attempt did not install output or alter retained history.
+        // Only native append prediction loses its successful cursor.
+        self.receipts.invalidate_actual();
+    }
+
     fn record_primary_observation(
         &mut self,
         body: &PrimaryFacts,
@@ -778,6 +888,7 @@ impl Replay {
     pub(super) fn record_primary_cost(&mut self, settled: Option<f64>) {
         self.result.coverage.primary_responses += 1;
         if let Some(cost) = settled {
+            self.result.carry_cost += cost;
             // An absent old population cannot be recovered by later success.
             // Preserve that explicit replay boundary rather than minting zero.
             if let Some(total) = &mut self.result.observed_primary_cost {

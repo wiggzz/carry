@@ -13,6 +13,9 @@ const RECEIPT_COUNTERFACTUAL_BASIS: &str = "shared_receipt_input_plus_neutral_re
 pub fn accounting_policy() -> Value {
     json!({"default_basis": RECEIPT_BASIS, "retained_legacy_basis": LEGACY_BASIS,
         "observed_cost_basis": "provider_native_partitions_with_dispatch_frozen_tariffs",
+        "attempt_population": "all_provider_attempts_regardless_of_outcome;unknown_is_not_zero",
+        "failed_comparator": "same_attempt_native_input_and_output_money_without_retained_output_retry_or_summary;missing_legacy_facts_unavailable",
+        "summary_policy_version":1,"summary_strategy_default":"conservative_lower",
         "counterfactual_basis": RECEIPT_COUNTERFACTUAL_BASIS,
         "counterfactual_cache_policy": format!("conditional_model_cache_v{}", carry::models::ScenarioCachePolicy::VERSION),
         "retained_counterfactual_cache_policy": "legacy_route_cache_v0",
@@ -34,7 +37,7 @@ pub fn accounting_basis_label() -> String {
 
 #[path = "proxy_receipts.rs"]
 mod receipts;
-pub(crate) use receipts::numeric_review_usage;
+pub(crate) use receipts::{configuration, numeric_review_usage, review_usage_shape};
 #[path = "proxy_traditional.rs"]
 mod traditional;
 use traditional::{HistoryContract, TraditionalHistoryState};
@@ -102,6 +105,10 @@ pub struct CachePolicyBoundary {
 
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 pub struct Estimate {
+    #[serde(default)]
+    pub summary_strategy: crate::savings::SummaryStrategy,
+    #[serde(skip)]
+    pub(crate) calibration: crate::proxy::client_receipt::Calibration,
     /// Disposable view of the applied-selection timeline, not a saved counter.
     #[serde(skip)]
     pub rewrites: evidence::RewriteCount,
@@ -196,6 +203,14 @@ pub struct WholeWindowEstimate {
 /// Strict matched subtotals remain diagnostics and are never relabeled whole.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DashboardEstimate {
+    #[serde(default)]
+    summary_strategy: crate::savings::SummaryStrategy,
+    #[serde(default)]
+    summary_request_policy: Value,
+    #[serde(default)]
+    calibration: crate::proxy::client_receipt::Calibration,
+    #[serde(default)]
+    calibration_scope: String,
     whole_window: Option<WholeWindowEstimate>,
     quantity_evidence: Value,
     legacy_quantity_segment: Option<CachePolicySegment>,
@@ -237,7 +252,7 @@ impl DashboardEstimate {
 }
 
 impl Estimate {
-    /// Pair the chronological alternative with the same successful observed
+    /// Pair the chronological alternative with the same all-outcome observed
     /// population. Strict partial sums stay diagnostic; they cannot impute
     /// missing requests by expense parity or a reference cost ratio.
     fn whole_window(&self) -> Option<WholeWindowEstimate> {
@@ -247,8 +262,8 @@ impl Estimate {
         }
         let calls = evidence.coverage.primary_responses;
         let reviewer_calls = evidence.coverage.reviewer_responses;
-        // The same successful population owns both amounts and counts. Missing
-        // historical scope is unknown; a lane with no successes contributes zero.
+        // The same observed attempts own both amounts and counts. Missing
+        // historical scope is unknown; a lane with no attempts contributes zero.
         let primary = if calls == 0 {
             0.0
         } else {
@@ -265,6 +280,7 @@ impl Estimate {
         // priced reviewer-only window has a zero traditional denominator, even
         // when the reviewer itself was free; a truly empty window stays absent.
         if !money_known
+            || evidence.excluded_failed_calls > 0
             || evidence.coverage.prior_untracked_calls > 0
             || (calls == 0 && reviewer_calls == 0)
             || !primary.is_finite()
@@ -330,7 +346,12 @@ impl Estimate {
     }
 
     pub fn dashboard(self, pending: bool) -> DashboardEstimate {
-        let available = self.priced;
+        let available = self.priced
+            && self.matched_primary_responses == self.coverage.primary_responses
+            && self.excluded_failed_calls == 0
+            && self.coverage.prior_untracked_calls == 0
+            && self.unavailable_primary_cost_calls == 0
+            && self.unavailable_reviewer_cost_calls == 0;
         let mut quantity_evidence = json!({
             "version": self.quantity_policy_version,
             "basis": if self.quantity_policy_version == Some(1) {
@@ -347,7 +368,7 @@ impl Estimate {
             "comparison_scope": if self.matched_primary_responses == self.coverage.primary_responses
                 && self.coverage.primary_responses > 0 && self.coverage.prior_untracked_calls == 0
                 && self.unavailable_reviewer_cost_calls == 0 {
-                "matched_completed_primary_window"
+                "matched_all_outcome_attempt_window"
             } else { "matched_subset_not_whole_session" },
         });
         if self.archive_unavailable {
@@ -355,6 +376,12 @@ impl Estimate {
         }
         let whole_window = self.whole_window();
         DashboardEstimate {
+            summary_strategy: self.summary_strategy,
+            calibration: self.calibration.clone(),
+            calibration_scope: "pooled_input_total_residual_by_role;dispatch_forecast_v1;not_cache_or_retention_accuracy;no_automatic_tuning;no_historical_backfill".into(),
+            summary_request_policy: json!({"version":1,"instruction_tokens":64,"summary_output":"existing_frozen_scenario_summary_allowance",
+                "scope":"api_equivalent_conditional_not_native_compact;instructions_and_new_retained_output_uncached",
+                "provenance":"pinned_Pi_standalone_and_Codex_ordinary_appended_fallback_not_dedicated_V2"}),
             whole_window,
             quantity_evidence,
             legacy_quantity_segment: self.legacy_quantity_segment,
@@ -389,6 +416,8 @@ impl Estimate {
             unavailable_primary_cost_calls: self.unavailable_primary_cost_calls,
             unavailable_reviewer_cost_calls: self.unavailable_reviewer_cost_calls,
 
+            // Comparison money requires a complete paired scope; known actual
+            // subtotals remain independently visible in observed_*_cost.
             carry_cost: available.then_some(self.carry_cost),
             traditional_cost: available.then_some(self.traditional_cost),
             reviewer_cost: available.then_some(self.reviewer_cost),
@@ -443,13 +472,13 @@ impl DashboardQuantityTotals {
             (true, false) => "legacy_v0",
             _ => "residual_v1",
         };
-        self.partial |= q["comparison_scope"] != "matched_completed_primary_window"
+        self.partial |= q["comparison_scope"] != "matched_all_outcome_attempt_window"
             || e.accounting_basis == LEGACY_BASIS
             || e.carry_cost.is_none();
         self.comparison_scope = if self.partial {
             "matched_subset_not_whole_session"
         } else {
-            "matched_completed_primary_window"
+            "matched_all_outcome_attempt_window"
         };
     }
 }
@@ -583,6 +612,8 @@ enum TrajectoryFormat {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Replay {
+    #[serde(default)]
+    summary_strategy: crate::savings::SummaryStrategy,
     format: TrajectoryFormat,
     receipts: receipts::Receipts,
     pub scenario: Scenario,
@@ -629,6 +660,7 @@ impl Default for Replay {
     fn default() -> Self {
         Self {
             format: TrajectoryFormat::Current,
+            summary_strategy: crate::savings::SummaryStrategy::default(),
             receipts: receipts::Receipts::default(),
             scenario: Scenario::default(),
             result: Estimate {
@@ -707,10 +739,15 @@ impl Replay {
         };
         estimate.quantity_policy_version = self.receipts.quantity_policy_version;
         estimate.accounting_basis = RECEIPT_BASIS.into();
+        estimate.summary_strategy = self.summary_strategy;
         estimate.matched_primary_responses = self.priced_primary_responses;
         estimate.savings = estimate.traditional_cost - estimate.carry_cost;
-        estimate.priced =
-            self.available && self.scenario.valid() && self.priced_primary_responses > 0;
+        estimate.priced = self.available
+            && self.scenario.valid()
+            && self.priced_primary_responses > 0
+            && self.priced_primary_responses == estimate.coverage.primary_responses
+            && estimate.unavailable_primary_cost_calls == 0
+            && estimate.unavailable_reviewer_cost_calls == 0;
         estimate.savings_percent = estimate
             .priced
             .then(|| crate::savings::savings_percent(estimate.savings, estimate.carry_cost))
@@ -729,11 +766,13 @@ impl Replay {
         // Failure invalidates actual quantity continuity, not prior successful
         // hypothetical cache coverage. Existing deadlines still govern reuse.
         self.receipts.invalidate_actual();
+        self.record_primary_cost(None);
         self.record_failed_call();
     }
 
     pub fn failed_reviewer_call(&mut self) {
-        // Carry-only work did not touch either primary history or its cache.
+        // Legacy bare failures have no recoverable usage/tariff/identity.
+        self.observed_reviewer(&Value::Null, false, None);
         self.record_failed_call();
     }
 
@@ -832,8 +871,7 @@ impl Replay {
         resolved: Option<&ResolvedModel>,
     ) {
         if response["status"] != "completed" {
-            self.failed_reviewer_call();
-            return;
+            self.result.coverage.failed_calls += 1;
         }
         self.reviewer_usage_resolved(
             body["model"].as_str().unwrap_or(""),
@@ -918,10 +956,6 @@ impl Replay {
 
     #[cfg(test)]
     pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
-        if primary.response["status"] != "completed" {
-            self.failed_call();
-            return;
-        }
         let facts = PrimaryFacts::extract(
             primary,
             self.history.retention_member(),
@@ -1098,8 +1132,16 @@ mod tests {
         let public = serde_json::to_value(trajectory.snapshot().dashboard(false)).unwrap();
         assert_eq!(public["excluded_unpriced_calls"], 2);
         assert_eq!(public["excluded_unpriced_reviewer_calls"], 2);
-        assert_eq!(public["reviewer_cost"], before["result"]["reviewer_cost"]);
-        assert!(public["savings"].as_f64().unwrap() < 0.0);
+        assert!(public["reviewer_cost"].is_null());
+        assert!(public["savings"].is_null());
+        assert_eq!(
+            public["observed_reviewer_cost"],
+            before["result"]["observed_reviewer_cost"]
+        );
+        assert!(
+            public["whole_window"].is_null(),
+            "unknown reviewer money is never free"
+        );
         let coverage = &public["coverage"];
         assert_eq!(
             coverage["missing_usage"], 1,
@@ -1119,12 +1161,12 @@ mod tests {
         trajectory.prior_untracked(1);
         totals.observe(&trajectory.snapshot().dashboard(false));
         let public = serde_json::to_value(totals).unwrap();
-        assert_eq!(public["included_sessions"], 2);
-        assert_eq!(public["excluded_sessions"], 1);
+        assert_eq!(public["included_sessions"], 0);
+        assert_eq!(public["excluded_sessions"], 3);
         assert_eq!(public["legacy_sessions"], 0);
         assert_eq!(public["excluded_unpriced_calls"], 3);
         assert_eq!(public["excluded_unpriced_reviewer_calls"], 3);
-        assert!(public["carry_cost"].as_f64().unwrap() > 0.0);
+        assert!(public["carry_cost"].is_null());
     }
 
     #[test]
@@ -1135,8 +1177,8 @@ mod tests {
         let snapshot = trajectory.snapshot();
         let persisted = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(
-            persisted["priced"], true,
-            "internal checkpoint compatibility stays intact"
+            persisted["priced"], false,
+            "unknown failed expense blocks comparison without dropping known money"
         );
         for pending in [false, true] {
             let dashboard = serde_json::to_value(snapshot.clone().dashboard(pending)).unwrap();
@@ -1149,8 +1191,16 @@ mod tests {
                 "savings",
                 "savings_percent",
             ] {
-                assert_eq!(dashboard[field], persisted[field]);
+                assert!(
+                    dashboard[field].is_null(),
+                    "{field}: unknown failed money is not excluded"
+                );
             }
+            assert_eq!(
+                dashboard["observed_primary_cost"],
+                persisted["observed_primary_cost"]
+            );
+            assert!(dashboard["whole_window"].is_null());
             for field in [
                 "coverage",
                 "excluded_failed_calls",
@@ -1197,7 +1247,7 @@ mod tests {
                 traditional_cost: traditional,
                 savings: traditional - carry,
                 priced: true,
-                excluded_failed_calls: 1,
+                excluded_failed_calls: 0,
                 ..Estimate::default()
             }
             .dashboard(false);
@@ -1256,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_failures_leave_successful_prompt_and_summary_state_unchanged() {
+    fn legacy_unknown_failure_preserves_history_but_blocks_complete_comparison() {
         let mut trajectory = Trajectory::default();
         trajectory.primary(
             &request(&"prefix ".repeat(3000)),
@@ -1282,7 +1332,9 @@ mod tests {
             assert_eq!(after[field], before[field], "failure changed {field}");
         }
         let estimate = trajectory.snapshot();
-        assert!(estimate.priced);
+        assert!(!estimate.priced);
+        assert_eq!(estimate.unavailable_primary_cost_calls, 1);
+        assert!(estimate.clone().dashboard(false).whole_window.is_none());
         assert_eq!(
             serde_json::to_value(estimate).unwrap()["excluded_failed_calls"],
             1
@@ -1290,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_reviewer_terminals_with_usage_are_excluded_but_completed_invalid_advice_is_charged() {
+    fn failed_reviewer_and_invalid_advice_both_charge_native_receipt_money() {
         let mut trajectory = Trajectory::default();
         trajectory.primary(&request("task"), &response(100), "route", 100, true);
         let before = trajectory.snapshot();
@@ -1302,14 +1354,23 @@ mod tests {
         let estimate = trajectory.snapshot();
         assert!(estimate.priced);
         assert_eq!(estimate.coverage.failed_calls, 2);
-        assert_eq!(estimate.coverage.reviewer_responses, 0);
-        assert_eq!(estimate.carry_cost, before.carry_cost);
+        assert_eq!(estimate.coverage.reviewer_responses, 2);
+        let receipt_cost = observed_cost(
+            "gpt-6-luna",
+            &receipts::receipt(&response(100)["usage"]).unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!((estimate.carry_cost - before.carry_cost - 2.0 * receipt_cost).abs() < 1e-12);
+        assert_eq!(estimate.traditional_cost, before.traditional_cost);
+        assert_eq!(estimate.excluded_failed_calls, 0);
         // Advice validity/refusal is not the completion classification.
         let mut refused = response(100);
         refused["output"] =
             json!([{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]);
         trajectory.reviewer(&request("review"), &refused, true);
-        assert_eq!(trajectory.snapshot().coverage.reviewer_responses, 1);
+        assert_eq!(trajectory.snapshot().coverage.reviewer_responses, 3);
         assert!(trajectory.snapshot().reviewer_cost > 0.0);
         trajectory.reviewer(
             &request("review"),
@@ -1318,8 +1379,8 @@ mod tests {
         );
         assert_eq!(trajectory.snapshot().coverage.missing_usage, 1);
         assert!(
-            trajectory.snapshot().priced,
-            "omit completed reviewer without usage, retain priced primary"
+            !trajectory.snapshot().priced,
+            "known money survives but missing reviewer usage blocks a complete comparison"
         );
     }
 
@@ -1354,8 +1415,8 @@ mod tests {
             );
             assert_eq!(
                 trajectory.snapshot().priced,
-                variant != 0,
-                "only unknown ancestry remains unavailable"
+                false,
+                "unknown failed-attempt money cannot be resurrected by a later success"
             );
         }
     }

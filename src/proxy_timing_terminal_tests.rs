@@ -13,9 +13,11 @@ fn timing_journal(directory: &Path, id: &str, request: &str) -> Vec<Value> {
                         .ok()
                 });
         if let Some(records) = records
-            && records
-                .iter()
-                .any(|e| e["event"] == "phase_timing" && e["request_id"] == request)
+            && records.iter().any(|e| {
+                e["event"] == "phase_timing"
+                    && e["request_id"] == request
+                    && e["data"]["stage"].is_null()
+            })
         {
             return records;
         }
@@ -30,7 +32,11 @@ fn timing_journal(directory: &Path, id: &str, request: &str) -> Vec<Value> {
 fn timing_record(directory: &Path, id: &str, request: &str) -> Value {
     let records: Vec<_> = timing_journal(directory, id, request)
         .into_iter()
-        .filter(|e| e["event"] == "phase_timing" && e["request_id"] == request)
+        .filter(|e| {
+            e["event"] == "phase_timing"
+                && e["request_id"] == request
+                && e["data"]["stage"].is_null()
+        })
         .collect();
     assert_eq!(records.len(), 1, "terminal summary must be unique");
     let t = &records[0]["data"];
@@ -120,7 +126,9 @@ async fn phase_timing_rejection_and_cancelled_lock_wait_preserve_unknowns() {
     drop(lock);
     let record = timing_record(directory.path(), &id, "abort");
     let t = &record["data"];
-    assert_eq!(t["outcome"], "cancelled");
+    assert_eq!(t["outcome"], "dropped_before_terminal");
+    assert_eq!(t["actual_dispatch"], false);
+    assert_eq!(t["explicit_local_cancellation"], Value::Null);
     assert_eq!(t["incomplete"], true);
     assert_eq!(t["active_phase"], "primary_lock_wait");
     assert_eq!(
@@ -168,6 +176,7 @@ async fn phase_timing_http_error_and_client_disconnect_are_not_successes() {
         service.config.mode = Mode::Off;
         service.config.upstream_url =
             format!("http://{}/responses", listener.local_addr().unwrap());
+        service.config.request_timeout_secs = 1;
         let service = Arc::new(service);
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let mut headers = HeaderMap::new();
@@ -210,7 +219,7 @@ async fn phase_timing_http_error_and_client_disconnect_are_not_successes() {
         assert_eq!(
             t["outcome"],
             if disconnect {
-                "client_disconnected"
+                "upstream_timeout"
             } else {
                 "http_error"
             }
@@ -275,8 +284,13 @@ async fn phase_timing_reviewer_is_correlated_background_and_timeout_is_censored(
     assert_eq!(t["attempts"], json!([]));
     assert_eq!(t["first_body_us"], Value::Null);
     assert_eq!(t["body_complete_us"], Value::Null);
-    assert_eq!(session.shadow.calls, 2);
-    assert_eq!(session.shadow.unavailable_cost_calls, 1);
+    assert_eq!(
+        session.shadow.calls, 1,
+        "held auth never dispatched a second call"
+    );
+    assert_eq!(session.shadow.unavailable_cost_calls, 0);
+    assert_eq!(t["actual_dispatch"], false);
+    assert_eq!(t["outcome"], "review_deadline_expired");
 }
 
 #[tokio::test]
@@ -311,7 +325,7 @@ async fn phase_timing_transport_failure_has_no_headers_or_body_and_unknown_cost(
     provider.await.unwrap();
     let record = timing_record(directory.path(), &id, "transport");
     let t = &record["data"];
-    assert_eq!(t["outcome"], "transport_error");
+    assert_eq!(t["outcome"], "upstream_transport_error");
     assert_eq!(t["incomplete"], true);
     assert_eq!(t["attempts"].as_array().unwrap().len(), 1);
     assert_eq!(t["attempts"][0]["headers_us"], Value::Null);
@@ -361,10 +375,10 @@ async fn phase_timing_retry_span_owner_keeps_attempts_distinct_without_double_co
     let attempts = t["attempts"].as_array().unwrap();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0]["ordinal"], 0);
-    assert_eq!(attempts[0]["status"], 401);
+    assert_eq!(attempts[0]["http_status"], 401);
     assert_eq!(attempts[0]["body_complete_us"], Value::Null);
     assert_eq!(attempts[1]["ordinal"], 1);
-    assert_eq!(attempts[1]["status"], 200);
+    assert_eq!(attempts[1]["http_status"], 200);
     assert!(
         attempts[1]["dispatch_us"].as_u64().unwrap() >= attempts[0]["headers_us"].as_u64().unwrap()
     );
