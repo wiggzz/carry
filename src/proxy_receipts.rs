@@ -827,8 +827,14 @@ impl Replay {
                 self.history.price_primary(observed, || {
                     // A hypothetical retry/summary required by this branch is
                     // unsupported, not free and not copied from actual expense.
-                    let budget = self.scenario.initial_input_budget(
+                    let allowance = carry::models::output_allowance(
                         body.allowance,
+                        resolved.map_or(self.scenario.reserve, |r| {
+                            u64::from(r.ordinary.output_reserve)
+                        }),
+                    );
+                    let budget = self.scenario.initial_input_budget(
+                        allowance,
                         resolved.and_then(|r| r.capacity_tokens.map(u64::from)),
                     );
                     if input > budget {
