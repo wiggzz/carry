@@ -48,18 +48,57 @@ atomic across imports, packaging and tests, while an Environment rename also
 needs deliberate secret/protection/OIDC migration. Neither rename is needed to
 run the existing SCB lane correctly.
 
-The current hosted preparation is deliberately a one-problem, one-repetition
-`cfgpipe` pilot. General contract/planner support for more selections and
-repetitions is not proof that this hosted preparation already supports them.
-For a representative successor, parameterize the preparation selection and
-repetition count, then derive denominator validation from the frozen plan rather
-than the pilot's literal 12 outcomes. Default to at least three fresh paired
-whole-problem repetitions; preserve every official checkpoint in each problem.
-Expand a predeclared mix of domains and context horizons separately from
-replication, and qualify every selected problem with real official gold tests
-before paid work. Publish individual attempts, paired differences, spread,
-quality and all primary/reviewer costs; correlated checkpoints are not independent
-task samples. A one-run pilot remains useful but cannot measure variability.
+Hosted preparation accepts `selection` (a JSON path in the checked-out source)
+and `repetitions` workflow inputs. Defaults retain the complete `cfgpipe` pilot
+and one repetition; use at least three for variability. `execute_paid=false`
+remains the default: preparation/gold readiness never authorizes model spend.
+The CLI equivalents are `--selection PATH --repetitions 3` on
+`python -B -m scripts.slopcodebench_prepare`.
+
+A multi-problem selection keeps the pilot's `runner_commit`, `problems_commit`,
+`primary_model`, `primary_reasoning`, `reviewer_model` and `reviewer_reasoning`,
+and replaces `problem`, `problem_tree_sha`, `checkpoints` and the pilot's annotated
+outcome count with `problems`: an ordered list of objects containing `id`,
+`problem_tree_sha` (the pinned full Git tree), and every ordered checkpoint name.
+The preparer checks each tree and complete official checkpoint order, warms each
+problem's actual dependency set, and runs the existing official offline gold path
+for every selected problem. Repetitions share trusted dependency preparation,
+not an agent workspace, HOME, session or cache. The original sequential official
+runner owns the entire checkpoint chain within each whole-problem arm attempt.
+Native deadlines and progression/correctness policies are unchanged.
+
+The frozen contract binds the selection metadata hash. Execution and workflow
+acceptance reconstruct the canonical plan rather than trusting an outcome-count
+annotation: every planned namespace/checkpoint must occur exactly once, supplied
+task/arm/repetition labels must match, and source/selection drift is rejected.
+A malformed worker result is retained as diagnostic evidence, converted to an
+unknown infrastructure outcome for its full slot, and stops further dispatch;
+it is never silently retried. Unknown cost remains unknown, with observed lower
+bounds retained separately.
+
+Reports include `problem_attempts` (each problem/repetition's two arms, terminal
+statuses, all-in native primary+reviewer tariff estimates, official checkpoint
+solve rates and whole-problem outcomes), checkpoint-level paired quality, and
+`per_problem` mean/median/min/max/range across repetitions. Missing scores or
+costs keep their spread unknown instead of selecting only successful attempts.
+Three repetitions give coarse descriptive spread, not precise uncertainty.
+Raw checkpoint-native events remain available for direct-baseline peak and
+cumulative input, response counts and cache-share reconstruction; checkpoint
+count/difficulty are only selection proxies, not measured trajectory lengths.
+Predeclare longer-chain candidates independently of Carry outcomes, retain
+negative/zero/failure/timeout results, and do not pad context or reset within a
+problem to manufacture savings. Preserve Luna primary/Luna reviewer first;
+any later 6.1 sol-primary comparison keeps Luna reviewer, freezes a separate
+cohort, and must not be pooled with the first model cohort.
+
+Local synthetic executor tests exercise preparation, workflow shell,
+readiness/preflight and canonical dispatch/run_slot. They are not official gold
+qualification, full native Docker isolation evidence, or measured model quality.
+Before paid work, require source-bound hosted CI/native qualification, actual
+official gold for the complete selected set, review and separate total-cohort
+spend authority. The 360-minute hosted ceiling and preparation phase ceiling
+still apply; calculate the full native-deadline envelope before selecting a
+larger cohort rather than shortening trajectories to make it fit.
 
 ## Safe first commands
 

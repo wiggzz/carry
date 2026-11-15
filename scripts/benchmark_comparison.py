@@ -24,6 +24,23 @@ def fingerprint(value):
                                      allow_nan=False).encode()).hexdigest()
 
 
+def validate_selection(selection, repetitions, benchmark):
+    if type(repetitions) is not int or not 1 <= repetitions <= 100:
+        raise ValueError('repetitions must be 1..100')
+    if not isinstance(selection, list) or not selection or len({task['id'] for task in selection}) != len(selection):
+        raise ValueError('selection must contain unique tasks')
+    for task in selection:
+        if not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}', task['id']):
+            raise ValueError('invalid task id')
+        checkpoints = task['checkpoints']
+        if not isinstance(checkpoints, list) or not checkpoints or len(set(checkpoints)) != len(checkpoints):
+            raise ValueError('checkpoint order must be nonempty and unique')
+        if any(not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}', cp) for cp in checkpoints):
+            raise ValueError('invalid checkpoint id')
+        if benchmark == 'swebench' and checkpoints != ['final']:
+            raise ValueError('SWE-bench has one official final outcome')
+
+
 def validate_contract(value):
     if value['schema_version'] != 1 or value['benchmark'] not in {'swebench', 'slopcodebench'}:
         raise ValueError('unsupported comparison contract')
@@ -32,21 +49,7 @@ def validate_contract(value):
     for key in ('source_commit', 'runner_commit', 'dataset_commit'):
         if not re.fullmatch('[0-9a-f]{40}', value[key]):
             raise ValueError(f'{key} must be an immutable full commit')
-    if type(value['repetitions']) is not int or not 1 <= value['repetitions'] <= 100:
-        raise ValueError('repetitions must be 1..100')
-    selection = value['selection']
-    if not selection or len({task['id'] for task in selection}) != len(selection):
-        raise ValueError('selection must contain unique tasks')
-    for task in selection:
-        if not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}', task['id']):
-            raise ValueError('invalid task id')
-        checkpoints = task['checkpoints']
-        if not checkpoints or len(set(checkpoints)) != len(checkpoints):
-            raise ValueError('checkpoint order must be nonempty and unique')
-        if any(not re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}', cp) for cp in checkpoints):
-            raise ValueError('invalid checkpoint id')
-        if value['benchmark'] == 'swebench' and checkpoints != ['final']:
-            raise ValueError('SWE-bench has one official final outcome')
+    validate_selection(value['selection'], value['repetitions'], value['benchmark'])
     settings = value['settings']
     for key in ('codex_sha256', 'prompt_sha256'):
         if not re.fullmatch('[0-9a-f]{64}', settings[key]):
@@ -102,18 +105,25 @@ def measured_sum(rows, key):
     return float(sum(Decimal(str(value)) for value in values))
 
 
-def summarize(plan, records):
-    """Reject missing slots; retain terminal errors in every paired denominator.
-
-    The caller provides trusted checkpoint-local native events, not client token
-    estimates. This is an offline reader, not an attestation of artifact origin.
-    """
+def validate_records(plan, records):
+    """Reconcile exact planned checkpoint identities before aggregation or spend."""
     expected = {(s['namespace'], cp): s for s in plan['slots'] for cp in s['checkpoints']}
+    if (len(expected) != sum(len(s['checkpoints']) for s in plan['slots'])
+            or len(expected) != plan['expected_records']
+            or len({s['namespace'] for s in plan['slots']}) != len(plan['slots'])):
+        raise ValueError('invalid fixed-denominator plan')
     rows = {}
     for row in records:
         key = (row['namespace'], row['checkpoint'])
         if key not in expected or key in rows or row['contract_sha256'] != plan['contract_sha256']:
             raise ValueError('duplicate, unknown or source-mismatched record')
+        slot = expected[key]
+        # Namespace already binds task, arm and repetition. Legacy rows may
+        # omit redundant labels, but a supplied label must never contradict it.
+        for field, wanted in [('task_id', slot['task_id']), ('arm', slot['name']),
+                              ('repetition', slot['repetition'])]:
+            if field in row and (type(row[field]) is not type(wanted) or row[field] != wanted):
+                raise ValueError('record identity differs from its planned slot')
         if row['status'] not in {'evaluated', 'agent-failed', 'agent-timeout',
                                  'infrastructure-error', 'evaluation-error', 'not-run'}:
             raise ValueError('unknown terminal status')
@@ -129,37 +139,63 @@ def summarize(plan, records):
         rows[key] = row
     if rows.keys() != expected.keys():
         raise ValueError('incomplete fixed denominator')
-    arms = {}
-    for arm in plan['arms']:
-        selected = [rows[key] for key, slot in expected.items() if slot['name'] == arm['name']]
-        native = summarize_events([event for row in selected for event in row['events']])
-        # Empty events cannot establish a free failed/unlaunched checkpoint even
-        # when a different checkpoint provides a complete priced ledger.
-        complete = all(summarize_events(row['events'])['estimated_total_cost_usd'] is not None
-                       for row in selected)
-        total = native['estimated_total_cost_usd'] if complete else None
-        counts = Counter(row['status'] for row in selected)
-        arm_report = {'denominator': len(selected),
-                      'resolved': sum(row['resolved'] is True for row in selected),
-                      'unknown_scores': sum(row['resolved'] is None for row in selected),
-                      'infrastructure_errors': sum(counts[k] for k in
-                          ('infrastructure-error', 'evaluation-error', 'not-run')),
-                      'terminal_statuses': dict(counts), 'native': native,
-                      'estimated_api_usd': total,
-                      'observed_api_usd_lower_bound': native['observed_cost_lower_bound_usd']}
-        for metric in ('agent_seconds', 'setup_seconds', 'evaluation_seconds', 'task_wall_seconds',
-                       'selected_rewrites', 'dispatched_rewrites', 'committed_rewrites', 'native_compactions'):
-            arm_report[metric] = measured_sum(selected, metric)
-        arm_report['median_agent_seconds'] = (None if arm_report['agent_seconds'] is None
-                                               else median(row['agent_seconds'] for row in selected))
-        arms[arm['name']] = arm_report
+    return expected, rows
+
+
+def summarize_arm(selected):
+    native = summarize_events([event for row in selected for event in row['events']])
+    complete = all(summarize_events(row['events'])['estimated_total_cost_usd'] is not None for row in selected)
+    counts = Counter(row['status'] for row in selected)
+    report = {'denominator': len(selected),
+              'resolved': sum(row['resolved'] is True for row in selected),
+              'unknown_scores': sum(row['resolved'] is None for row in selected),
+              'infrastructure_errors': sum(counts[k] for k in ('infrastructure-error', 'evaluation-error', 'not-run')),
+              'terminal_statuses': dict(counts), 'native': native,
+              'estimated_api_usd': native['estimated_total_cost_usd'] if complete else None,
+              'observed_api_usd_lower_bound': native['observed_cost_lower_bound_usd']}
+    for metric in ('agent_seconds', 'setup_seconds', 'evaluation_seconds', 'task_wall_seconds',
+                   'selected_rewrites', 'dispatched_rewrites', 'committed_rewrites', 'native_compactions'):
+        report[metric] = measured_sum(selected, metric)
+    report['median_agent_seconds'] = (None if report['agent_seconds'] is None
+                                     else median(row['agent_seconds'] for row in selected))
+    return report
+
+
+def spread(values):
+    """Do not silently turn incomplete attempts into a successful subset."""
+    unknown = sum(value is None for value in values)
+    return {'count': len(values), 'unknown': unknown,
+            **({key: None for key in ('mean', 'median', 'min', 'max', 'range')} if unknown else {
+                'mean': sum(values)/len(values), 'median': median(values),
+                'min': min(values), 'max': max(values), 'range': max(values)-min(values)})}
+
+
+def summarize(plan, records):
+    """Keep every terminal outcome; trusted native receipts are not invoices."""
+    expected, rows = validate_records(plan, records)
+    arms = {arm['name']: summarize_arm([rows[key] for key, slot in expected.items()
+                                      if slot['name'] == arm['name']]) for arm in plan['arms']}
     paired = Counter()
     checkpoints = []
+    attempts = []
     by_task = {(s['task_id'], s['repetition'], s['name']): s for s in plan['slots']}
     for (task, rep, arm), slot in by_task.items():
         if arm != 'direct':
             continue
         other = by_task[(task, rep, 'compact')]
+        attempt = {'task_id': task, 'repetition': rep, 'arms': {}}
+        for name in ('direct', 'compact'):
+            arm_slot = by_task[(task, rep, name)]
+            selected = [rows[(arm_slot['namespace'], cp)] for cp in arm_slot['checkpoints']]
+            result = summarize_arm(selected)
+            result.update(namespace=arm_slot['namespace'],
+                          checkpoint_solve_rate=None if result['unknown_scores'] else result['resolved']/len(selected),
+                          whole_problem_resolved=None if result['unknown_scores'] else all(row['resolved'] for row in selected))
+            attempt['arms'][name] = result
+        for metric in ('estimated_api_usd', 'checkpoint_solve_rate', 'agent_seconds', 'task_wall_seconds'):
+            a, b = (attempt['arms'][name][metric] for name in ('direct', 'compact'))
+            attempt['compact_minus_direct_'+metric] = None if a is None or b is None else b-a
+        attempts.append(attempt)
         for checkpoint in slot['checkpoints']:
             direct, compact = rows[(slot['namespace'], checkpoint)], rows[(other['namespace'], checkpoint)]
             a, b = direct['resolved'], compact['resolved']
@@ -175,6 +211,15 @@ def summarize(plan, records):
     for metric in ('agent_seconds', 'task_wall_seconds', 'estimated_api_usd'):
         a, b = arms['direct'][metric], arms['compact'][metric]
         paired['compact_minus_direct_' + metric] = None if a is None or b is None else b - a
+    per_problem = []
+    for task in dict.fromkeys(a['task_id'] for a in attempts):
+        selected = [a for a in attempts if a['task_id'] == task]
+        per_problem.append({'task_id': task, 'repetitions': len(selected),
+            'paired_cost_delta_usd': spread([a['compact_minus_direct_estimated_api_usd'] for a in selected]),
+            'paired_checkpoint_solve_rate_delta': spread([a['compact_minus_direct_checkpoint_solve_rate'] for a in selected]),
+            'arms': {name: {metric: spread([a['arms'][name][metric] for a in selected])
+                            for metric in ('estimated_api_usd', 'checkpoint_solve_rate', 'whole_problem_resolved', 'agent_seconds')}
+                     for name in ('direct', 'compact')}})
     return {'schema_version': 1, 'contract_sha256': plan['contract_sha256'],
             'performance_qualifier': (
                 'invalid-infrastructure-or-unknown-score' if any(a['infrastructure_errors'] or a['unknown_scores'] for a in arms.values())
@@ -187,6 +232,9 @@ def summarize(plan, records):
             'cost_basis': 'modeled-standard-api-usd-not-invoice',
             'infrastructure_cost_included': False, 'arms': arms, 'paired': dict(paired),
             'checkpoints': checkpoints,
+            'problem_attempts': attempts, 'per_problem': per_problem,
+            'repetition_unit': 'whole-problem-arm',
+            'spread_qualifier': 'descriptive-only; three repetitions give coarse spread, not precise uncertainty',
             'comparison_valid': all(not a['infrastructure_errors'] and not a['unknown_scores']
                                     for a in arms.values()),
             'cost_comparison_complete': all(a['estimated_api_usd'] is not None for a in arms.values()),
@@ -202,6 +250,9 @@ def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
     """
     import time
     import os
+    canonical = build_plan(contract, include_off=any(a['name'] == 'forward-only' for a in plan['arms']))
+    if any(plan.get(key) != value for key, value in canonical.items()):
+        raise ValueError('execution plan differs from the frozen contract')
     try:
         from benchmark_budget import SpendingAuthority
     except ModuleNotFoundError:
@@ -234,6 +285,12 @@ def dispatch(plan, contract, prepared, output, runner, *, budget_usd):
                     if authority is not None:
                         authority.validate()
                     rows = runner(contract, slot, prepared, output/slot['namespace'])
+                    try:
+                        validate_records({**plan, 'slots': [slot], 'expected_records': len(slot['checkpoints'])}, rows)
+                    except (ValueError, KeyError, TypeError):
+                        (output/f'invalid-records-{slot["namespace"]}.json').write_text(
+                            json.dumps(rows, indent=2, sort_keys=True)+'\n')
+                        raise ValueError('worker returned invalid fixed-denominator outcomes; retained diagnostics')
                 except Exception as error:
                     rows = [{'namespace': slot['namespace'], 'contract_sha256': plan['contract_sha256'],
                              'checkpoint': checkpoint, 'task_id': slot['task_id'], 'arm': slot['name'],

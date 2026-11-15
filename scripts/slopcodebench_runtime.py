@@ -76,6 +76,10 @@ def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True
     except ModuleNotFoundError:
         from slopcodebench import plan
     result = plan(contract)
+    if 'study_selection_sha256' in contract:
+        selection = json.loads(Path(prepared['selection']).read_text())
+        if fingerprint(selection) != contract['study_selection_sha256']:
+            raise ValueError('frozen study selection changed since preparation')
     settings = contract['settings']
     if settings['concurrency'] != 1 or not 0 <= settings['retries'] <= 3:
         raise ValueError('protected SCB is serial with at most three native retries')
