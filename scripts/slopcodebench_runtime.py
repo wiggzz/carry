@@ -22,9 +22,11 @@ from collections import Counter
 
 try:
     from scripts import proxy_benchmark, swebench_smoke
+    from scripts import slopcodebench_evaluator as evaluator
     from scripts.benchmark_comparison import fingerprint
     from scripts.slopcodebench import has_executed_tests
 except ModuleNotFoundError:
+    import slopcodebench_evaluator as evaluator
     import proxy_benchmark
     import swebench_smoke
     from benchmark_comparison import fingerprint
@@ -59,6 +61,7 @@ def verify_checkout(root, expected):
 
 def readiness_binding(contract, prepared, task):
     return {'runner_commit': contract['runner_commit'], 'dataset_commit': contract['dataset_commit'],
+            'evaluator_identity': contract.get('evaluator_identity'),
             'definition_sha256': prepared['tasks'][task['id']]['definition_sha256'],
             'evaluator_image': prepared['evaluator_image'],
             'environment_sha256': hashlib.sha256(Path(prepared['environment']).read_bytes()).hexdigest(),
@@ -80,6 +83,7 @@ def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True
         selection = json.loads(Path(prepared['selection']).read_text())
         if fingerprint(selection) != contract['study_selection_sha256']:
             raise ValueError('frozen study selection changed since preparation')
+    evaluator.validate_binding(contract, prepared)
     settings = contract['settings']
     if settings['concurrency'] != 1 or not 0 <= settings['retries'] <= 3:
         raise ValueError('protected SCB is serial with at most three native retries')
@@ -95,8 +99,8 @@ def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True
     if verify_sources:
         if Path(prepared['source_root']).resolve() != Path(__file__).resolve().parents[1]:
             raise ValueError('runtime must execute from its pinned source checkout')
-        for key, commit in [('source_root', 'source_commit'), ('upstream_root', 'runner_commit'),
-                            ('problems_root', 'dataset_commit')]:
+        evaluator.verify(Path(prepared['upstream_root']))
+        for key, commit in [('source_root', 'source_commit'), ('problems_root', 'dataset_commit')]:
             verify_checkout(Path(prepared[key]), contract[commit])
     for key in ('prompt', 'environment'):
         if not Path(prepared[key]).is_file():
@@ -404,6 +408,7 @@ def official_components(prepared, contract, task_id):
 
 
 def activate_upstream(prepared):
+    evaluator.verify(Path(prepared['upstream_root']))
     source = (Path(prepared['upstream_root'])/'src').resolve()
     sys.path.insert(0, str(source))
     import slop_code

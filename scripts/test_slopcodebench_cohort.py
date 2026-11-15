@@ -97,6 +97,7 @@ class CohortPreparationTests(unittest.TestCase):
         for name, selection, repetitions in variants:
             with self.subTest(name=name), patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
                     patch.object(preparation, 'official_definition', side_effect=self.definition), \
+                    patch.object(runtime.evaluator, 'install', return_value=runtime.evaluator.identity()), \
                     patch.object(runtime, 'verify_checkout'):
                 self.calls.clear(); self.selection_path.write_text(json.dumps(selection))
                 try:
@@ -125,6 +126,7 @@ class CohortPreparationTests(unittest.TestCase):
                 return result
             with self.subTest(mode=mode), patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
                     patch.object(preparation, 'official_definition', side_effect=definition), \
+                    patch.object(runtime.evaluator, 'install', return_value=runtime.evaluator.identity()), \
                     patch.object(runtime, 'verify_checkout'):
                 self.calls.clear()
                 with self.assertRaises(ValueError):
@@ -142,6 +144,7 @@ class CohortPreparationTests(unittest.TestCase):
         stderr = io.StringIO()
         with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
                 patch.object(preparation, 'official_definition', side_effect=self.definition), \
+                patch.object(runtime.evaluator, 'install', return_value=runtime.evaluator.identity()), \
                 patch.object(runtime, 'verify_checkout'), patch.object(preparation, 'prepare', side_effect=injected), \
                 patch.object(sys, 'argv', argv), contextlib.redirect_stderr(stderr):
             try:

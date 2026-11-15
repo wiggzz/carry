@@ -4,6 +4,14 @@
   "runner_commit": "af5a9cbc311605b5cceb80200ca9832bdff2d7b1",
   "problems_repository": "https://github.com/gabeorlanski/scb-problems",
   "problems_commit": "9cd9ca3a51c3d3e2a99d2488a25baf73a2204451",
+  "evaluator_correction": {
+    "version": "collection-canonical-adder-v1",
+    "module": "src/slop_code/evaluation/collection.py",
+    "before_sha256": "bd5c84a2c7ab56a7afd3cb0587e4f2dd0bc5a0f3920d6006ca13b2dbcb102119",
+    "after_sha256": "6b0dd979497ebd488878a1cd856a4c21974e41b4b0fd5e7ba738bd34dc0abfbb",
+    "edit": "benchmarks/slopcodebench/collection-counts-v1.json",
+    "edit_sha256": "94dc400271ac8c65181e0a439e9a89623f6dc179e066b449fa44586049af8be9"
+  },
   "report_module": "src/slop_code/evaluation/report.py",
   "report_sha256": "5243b72604cee806491934e742f5b6312f778720dd7fd89abd35443d3d7de19e"
 }

@@ -28,9 +28,11 @@ class CohortReadinessTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = cohort_fixture.CohortOutcomeTests().configuration()
+        self.config['evaluator_identity'] = runtime.evaluator.identity()
         self.selection = {'problems': copy.deepcopy(self.config['selection'])}
         self.config['study_selection_sha256'] = comparison.fingerprint(self.selection)
-        self.prepared = {'problems_root': str(self.root/'problems'), 'tasks': {}}
+        self.prepared = {'problems_root': str(self.root/'problems'), 'tasks': {},
+                         'evaluator_identity': runtime.evaluator.identity()}
         self.calls = []
         for name, key in [('agent_image', 'harness_digest'), ('evaluator_image', 'environment_digest'),
                           ('gateway_image', 'gateway_digest'), ('carry_image', 'carry_digest')]:
@@ -54,6 +56,34 @@ class CohortReadinessTests(unittest.TestCase):
 
     def preflight(self, contract, prepared, **kwargs):
         return PREFLIGHT(contract, prepared, execute=self.execute, verify_sources=False, **kwargs)
+
+    def test_missing_evaluator_provenance_rejected_before_external_runtime(self):
+        self.config.pop('evaluator_identity')
+        with self.assertRaisesRegex(ValueError, 'evaluator'):
+            self.preflight(self.config, self.prepared, require_readiness=False)
+        self.assertEqual(self.calls, [])
+
+    def test_old_or_changed_evaluator_receipt_cannot_authorize_runtime(self):
+        for task in self.config['selection']:
+            record = self.prepared['tasks'][task['id']]
+            target = Path(record['readiness']); target.parent.mkdir(parents=True, exist_ok=True)
+            binding = runtime.readiness_binding(self.config, self.prepared, task)
+            binding.pop('evaluator_identity')
+            target.write_text(json.dumps({'status': 'ready', 'binding': binding}))
+        with self.assertRaisesRegex(ValueError, 'readiness'):
+            self.preflight(self.config, self.prepared)
+        self.prepared['evaluator_identity'] = {'version': 'old'}
+        self.calls.clear()
+        with self.assertRaisesRegex(ValueError, 'evaluator'):
+            self.preflight(self.config, self.prepared)
+        self.assertEqual(self.calls, [])
+
+    def test_readiness_binding_changes_with_effective_evaluator(self):
+        task = self.config['selection'][0]
+        first = runtime.readiness_binding(self.config, self.prepared, task)
+        self.config['evaluator_identity'] = {'version': 'new-effective-evaluator'}
+        second = runtime.readiness_binding(self.config, self.prepared, task)
+        self.assertNotEqual(first, second, 'old gold receipt can authorize changed evaluator')
 
     def test_changed_selection_is_rejected_before_external_runtime_or_model(self):
         Path(self.prepared['selection']).write_text(json.dumps({'changed': True}))

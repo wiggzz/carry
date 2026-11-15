@@ -141,6 +141,7 @@ docker:
                 'agent_image': agent, 'evaluator_image': agent, 'gateway_image': gateway, 'carry_image': agent,
                 'prompt': str(prompt), 'environment': str(environment), 'tasks': {'synthetic_evolution': {
                     'definition_sha256': runtime.tree_digest(problem), 'readiness': str(root/'readiness'/'synthetic_evolution.json')}}}
+    contract['evaluator_identity'] = prepared['evaluator_identity'] = runtime.evaluator.install(upstream)
     runtime.activate_upstream(prepared)
     (root/'contract.json').write_text(json.dumps(contract, indent=2)+'\n')
     (root/'prepared.json').write_text(json.dumps(prepared, indent=2)+'\n')

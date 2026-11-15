@@ -71,6 +71,7 @@ def prepare(root, upstream, problems, carry, *, selection_path=None, repetitions
         runtime.verify_checkout(checkout, commit)
     if (selection['runner_commit'], selection['problems_commit']) != (lock['runner_commit'], lock['problems_commit']):
         raise ValueError('study selection and upstream pins differ')
+    evaluator_identity = runtime.evaluator.install(upstream)
     definitions = []
     for task in tasks:
         problem_tree = command(['git', '-C', str(problems), 'rev-parse', 'HEAD:'+task['id']],
@@ -128,6 +129,7 @@ RUN chmod 0555 /opt/swebench-harness/bin/carry
                 'source_commit': source_commit, 'runner_commit': lock['runner_commit'],
                 'dataset_commit': lock['problems_commit'], 'repetitions': repetitions,
                 'study_selection_sha256': fingerprint(selection),
+                'evaluator_identity': evaluator_identity,
                 'selection': [{'id': task['id'], 'checkpoints': task['checkpoints']} for task in tasks],
                 'settings': {'codex_version': CODEX_VERSION, 'codex_sha256': native[1].split()[0],
                     'prompt_sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
@@ -142,7 +144,7 @@ RUN chmod 0555 /opt/swebench-harness/bin/carry
     prepared = {'source_root': str(SOURCE), 'upstream_root': str(upstream), 'problems_root': str(problems),
                 'agent_image': image, 'evaluator_image': image, 'gateway_image': gateway, 'carry_image': image,
                 'prompt': str(prompt), 'environment': str(environment),
-                'selection': str(root/'selection.json'),
+                'selection': str(root/'selection.json'), 'evaluator_identity': evaluator_identity,
                 'tasks': {task['id']: {'definition_sha256': runtime.tree_digest(problems/task['id']),
                                   'readiness': str(root/'readiness'/f'{task["id"]}.json')} for task in tasks}}
     plan(contract)
