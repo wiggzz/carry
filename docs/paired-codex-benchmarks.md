@@ -53,7 +53,11 @@ and `repetitions` workflow inputs. Defaults retain the complete `cfgpipe` pilot
 and one repetition; use at least three for variability. `execute_paid=false`
 remains the default: preparation/gold readiness never authorizes model spend.
 The CLI equivalents are `--selection PATH --repetitions 3` on
-`python -B -m scripts.slopcodebench_prepare`.
+`python -B -m scripts.slopcodebench_prepare`. The source-pinned
+`benchmarks/slopcodebench/luna-cohort.json` selects six previously proposed
+problems and their complete 32 checkpoints for dependency/gold qualification;
+use `execute_paid=false`. It is not model-run approval, a measured long-context
+stratum, or a renewed spend allowance.
 
 A multi-problem selection keeps the pilot's `runner_commit`, `problems_commit`,
 `primary_model`, `primary_reasoning`, `reviewer_model` and `reviewer_reasoning`,

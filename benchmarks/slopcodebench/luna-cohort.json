@@ -1,0 +1,80 @@
+{
+  "runner_commit": "af5a9cbc311605b5cceb80200ca9832bdff2d7b1",
+  "problems_commit": "9cd9ca3a51c3d3e2a99d2488a25baf73a2204451",
+  "primary_model": "gpt-6-luna",
+  "primary_reasoning": "medium",
+  "reviewer_model": "gpt-6-luna",
+  "reviewer_reasoning": "low",
+  "phase": "Pinned preparation/gold qualification selection only; no model dispatch or renewed spend authority.",
+  "selection_rationale": "Six previously proposed domains across Easy/Medium/Hard metadata; complete checkpoint chains. Checkpoint count is only a horizon proxy, not measured long context or representative efficacy. Selection is not based on Carry wins; cfgpipe retains the already consumed pilot comparator. Require actual direct-baseline horizons and paired all-attempt cost/official quality in any separately authorized study.",
+  "problems": [
+    {
+      "id": "cfgpipe",
+      "problem_tree_sha": "76e7313b7594277d6347fffb850d54e01a30bc45",
+      "checkpoints": [
+        "checkpoint_1",
+        "checkpoint_2",
+        "checkpoint_3",
+        "checkpoint_4",
+        "checkpoint_5",
+        "checkpoint_6"
+      ]
+    },
+    {
+      "id": "circuit_eval",
+      "problem_tree_sha": "0b779bb21c34324446c332925425409bf501c271",
+      "checkpoints": [
+        "checkpoint_1",
+        "checkpoint_2",
+        "checkpoint_3",
+        "checkpoint_4",
+        "checkpoint_5",
+        "checkpoint_6",
+        "checkpoint_7",
+        "checkpoint_8"
+      ]
+    },
+    {
+      "id": "dag_execution",
+      "problem_tree_sha": "29509494b463cc94bc1582920922255c40e4dcee",
+      "checkpoints": [
+        "checkpoint_1",
+        "checkpoint_2",
+        "checkpoint_3"
+      ]
+    },
+    {
+      "id": "database_migration",
+      "problem_tree_sha": "c3f21a91726afd9b1095efb06c5c7b849b174394",
+      "checkpoints": [
+        "checkpoint_1",
+        "checkpoint_2",
+        "checkpoint_3",
+        "checkpoint_4",
+        "checkpoint_5"
+      ]
+    },
+    {
+      "id": "etl_pipeline",
+      "problem_tree_sha": "ad3fa1b12aafda62d75be9cd8e8f9481df7b2a1c",
+      "checkpoints": [
+        "checkpoint_1",
+        "checkpoint_2",
+        "checkpoint_3",
+        "checkpoint_4",
+        "checkpoint_5"
+      ]
+    },
+    {
+      "id": "file_query_tool",
+      "problem_tree_sha": "9aa227bd0fa3d23aef2f99e8214dddc3caa4e1b7",
+      "checkpoints": [
+        "checkpoint_1",
+        "checkpoint_2",
+        "checkpoint_3",
+        "checkpoint_4",
+        "checkpoint_5"
+      ]
+    }
+  ]
+}
