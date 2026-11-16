@@ -57,7 +57,10 @@ fn expired_totals_read_each_retained_observation_once() {
             let began = std::time::Instant::now();
             let (totals, usage) = store.expired_accounting_totals().unwrap();
             let reads = misses(0);
-            eprintln!("expired-totals-resources: observations={observations} owners={owners} poll={poll} cache_misses={reads} elapsed_us={}", began.elapsed().as_micros());
+            eprintln!(
+                "expired-totals-resources: observations={observations} owners={owners} poll={poll} cache_misses={reads} elapsed_us={}",
+                began.elapsed().as_micros()
+            );
             assert_eq!(totals.excluded_sessions, owners);
             assert_eq!(usage.primary.calls, owners * 7);
             assert!((usage.primary.cost_usd - owners as f64 * 0.125).abs() < 1e-12);
