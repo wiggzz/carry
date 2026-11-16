@@ -96,8 +96,9 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
         runtime.activate_upstream(self.prepared)
         from slop_code.execution import runtime as registry
         _, environment, _ = runtime.official_components(self.prepared, self.contract, 'synthetic_evolution')
-        environment = environment.model_copy(deep=True)
-        environment.setup.eval_commands = ['uv init', 'uv add -r requirements.txt']
+        environment = environment.model_copy(update={
+            'setup': environment.setup.model_copy(update={
+                'eval_commands': ['uv init', 'uv add -r requirements.txt']})})
         with tempfile.TemporaryDirectory(dir=self.root) as directory:
             workspace = Path(directory)
             # deepdiff exists in the warmed pytest cache, NOT base Python.
