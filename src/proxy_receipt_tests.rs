@@ -1337,7 +1337,15 @@ fn receipt_failed_reviewer_does_not_invalidate_primary_or_traditional_cache() {
             assert!((after.traditional_cost - before.traditional_cost - expected).abs() < 1e-12);
             assert_eq!(after.coverage.failed_calls, 1);
             assert_eq!(after.coverage.primary_responses, 2);
-            assert_eq!(after.reviewer_cost, 0.0);
+            assert_eq!(after.coverage.reviewer_responses, 1);
+            // Terminal outcome cannot erase an independently priced native receipt.
+            let paid_reviewer = (1000.0 * 2.0 + 10.0 * 10.0) / 1e6;
+            assert!((after.reviewer_cost - paid_reviewer).abs() < 1e-12);
+            assert!((after.observed_reviewer_cost.unwrap() - paid_reviewer).abs() < 1e-12);
+            assert!((after.carry_cost - (4100.0 * 2.0 / 1e6 + paid_reviewer)).abs() < 1e-12);
+            assert_eq!(after.excluded_failed_calls, 0);
+            assert_eq!(after.matched_primary_responses, 2);
+            assert!(after.priced);
         }
     }
 }
@@ -1787,7 +1795,27 @@ fn receipt_unmodeled_actuals_are_unknown_and_coverage_reconciles() {
     let mut totals = DashboardTotals::default();
     totals.observe(&t.snapshot().dashboard(false));
     let aggregate = serde_json::to_value(totals).unwrap();
-    assert_eq!(aggregate["matched_primary_responses"], 2);
+    assert_eq!(
+        aggregate["matched_primary_responses"], 0,
+        "an incomplete session cannot enter the complete-comparison denominator"
+    );
+    assert_eq!(aggregate["included_sessions"], 0);
+    assert_eq!(aggregate["excluded_sessions"], 1);
+    assert!(aggregate["carry_cost"].is_null());
+    assert!(aggregate["traditional_cost"].is_null());
+    assert_eq!(aggregate["quantity_evidence"]["total_primary_responses"], 3);
+    for field in [
+        "measured_priced_calls",
+        "estimated_priced_calls",
+        "unavailable_quantity_calls",
+    ] {
+        assert_eq!(
+            aggregate["quantity_evidence"][field],
+            public["quantity_evidence"][field]
+        );
+    }
+    let known_paid = (3100.0 * 2.0 + 1000.0 * 0.1 + 10.0 * 10.0) / 1e6;
+    assert!((t.snapshot().observed_primary_cost.unwrap() - known_paid).abs() < 1e-12);
     assert_eq!(
         aggregate["observed_primary_cost"],
         public["observed_primary_cost"]
@@ -2016,7 +2044,17 @@ fn receipt_priced_subset_recovers_into_paid_summary_after_unknown_quantities() {
         true,
     );
     let omitted = t.snapshot();
-    assert!(omitted.priced);
+    assert!(
+        !omitted.priced,
+        "one unknown attempt prevents complete all-outcome pricing"
+    );
+    let public = serde_json::to_value(omitted.clone().dashboard(false)).unwrap();
+    assert!(public["carry_cost"].is_null());
+    assert!(public["traditional_cost"].is_null());
+    assert_eq!(
+        public["quantity_evidence"]["comparison_scope"],
+        "matched_subset_not_whole_session"
+    );
     assert_eq!(omitted.matched_primary_responses, 1);
     assert_eq!(omitted.excluded_unpriced_calls, 1);
     assert_eq!(omitted.carry_cost, before.carry_cost);
@@ -2059,10 +2097,26 @@ fn receipt_priced_subset_recovers_into_paid_summary_after_unknown_quantities() {
     assert_eq!(t.snapshot().traditional_compactions, 1);
     assert_eq!(t.snapshot().summary_cost, summary.summary_cost);
     assert_eq!(t.history.last_traditional_input, 1700);
+    assert!(
+        !t.snapshot().priced,
+        "later quantity recovery cannot price the missing receipt"
+    );
+    assert_eq!(t.snapshot().unavailable_primary_cost_calls, 1);
+    assert_eq!(t.snapshot().excluded_unpriced_calls, 1);
+    assert_eq!(
+        t.snapshot().observed_reviewer_cost,
+        before.observed_reviewer_cost
+    );
+    assert!(
+        (t.snapshot().observed_primary_cost.unwrap()
+            - ((4800 + next_native) as f64 * 2.0 + 1000.0 * 10.0) / 1e6)
+            .abs()
+            < 1e-12
+    );
 }
 
 #[test]
-fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
+fn receipt_missing_or_conflicting_usage_remains_unknown_not_projected() {
     for variant in [
         "no_cache",
         "overlap",
@@ -2070,7 +2124,6 @@ fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
         "null_write",
         "invalid_write",
         "missing",
-        "failed",
     ] {
         let mut t = Trajectory::default();
         let mut r = terminal(2000, 1000, 100, 10);
@@ -2088,7 +2141,7 @@ fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
                 r["usage"]["input_tokens_details"]["cache_write_tokens"] = json!("100")
             }
             "missing" => r["usage"] = Value::Null,
-            _ => r["status"] = json!("failed"),
+            _ => unreachable!(),
         }
         t.primary(&body(), &r, "route", 100, true);
         t.reviewer(&body(), &r, true);
@@ -2098,6 +2151,55 @@ fn receipt_missing_conflicting_and_failed_usage_remain_unknown_not_projected() {
         );
         assert_eq!(t.snapshot().carry_cost, 0.0, "{variant}");
         assert_eq!(t.snapshot().traditional_cost, 0.0, "{variant}");
+    }
+}
+
+#[test]
+fn receipt_failed_usage_keeps_paid_money_without_retained_output() {
+    for status in ["failed", "incomplete"] {
+        for restart in [false, true] {
+            let mut t = Trajectory {
+                scenario: Scenario {
+                    context_window: 2300,
+                    reserve: 100,
+                    keep_recent: 100,
+                    summary: 20,
+                },
+                ..Trajectory::default()
+            };
+            let mut receipt = terminal(2000, 1000, 100, 10);
+            receipt["status"] = json!(status);
+            // This would cross the summary threshold if failed output were retained.
+            receipt["output"] = json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible ".repeat(1000)}]}]);
+            t.primary(&body(), &receipt, "route", 100, true);
+            t.reviewer(&body(), &receipt, true);
+            if restart {
+                t = serde_json::from_value(state(&t)).unwrap();
+            }
+            let e = t.snapshot();
+            // Frozen catalog USD/million: input2, read0.1, write2.5, output10.
+            let paid = (900.0 * 2.0 + 1000.0 * 0.1 + 100.0 * 2.5 + 10.0 * 10.0) / 1e6;
+            assert!((e.observed_primary_cost.unwrap() - paid).abs() < 1e-12);
+            assert!((e.observed_reviewer_cost.unwrap() - paid).abs() < 1e-12);
+            assert!((e.carry_cost - 2.0 * paid).abs() < 1e-12);
+            assert!((e.traditional_cost - paid).abs() < 1e-12);
+            assert!((e.reviewer_cost - paid).abs() < 1e-12);
+            assert_eq!(e.coverage.primary_responses, 1);
+            assert_eq!(e.coverage.reviewer_responses, 1);
+            assert_eq!(e.coverage.failed_calls, 2);
+            assert_eq!(e.matched_primary_responses, 1);
+            assert_eq!(e.excluded_failed_calls, 0);
+            assert_eq!(e.unavailable_primary_cost_calls, 0);
+            assert_eq!(e.unavailable_reviewer_cost_calls, 0);
+            assert!(e.priced);
+            assert_eq!(e.traditional_compactions, 0);
+            assert_eq!(e.initial_compactions, 0);
+            assert_eq!(e.summary_cost, 0.0);
+            assert_eq!(t.history.retired, 0);
+            assert_eq!(t.history.summary, 0);
+            assert_eq!(state(&t)["receipts"]["modeled_cache"]["writes"], json!([]));
+            assert!(state(&t)["receipts"]["anchor"].is_null());
+        }
     }
 }
 

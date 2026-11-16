@@ -1594,17 +1594,32 @@ mod whole_window_tests {
             },
             ..Estimate::default()
         };
-        let d = serde_json::to_value(e.dashboard(false)).unwrap();
+        let frozen = serde_json::to_value(&e).unwrap();
+        let d = serde_json::to_value(e.clone().dashboard(false)).unwrap();
         assert_eq!(d["whole_window"]["carry_cost"], 15.0);
         assert_eq!(d["whole_window"]["traditional_cost"], 30.0);
         assert_eq!(d["whole_window"]["savings"], 15.0);
         assert_eq!(d["whole_window"]["savings_percent"], 50.0);
         assert_eq!(d["whole_window"]["inferred_primary_responses"], 5);
-        assert_eq!(
-            d["carry_cost"], 5.0,
-            "original evidentiary sums remain immutable"
+        assert!(
+            d["carry_cost"].is_null(),
+            "one strict pair cannot represent six attempts"
         );
-        assert_eq!(d["traditional_cost"], 4.0);
+        assert!(d["traditional_cost"].is_null());
+        assert_eq!(d["matched_primary_responses"], 1);
+        assert_eq!(
+            d["quantity_evidence"]["comparison_scope"],
+            "matched_subset_not_whole_session"
+        );
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            frozen,
+            "dashboard projection cannot rewrite original evidentiary sums"
+        );
+        assert_eq!(e.carry_cost, 5.0);
+        assert_eq!(e.traditional_cost, 4.0);
+        assert_eq!(e.observed_primary_cost, Some(12.0));
+        assert_eq!(e.observed_reviewer_cost, Some(3.0));
     }
 
     #[test]
