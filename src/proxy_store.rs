@@ -13,9 +13,11 @@ fn expired_totals_read_each_retained_observation_once() {
         let store =
             Store::open_policy(&Policy::fixture(directory.path()), HashSet::new(), true).unwrap();
         let owners = 32;
-        let mut primary = carry::core::UsageLedger::default();
-        primary.calls = 7;
-        primary.cost_usd = 0.125;
+        let primary = carry::core::UsageLedger {
+            calls: 7,
+            cost_usd: 0.125,
+            ..Default::default()
+        };
         let data = serde_json::to_vec(&json!({
             "primary":primary, "reviewer":carry::core::UsageLedger::default(),
             "estimate":null, "padding":"x".repeat(8192)
