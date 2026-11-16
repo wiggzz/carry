@@ -112,7 +112,7 @@ working sets, and the reference limit bounds concurrently pinned owners, not
 total retained sessions. Ordinary bounded writes are attempted optimistically;
 actual transaction/file limits and maintenance headroom still apply. The separate
 `--history-disk-bytes` ceiling refuses local persistence rather than evicting
-unexpired evidence. If actual write admission or local
+unexpired evidence. If actual write admission, SQLite open/permission/I/O, or local
 storage writes fail, self-contained requests instead use the ordinary upstream
 transport with the caller's original payload, without selection, new reviews or
 durable accounting. Pre-dispatch degradation returns
@@ -124,9 +124,9 @@ failure never retries generation or aborts otherwise valid JSON/SSE output; an
 existing pending marker remains conservative if even paid-only settlement fails.
 Already-sent response headers cannot report a later persistence failure; the
 bounded diagnostic lane receives a privacy-safe `storage_unavailable` warning
-and checkpoint/accounting publication outcomes when available. These warnings use the
-existing fixed-capacity nonblocking queue; full queues or failed sinks may drop
-it and never create a retry/flush obligation on the response owner. Lost local
+and checkpoint/accounting publication outcomes when available. These warnings use
+the existing fixed-capacity nonblocking queue; full queues or failed sinks may drop
+them and never create a retry/flush obligation on the response owner. Lost local
 history/accounting is accepted, not backfilled or represented as known zero cost.
 Absence of a diagnostic is not proof of persistence or complete coverage.
 Maintenance collects expired history within its own bounded disk reserve.

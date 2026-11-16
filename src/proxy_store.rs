@@ -7,9 +7,18 @@ use serde::{Serialize, de::DeserializeOwned};
 
 pub(super) fn error(e: rusqlite::Error) -> std::io::Error {
     let kind = match &e {
-        rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::DiskFull => {
-            std::io::ErrorKind::StorageFull
-        }
+        rusqlite::Error::SqliteFailure(code, _) => match code.code {
+            rusqlite::ErrorCode::DiskFull => std::io::ErrorKind::StorageFull,
+            rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::PermissionDenied => {
+                std::io::ErrorKind::PermissionDenied
+            }
+            rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::SystemIoFailure => {
+                std::io::ErrorKind::Other
+            }
+            // Unavailable storage is not corrupt data. Conversely, malformed
+            // authority/schema/records still fail closed and are never reset.
+            _ => std::io::ErrorKind::InvalidData,
+        },
         _ => std::io::ErrorKind::InvalidData,
     };
     std::io::Error::new(kind, e)
