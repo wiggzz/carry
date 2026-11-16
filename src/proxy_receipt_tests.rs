@@ -852,48 +852,100 @@ fn receipt_current_projection_repeats_changes_and_retains_without_accumulation()
 
 #[test]
 fn receipt_projection_preserves_legitimate_summary_retirement_and_failed_paid_scope() {
-    let mut t = Trajectory {
-        scenario: Scenario {
-            context_window: 3600,
-            reserve: 100,
-            keep_recent: 100,
-            summary: 50,
-        },
-        ..Trajectory::default()
-    };
-    // Establish an in-window trajectory before crossing the summary threshold.
-    // An already-oversized unknown first request now initializes for free.
-    let mut request = body();
-    t.primary(&request, &terminal(3000, 0, 0, 0), "route", 99, true);
-    request["input"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"role":"user","content":"in-window growth"}));
-    t.primary(&request, &terminal(4000, 0, 0, 0), "route", 100, true);
-    assert_eq!(t.snapshot().initial_compactions, 0);
-    assert_eq!(t.snapshot().traditional_compactions, 1);
-    let retired = t.history.retired;
-    let summary = t.history.summary;
-    for at in [101, 102, 103] {
-        t.projected(5000, 4000, true);
-        let before = t.snapshot();
-        if at == 102 {
-            let mut failed = terminal(3500, 0, 0, 0);
-            failed["status"] = json!("failed");
-            t.primary(&body(), &failed, "route", at, true);
-            assert_eq!(t.snapshot().traditional_cost, before.traditional_cost);
-            assert_eq!(t.snapshot().carry_cost, before.carry_cost);
-            assert_eq!(t.snapshot().coverage.failed_calls, 1);
-        }
-        t.primary(&body(), &terminal(3500, 0, 0, 0), "route", at, true);
-        assert_eq!(t.history.retired, retired);
-        assert_eq!(t.history.summary, summary);
-        assert_eq!(t.history.last_traditional_input, 4500 - retired + summary);
+    for failed_output in [0, 10] {
+        let mut t = Trajectory {
+            scenario: Scenario {
+                context_window: 3600,
+                reserve: 100,
+                keep_recent: 100,
+                summary: 50,
+            },
+            ..Trajectory::default()
+        };
+        // Establish in-window history before a charged summary. An oversized
+        // unknown first request instead initializes for free.
+        let mut request = body();
+        t.primary(&request, &terminal(3000, 0, 0, 0), "route", 99, true);
+        request["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"in-window growth"}));
+        t.primary(&request, &terminal(4000, 0, 0, 0), "route", 100, true);
+        assert_eq!(t.snapshot().initial_compactions, 0);
         assert_eq!(t.snapshot().traditional_compactions, 1);
-        t = serde_json::from_value(state(&t)).unwrap();
+        let retired = t.history.retired;
+        let summary = t.history.summary;
+        for at in [101, 102, 103] {
+            t.projected(5000, 4000, true);
+            let before = t.snapshot();
+            if at == 102 {
+                let history = serde_json::to_value(&t.history).unwrap();
+                let cache = state(&t)["receipts"]["modeled_cache"].clone();
+                let mut failed = terminal(3500, 0, 0, failed_output);
+                failed["status"] = json!("failed");
+                t.primary(&body(), &failed, "route", at, true);
+                let after = t.snapshot();
+                // The real failed receipt is paid. The alternative attempts its
+                // own retained input plus the same billed output, without an
+                // invented retry, retained output, summary or new cache write.
+                let alternative = 3500 + 1000 - retired + summary;
+                assert_eq!(alternative, 650);
+                let traditional = (alternative as f64 * 2.0 + failed_output as f64 * 10.0) / 1e6;
+                let native = (3500.0 * 2.0 + failed_output as f64 * 10.0) / 1e6;
+                assert!(
+                    (after.traditional_cost - before.traditional_cost - traditional).abs() < 1e-12
+                );
+                assert!((after.carry_cost - before.carry_cost - native).abs() < 1e-12);
+                assert!(
+                    (after.observed_primary_cost.unwrap()
+                        - before.observed_primary_cost.unwrap()
+                        - native)
+                        .abs()
+                        < 1e-12
+                );
+                assert_eq!(after.coverage.failed_calls, 1);
+                assert_eq!(
+                    after.matched_primary_responses,
+                    before.matched_primary_responses + 1
+                );
+                assert_eq!(after.excluded_failed_calls, 0);
+                assert_eq!(after.summary_cost, before.summary_cost);
+                assert_eq!(
+                    after.traditional_compactions,
+                    before.traditional_compactions
+                );
+                assert_eq!(serde_json::to_value(&t.history).unwrap(), history);
+                assert_eq!(state(&t)["receipts"]["modeled_cache"], cache);
+                // Reload the failed paid state before the actual next success.
+                t = serde_json::from_value(state(&t)).unwrap();
+                let restored = t.snapshot();
+                assert!((restored.carry_cost - after.carry_cost).abs() < 1e-12);
+                assert!((restored.traditional_cost - after.traditional_cost).abs() < 1e-12);
+                assert_eq!(
+                    restored.matched_primary_responses,
+                    after.matched_primary_responses
+                );
+                assert_eq!(restored.coverage.failed_calls, 1);
+            }
+            t.primary(&body(), &terminal(3500, 0, 0, 0), "route", at, true);
+            assert_eq!(t.history.retired, retired);
+            assert_eq!(t.history.summary, summary);
+            assert_eq!(t.history.last_traditional_input, 4500 - retired + summary);
+            assert_eq!(t.snapshot().traditional_compactions, 1);
+            t = serde_json::from_value(state(&t)).unwrap();
+        }
+        let final_state = t.snapshot();
+        assert_eq!(final_state.coverage.primary_responses, 6);
+        assert_eq!(final_state.matched_primary_responses, 6);
+        assert_eq!(final_state.coverage.failed_calls, 1);
+        assert_eq!(final_state.excluded_failed_calls, 0);
+        assert_eq!(final_state.excluded_unpriced_calls, 0);
+        assert_eq!(final_state.unavailable_primary_cost_calls, 0);
+        assert!(final_state.priced);
+        let actual = ((3000.0 + 4000.0 + 4.0 * 3500.0) * 2.0 + failed_output as f64 * 10.0) / 1e6;
+        assert!((final_state.carry_cost - actual).abs() < 1e-12);
+        assert!((final_state.observed_primary_cost.unwrap() - actual).abs() < 1e-12);
     }
-    assert_eq!(t.snapshot().coverage.primary_responses, 5);
-    assert_eq!(t.snapshot().excluded_failed_calls, 1);
 }
 
 #[test]

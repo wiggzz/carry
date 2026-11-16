@@ -451,65 +451,102 @@ fn cache_write191_divergent_history_uses_frozen_branch_tiers_and_independent_cac
 
 #[test]
 fn cache_write191_post_summary_cold_then_warm_obeys_mode_after_restart() {
+    use crate::savings::SummaryStrategy::*;
     for mode in ["implicit", "explicit"] {
-        let mut t = Trajectory {
-            scenario: Scenario {
-                context_window: 3000,
-                reserve: 100,
-                keep_recent: 1200,
-                summary: 20,
-            },
-            ..Trajectory::default()
-        };
-        let mut request = body();
-        request["prompt_cache_options"] = json!({"mode":mode,"ttl":"30m"});
-        // Prime a recognized in-window history, then cross the threshold.
-        // Keep the original charged-summary/write-tariff controls unchanged.
-        t.primary(&request, &terminal(2800, 0, 0, 0), "fixture", 99, true);
-        request["input"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role":"user","content":"in-window growth"}));
-        t.primary(&request, &terminal(3000, 3000, 0, 0), "fixture", 100, true);
-        let first = t.snapshot();
-        assert_eq!(first.initial_compactions, 0);
-        assert!(first.priced);
-        assert_eq!(first.traditional_compactions, 1);
-        // Summary request is ordinary uncached at its own input tier.
-        assert!((first.summary_cost - (1800.0 * 2.0 + 20.0 * 10.0) / 1e6).abs() < 1e-12);
-        let mut expected = first.traditional_cost;
-        for (index, input) in [3100, 3200].into_iter().enumerate() {
-            t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+        for strategy in [ReplacementCold, AppendedHistory, ConservativeLower] {
+            let mut t = Trajectory {
+                summary_strategy: strategy,
+                scenario: Scenario {
+                    context_window: 3000,
+                    reserve: 100,
+                    keep_recent: 1200,
+                    summary: 20,
+                },
+                ..Trajectory::default()
+            };
+            let mut request = body();
+            request["prompt_cache_options"] = json!({"mode":mode,"ttl":"30m"});
+            // Prime recognized in-window history, then cross the threshold.
+            t.primary(&request, &terminal(2800, 0, 0, 0), "fixture", 99, true);
             request["input"]
                 .as_array_mut()
                 .unwrap()
-                .push(json!({"role":"user","content":"continue"}));
-            t.primary(
-                &request,
-                &terminal(input, 3000, 0, 0),
-                "fixture",
-                101 + index as u64,
-                true,
-            );
-            let alternative = input - 1780;
-            let cached = if mode == "implicit" && index > 0 {
-                1320
+                .push(json!({"role":"user","content":"in-window growth"}));
+            t.primary(&request, &terminal(3000, 3000, 0, 0), "fixture", 100, true);
+            let frozen = serde_json::to_vec(&t).unwrap();
+            let first = t.snapshot();
+            assert_eq!(serde_json::to_vec(&t).unwrap(), frozen);
+            assert_eq!(first.initial_compactions, 0);
+            assert!(first.priced);
+            assert_eq!(first.matched_primary_responses, 2);
+            assert_eq!(first.traditional_compactions, 1);
+            // Absolute scenario oracles: both pay for 64 NEW instruction units
+            // and 20 generated output units. Only appended prior INPUT is warm.
+            // Implicit misses pay the frozen write tariff; explicit-only without
+            // breakpoints is disabled and pays ordinary uncached input instead.
+            let miss_rate = if mode == "implicit" { 2.5 } else { 2.0 };
+            let cold: f64 = ((1800.0 + 64.0) * miss_rate + 20.0 * 10.0) / 1e6;
+            let appended = if mode == "implicit" {
+                (3000.0 * 0.1 + 64.0 * 2.5 + 20.0 * 10.0) / 1e6
             } else {
-                0
+                ((3000.0 + 64.0) * 2.0 + 20.0 * 10.0) / 1e6
             };
-            expected += if mode == "implicit" {
-                (cached as f64 * 0.1 + (alternative - cached) as f64 * 2.5) / 1e6
-            } else {
-                alternative as f64 * 2.0 / 1e6
+            let summary_cost = match strategy {
+                ReplacementCold => cold,
+                AppendedHistory => appended,
+                ConservativeLower => cold.min(appended),
             };
-            let after = t.snapshot();
-            assert!(after.priced);
-            assert_eq!(after.traditional_compactions, 1);
-            assert_eq!(after.summary_cost, first.summary_cost);
             assert!(
-                (after.traditional_cost - expected).abs() < 1e-12,
-                "{mode} post-summary price"
+                (first.summary_cost - summary_cost).abs() < 1e-12,
+                "{mode}/{strategy:?} summary price"
             );
+            let mut actual = (2800.0 * 2.0 + 3000.0 * 0.1) / 1e6;
+            let mut expected = actual + summary_cost;
+            assert!((first.traditional_cost - expected).abs() < 1e-12);
+            assert!((first.observed_primary_cost.unwrap() - actual).abs() < 1e-12);
+            for (index, input) in [3100, 3200].into_iter().enumerate() {
+                t = serde_json::from_slice(&serde_json::to_vec(&t).unwrap()).unwrap();
+                request["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"user","content":"continue"}));
+                t.primary(
+                    &request,
+                    &terminal(input, 3000, 0, 0),
+                    "fixture",
+                    101 + index as u64,
+                    true,
+                );
+                let alternative = input - 1780;
+                let cached = if mode == "implicit" && index > 0 {
+                    1320
+                } else {
+                    0
+                };
+                expected += if mode == "implicit" {
+                    (cached as f64 * 0.1 + (alternative - cached) as f64 * 2.5) / 1e6
+                } else {
+                    alternative as f64 * 2.0 / 1e6
+                };
+                actual += ((input - 3000) as f64 * 2.0 + 3000.0 * 0.1) / 1e6;
+                let frozen = serde_json::to_vec(&t).unwrap();
+                let after = t.snapshot();
+                assert_eq!(serde_json::to_vec(&t).unwrap(), frozen);
+                assert!(after.priced);
+                assert_eq!(after.initial_compactions, 0);
+                assert_eq!(after.matched_primary_responses, 3 + index as u64);
+                assert_eq!(after.excluded_unpriced_calls, 0);
+                assert_eq!(after.unavailable_primary_cost_calls, 0);
+                assert_eq!(after.traditional_compactions, 1);
+                assert!((after.summary_cost - summary_cost).abs() < 1e-12);
+                assert!((after.observed_primary_cost.unwrap() - actual).abs() < 1e-12);
+                assert!((after.carry_cost - actual).abs() < 1e-12);
+                assert!(
+                    (after.traditional_cost - expected).abs() < 1e-12,
+                    "{mode}/{strategy:?} post-summary cold-once then own-prefix warm"
+                );
+                assert!((after.savings - (expected - actual)).abs() < 1e-12);
+            }
         }
     }
 }
