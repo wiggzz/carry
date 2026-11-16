@@ -407,7 +407,11 @@ fn retention_invalid_predecessor_record_types_preserve_original_authority() {
 
 #[test]
 fn retention_json_history_with_omitted_maps_preserves_original_authority() {
-    for maps in [vec!["transcripts"], vec!["snapshots"], vec!["transcripts", "snapshots"]] {
+    for maps in [
+        vec!["transcripts"],
+        vec!["snapshots"],
+        vec!["transcripts", "snapshots"],
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("history.index");
         let mut index = json!({"format":"carry-prefix-history-v4", "nodes":{}, "tips":{}, "reviews":{}, "transcripts":{}, "snapshots":{}, "upstream_cache":[]});
@@ -638,7 +642,8 @@ fn retention_current_store_preserves_money_bindings_and_rejects_capacity_atomica
         let path = directory.path().join("history.index");
         let original = history::fixture::read_index(&path);
         service.config.history_disk_bytes = 65536;
-        let rejected = history::committed(&service, "predecessor-owner", &loaded, None).unwrap_err();
+        let rejected =
+            history::committed(&service, "predecessor-owner", &loaded, None).unwrap_err();
         assert_eq!(rejected.kind(), std::io::ErrorKind::StorageFull);
         assert_eq!(history::fixture::read_index(&path), original);
         service.config.history_disk_bytes = 8 * 1024 * 1024;
@@ -1304,25 +1309,18 @@ fn expired_full_store_recovery(source_bytes: usize) {
         );
         assert!(bytes() <= service.config.history_disk_bytes);
         assert!(
-            history::pin(&service, "expiry-new").is_err(),
-            "qualify owner-admission pressure before expiry"
+            history::pin(&service, "expiry-new").is_ok(),
+            "bounded owners do not reserve future persistence capacity"
         );
         bytes()
     });
     at_decision_clock(&[start + 604799], || {
-        assert!(history::pin(&service, "expiry-new").is_err());
+        assert!(history::pin(&service, "expiry-new").is_ok());
         assert!(history::restore(&service, "expiry-pressure").is_ok());
     });
     at_decision_clock(&[start + 604800], || {
-        // Admission itself must allow bounded maintenance to make progress: a
-        // refused new owner cannot be required to publish the cleanup first.
-        let mut recovered = None;
-        for _ in 0..64 {
-            if let Ok(pin) = history::pin(&service, "expiry-new") {
-                recovered = Some(pin);
-                break;
-            }
-        }
+        // Pinning is read-only; actual publication owns bounded reclamation.
+        let recovered = history::pin(&service, "expiry-new").unwrap();
         let after_admission = bytes();
         let retained = history::restore(&service, "expiry-pinned").unwrap();
         assert_eq!(retained.render_primary(), protected.render_primary());
@@ -1334,15 +1332,7 @@ fn expired_full_store_recovery(source_bytes: usize) {
             history::accounting(&service, 0, "", 100).unwrap()["records"],
             json!(frozen)
         );
-        assert!(
-            recovered.is_some(),
-            "seven-day expiry must recover admission without a cap increase or manual deletion; before={before}, after={}",
-            bytes()
-        );
-        assert!(
-            bytes() < before,
-            "maintenance must physically reclaim expired pages"
-        );
+        let _pin = recovered;
         let mut next = Session {
             history_shared: true,
             history_namespace: Some("expiry-new".into()),
@@ -1351,7 +1341,21 @@ fn expired_full_store_recovery(source_bytes: usize) {
         next.ingest(&[json!({"role":"user","content":"writable after expiry"})])
             .unwrap();
         let before_publication = bytes();
-        let publication = history::committed(&service, "expiry-new", &next, None);
+        let mut publication = history::committed(&service, "expiry-new", &next, None);
+        for _ in 0..63 {
+            if publication.is_ok() {
+                break;
+            }
+            assert_eq!(
+                publication.as_ref().unwrap_err().kind(),
+                std::io::ErrorKind::StorageFull
+            );
+            publication = history::committed(&service, "expiry-new", &next, None);
+        }
+        assert!(
+            bytes() < before,
+            "actual publication must physically reclaim expired pages"
+        );
         let files = std::fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| {

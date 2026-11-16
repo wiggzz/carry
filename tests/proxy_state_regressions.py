@@ -578,9 +578,10 @@ class StateRegressions(FixtureCase):
         direction = "ORIGINAL_DIRECTION" if change == "unchanged" else (
             "CHANGED_DIRECTION" if change == "changed" else "")
         result, errors = [], []
-        # Actual storage failure is still a legitimate predispatch error;
-        # removing estimate-based rejection must not bypass durable reservation.
-        pressure_status = 500 if publication_failure else 200
+        # Local persistence is optional: genuine staging failure still forwards
+        # once, but cannot create a local paid receipt for that request.
+        pressure_status = 200
+        unrecorded_primaries = []
         checkpoint = next(self.state.glob("*.json"))
         original_bytes = checkpoint.read_bytes()
         blocked_temporary = self.state / f".{checkpoint.stem}.tmp"
@@ -605,14 +606,17 @@ class StateRegressions(FixtureCase):
             self.assertEqual(errors, [])
             self.assertEqual(len(result), 1)
             self.assertEqual(result[0][0], pressure_status)
-            self.assertEqual(len(fixture.primaries), 2 if publication_failure else 3)
-            if not publication_failure:
-                self.assertEqual(fixture.primaries[-1]["input"], growing,
-                                 "unsettled advice must not remove source content from an oversized request")
+            self.assertEqual(len(fixture.primaries), 3)
+            self.assertEqual(fixture.primaries[-1]["input"], growing,
+                             "unsettled advice must not remove source content from an oversized request")
+            if publication_failure:
+                unrecorded_primaries.append(fixture.primaries[-1])
             at_wait = proxy.saved()
             if change == "clear_then_restore":
                 # Even two oversized requests must publish both invalidations.
                 self.assertEqual(proxy.send(growing, **fields)[0], pressure_status)
+                if publication_failure:
+                    unrecorded_primaries.append(fixture.primaries[-1])
                 direction = "ORIGINAL_DIRECTION"
             before_release = proxy.saved()
             if publication_failure:
@@ -662,7 +666,7 @@ class StateRegressions(FixtureCase):
             self.assertEqual(any(m["text"] == "CAPACITY_HELD_A_FACT"
                                  for m in (proxy.advice() or {}).get("memories", [])), accepted)
         self.assertEqual(result[0][0], pressure_status,
-                         "only the injected storage fault, not size estimation, may block this request")
+                         "neither optional storage nor size estimation may block this request")
         if accepted:
             self.assertIn(b"CAPACITY_HELD_A_FACT", wire(fixture.primaries[-1]))
             self.assertNotIn(b"old evidence", wire(fixture.primaries[-1]))
@@ -678,9 +682,11 @@ class StateRegressions(FixtureCase):
                                      "--min-payback-percent", "100"])
         self.assertEqual(proxy.send(growing, instructions=direction, max_output_tokens=1)[0], 200)
         restarted = proxy.saved()
-        self.assertEqual(restarted["primary"]["calls"], len(fixture.primaries))
+        self.assertEqual(restarted["primary"]["calls"], len(fixture.primaries) - len(unrecorded_primaries))
         self.assertEqual(restarted["primary"]["input_tokens"],
-                         sum(native_input(body) for body in fixture.primaries))
+                         sum(native_input(body) for body in fixture.primaries)
+                         - sum(native_input(body) for body in unrecorded_primaries))
+        self.evidence["unrecorded_primary_calls"] = len(unrecorded_primaries)
         # Changed direction may legitimately acquire a fresh review: compare
         # paid totals with the fixture's actual calls, never forbid that work.
         self.assertEqual(restarted["shadow"]["calls"], len(fixture.reviews))

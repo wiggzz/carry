@@ -342,8 +342,10 @@ ssize_t pwrite64(int fd, const void *buf, size_t n, off64_t at) {
             before = self.authority_rows(state)
             proxy.close()
             marker.unlink()
-            proxy.start()
-            self.assertNotEqual(self.request(proxy, {**body, "stream": False,
+            restarted = Proxy(state, fixture, extra=("--review-min-primary-tokens", "2000000",
+                "--review-min-new-tokens", "2000000"), wait_reviews=False)
+            self.addCleanup(restarted.close)
+            self.assertNotEqual(self.request(restarted, {**body, "stream": False,
                 "previous_response_id": "resp_stream_fault"})[0], 200)
             self.assertEqual(fixture.primaries, [body])
             self.assertEqual(self.authority_rows(state), before)

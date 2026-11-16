@@ -76,7 +76,7 @@ fn archive_actual_over_limit_numeric_frontier_grows_through_session_restart() {
 }
 
 #[test]
-fn archive_optional_conflict_fork_cannot_spend_paid_settlement_promise() {
+fn archive_optional_conflict_fork_preserves_prior_receipt_when_optional_settlement_fails() {
     for shared in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let mut service = checkpoint_service(directory.path());
@@ -153,13 +153,16 @@ fn archive_optional_conflict_fork_cannot_spend_paid_settlement_promise() {
         session.primary_pending = false;
         let result = save_paid_accounting(&service, &id, &session, "paid-fork");
         assert!(
-            result.is_ok(),
-            "optional archive fork spent protected paid settlement: shared={shared}, result={result:?}"
+            result.is_err(),
+            "full actual-write budget cannot promise optional settlement"
         );
         let restored = load(&service, &id).unwrap();
-        assert_eq!(restored.primary.calls, n + 1);
-        assert!((restored.primary.cost_usd - before - 0.002).abs() < 1e-10);
-        assert!(!restored.primary_pending);
+        assert_eq!(restored.primary.calls, n);
+        assert_eq!(restored.primary.cost_usd, before);
+        assert!(
+            restored.primary_pending,
+            "retain the last real pending authority, not a fabricated receipt"
+        );
         assert_eq!(std::fs::read(&archive).unwrap(), orphan);
         assert_eq!(numeric_selected_path(directory.path(), &restored), archive);
         assert!(
@@ -172,7 +175,7 @@ fn archive_optional_conflict_fork_cannot_spend_paid_settlement_promise() {
         );
         let cold = checkpoint_service(directory.path());
         let restarted = load(&cold, &id).unwrap();
-        assert_eq!(restarted.primary.calls, n + 1);
+        assert_eq!(restarted.primary.calls, n);
         assert_eq!(restarted.primary.cost_usd, restored.primary.cost_usd);
     }
 }
@@ -248,10 +251,16 @@ async fn archive_sync_reviewer_stale_reservation_and_primary_fault_preserve_comm
                 _lock: session_lock(&service, &id).await,
             };
             let response = relay(upstream, Some(commit), None, false, None).await;
-            assert!(
-                axum::body::to_bytes(response.into_body(), 10000)
-                    .await
-                    .is_err()
+            let delivered = axum::body::to_bytes(response.into_body(), 10000)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&delivered).unwrap(),
+                json!({
+                    "id":"numeric-primary","status":"completed","output":[],
+                    "usage":{"input_tokens":1000,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}
+                }),
+                "storage failure must not destroy the already received primary response"
             );
             upstream_server.abort();
         } else {

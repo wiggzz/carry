@@ -124,7 +124,7 @@ failure never retries generation or aborts otherwise valid JSON/SSE output; an
 existing pending marker remains conservative if even paid-only settlement fails.
 Already-sent response headers cannot report a later persistence failure; the
 bounded diagnostic lane receives a privacy-safe `storage_unavailable` warning
-and checkpoint/accounting publication outcomes when available. Logging uses the
+and checkpoint/accounting publication outcomes when available. These warnings use the
 existing fixed-capacity nonblocking queue; full queues or failed sinks may drop
 it and never create a retry/flush obligation on the response owner. Lost local
 history/accounting is accepted, not backfilled or represented as known zero cost.
