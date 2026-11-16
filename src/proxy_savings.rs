@@ -562,6 +562,7 @@ impl DashboardTotals {
         self.quantity_evidence.observe(estimate);
         self.in_flight_sessions += u64::from(estimate.in_flight_costs_excluded);
         // Diagnostics cover all sessions, even pending/ineligible comparisons.
+        self.excluded_failed_calls += estimate.excluded_failed_calls;
         self.excluded_unpriced_calls += estimate.excluded_unpriced_calls;
         self.excluded_unpriced_reviewer_calls += estimate.excluded_unpriced_reviewer_calls;
         if estimate.accounting_basis == LEGACY_BASIS {
@@ -591,7 +592,6 @@ impl DashboardTotals {
             _ => (),
         }
         self.matched_primary_responses += estimate.matched_primary_responses;
-        self.excluded_failed_calls += estimate.excluded_failed_calls;
         let carry = self.carry_cost.unwrap_or(0.0) + carry;
         let traditional = self.traditional_cost.unwrap_or(0.0) + traditional;
         let savings = traditional - carry;
@@ -1273,6 +1273,52 @@ mod tests {
         assert_eq!(totals.included_sessions, 4);
         assert_eq!(totals.excluded_sessions, 2);
         assert_eq!(totals.excluded_failed_calls, 4);
+    }
+
+    #[test]
+    fn dashboard_excluded_failure_diagnostics_survive_unavailable_comparisons() {
+        for legacy in [false, true] {
+            for pending in [false, true] {
+                let estimate = Estimate {
+                    accounting_basis: if legacy { LEGACY_BASIS } else { RECEIPT_BASIS }.into(),
+                    observed_primary_cost: Some(0.125),
+                    carry_cost: 0.125,
+                    traditional_cost: 0.1,
+                    matched_primary_responses: 1,
+                    excluded_failed_calls: 2,
+                    excluded_unpriced_calls: 3,
+                    excluded_unpriced_reviewer_calls: 1,
+                    unavailable_primary_cost_calls: 2,
+                    unavailable_reviewer_cost_calls: 1,
+                    coverage: Coverage {
+                        primary_responses: 3,
+                        reviewer_responses: 1,
+                        failed_calls: 2,
+                        ..Coverage::default()
+                    },
+                    ..Estimate::default()
+                };
+                let mut totals = DashboardTotals::default();
+                totals.observe(&estimate.dashboard(pending));
+                assert_eq!(totals.excluded_failed_calls, 2);
+                assert_eq!(totals.excluded_unpriced_calls, 3);
+                assert_eq!(totals.excluded_unpriced_reviewer_calls, 1);
+                assert_eq!(totals.included_sessions, 0);
+                assert_eq!(totals.excluded_sessions, 1);
+                assert_eq!(totals.matched_primary_responses, 0);
+                assert_eq!(totals.carry_cost, None);
+                assert_eq!(totals.traditional_cost, None);
+                assert_eq!(totals.savings, None);
+                assert_eq!(totals.whole_window_included_sessions, 0);
+                assert!(totals.whole_window.is_none());
+                assert_eq!(totals.in_flight_sessions, u64::from(pending));
+                if !legacy {
+                    assert_eq!(totals.observed_primary_cost, Some(0.125));
+                    assert_eq!(totals.unavailable_primary_cost_calls, 2);
+                    assert_eq!(totals.unavailable_reviewer_cost_calls, 1);
+                }
+            }
+        }
     }
 
     #[test]
