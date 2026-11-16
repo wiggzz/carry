@@ -331,10 +331,8 @@ fn append(
     } else {
         (JOURNAL_RECORD, &JOURNAL_DROPPED)
     };
-    let result = (|| -> std::io::Result<()> {
-        let _guard = LOG_LOCK
-            .lock()
-            .map_err(|_| std::io::Error::other("log lock poisoned"))?;
+    let result = (|| -> Option<()> {
+        let sender = service.phase_sink.sender.as_ref()?;
         let record = Record {
             event,
             at: now(),
@@ -346,10 +344,17 @@ fn append(
             dropped_before: dropped.load(Ordering::Relaxed),
             data,
         };
-        let bytes = encode(&record, record_max)?;
-        write_record(&history::FilePolicy::new(&service.config), id, &bytes, raw)
+        let bytes = encode(&record, record_max).ok()?;
+        sender
+            .try_send(PhaseRecord {
+                id: id.into(),
+                bytes,
+                raw,
+                policy: history::FilePolicy::new(&service.config),
+            })
+            .ok()
     })();
-    if result.is_err() {
+    if result.is_none() {
         dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -362,6 +367,7 @@ const PHASE_QUEUE: usize = 16;
 struct PhaseRecord {
     id: String,
     bytes: Vec<u8>,
+    raw: bool,
     policy: history::FilePolicy,
 }
 #[derive(Clone)]
@@ -381,10 +387,15 @@ impl PhaseSink {
                         let _guard = LOG_LOCK
                             .lock()
                             .map_err(|_| std::io::Error::other("log lock poisoned"))?;
-                        write_record(&record.policy, &record.id, &record.bytes, false)
+                        write_record(&record.policy, &record.id, &record.bytes, record.raw)
                     })();
                     if result.is_err() {
-                        JOURNAL_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        let dropped = if record.raw {
+                            &RAW_DROPPED
+                        } else {
+                            &JOURNAL_DROPPED
+                        };
+                        dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     #[cfg(test)]
                     phase_sink_fault::after_append(record.policy.directory());
@@ -396,7 +407,7 @@ impl PhaseSink {
     }
 }
 
-// Phase-only handoff: bounded serialization + try_send; no filesystem, log lock,
+// Bounded handoff: serialization + try_send; no filesystem, log lock,
 // worker startup, await, retry, or flushing on the request/cancel/EOF owner.
 pub(super) fn phase_summary(
     service: &Service,
@@ -405,31 +416,27 @@ pub(super) fn phase_summary(
     review_attempt_id: Option<&str>,
     data: &Value,
 ) {
-    let result = (|| -> Option<()> {
-        let sender = service.phase_sink.sender.as_ref()?;
-        let record = Record {
-            event: "phase_timing",
-            at: now(),
-            session_id: id,
-            request_id,
-            review_attempt_id,
-            mode: mode(&service.config),
-            policy_id: policy_id(&service.config),
-            dropped_before: JOURNAL_DROPPED.load(Ordering::Relaxed),
-            data,
-        };
-        let bytes = encode(&record, JOURNAL_RECORD).ok()?;
-        sender
-            .try_send(PhaseRecord {
-                id: id.into(),
-                bytes,
-                policy: history::FilePolicy::new(&service.config),
-            })
-            .ok()
-    })();
-    if result.is_none() {
-        JOURNAL_DROPPED.fetch_add(1, Ordering::Relaxed);
-    }
+    append(
+        service,
+        id,
+        request_id,
+        review_attempt_id,
+        "phase_timing",
+        data,
+        false,
+    );
+}
+
+pub(super) fn storage_warning(service: &Service, id: &str, request_id: &str, stage: &str) {
+    // Fixed enum-like stage and outcome only; never caller input, credentials,
+    // exception strings or provider output. The shared queue never waits/flushes.
+    journal(
+        service,
+        id,
+        request_id,
+        "storage_unavailable",
+        &json!({"stage":stage,"recorded":false}),
+    );
 }
 
 pub(super) fn raw(service: &Service, id: &str, event: &str, data: &Value) {

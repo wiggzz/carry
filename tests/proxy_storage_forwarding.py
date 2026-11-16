@@ -7,8 +7,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sqlite3
 import threading
+import time
+import sqlite3
 import tempfile
 import unittest
 
@@ -18,6 +19,7 @@ from proxy_state_regressions import Fixture, Proxy, completed, wire
 class RecordingFixture(Fixture):
     def __init__(self, *args):
         self.wires = []
+        self.split_response = None
         super().__init__(*args)
         fixture = self
         parent = self.server.RequestHandlerClass
@@ -26,7 +28,24 @@ class RecordingFixture(Fixture):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
                 fixture.wires.append((self.path, dict(self.headers), raw))
                 self.rfile = io.BytesIO(raw)
-                super().do_POST()
+                target = self.wfile
+                class Writer:
+                    def write(self, data):
+                        split = fixture.split_response
+                        if split and data == split[0]:
+                            target.write(data[:split[1]])
+                            target.flush()
+                            split[2]()
+                            target.write(data[split[1]:])
+                            return len(data)
+                        return target.write(data)
+                    def __getattr__(self, name):
+                        return getattr(target, name)
+                self.wfile = Writer()
+                try:
+                    super().do_POST()
+                finally:
+                    self.wfile = target
         self.server.RequestHandlerClass = Handler
 
 
@@ -96,21 +115,27 @@ class StorageForwarding(unittest.TestCase):
             self.assertFalse(saved["primary_pending"])
             self.assertEqual(fixture.primaries, [body])
 
-    def test_owner_admission_refusal_in_explicit_and_implicit_modes(self):
+    def test_actual_write_limits_remain_bounded_without_future_receipt_reservations(self):
         for implicit in (False, True):
-            with self.subTest(implicit=implicit), self.directory() as directory:
-                proxy, fixture = self.setup_proxy(Path(directory), extra=(
-                    "--history-max-bytes", "16384", "--history-disk-bytes", "393216"))
-                body = self.body()
-                status, headers, raw = self.request(proxy, body,
-                    {"x-carry-session": None} if implicit else {})
-                self.assertEqual(status, 200, raw)
-                self.assertEqual(headers.get("x-carry-durability"), "unavailable")
-                self.assertEqual(fixture.primaries, [body])
-                self.assertEqual(fixture.reviews, [])
-                self.assertEqual(list(Path(directory).glob("*.json")), [])
+            for cap, durable in ((393216, False), (650000, True)):
+                with self.subTest(implicit=implicit, cap=cap), self.directory() as directory:
+                    proxy, fixture = self.setup_proxy(Path(directory), extra=(
+                        "--history-max-bytes", "16384", "--history-disk-bytes", str(cap)))
+                    body = self.body()
+                    status, headers, raw = self.request(proxy, body,
+                        {"x-carry-session": None} if implicit else {})
+                    self.assertEqual(status, 200, raw)
+                    self.assertEqual(fixture.primaries, [body])
+                    self.assertEqual(fixture.reviews, [])
+                    if durable:
+                        self.assertNotIn("x-carry-durability", headers)
+                        self.assertEqual(proxy.saved()["primary"]["calls"], 1,
+                            "future receipt headroom must not prevent bounded actual writes")
+                    else:
+                        self.assertEqual(headers.get("x-carry-durability"), "unavailable")
+                        self.assertEqual(list(Path(directory).glob("*.json")), [])
 
-    def test_second_live_owner_degrades_without_spending_first_owners_promise(self):
+    def test_second_live_owner_persists_optimistically_without_future_receipt_reservations(self):
         with self.directory() as directory:
             root = Path(directory)
             held, release = threading.Event(), threading.Event()
@@ -136,9 +161,11 @@ class StorageForwarding(unittest.TestCase):
             try:
                 status, headers, raw = self.request(proxy, second, {"x-carry-session": "non-durable-owner"})
                 self.assertEqual(status, 200, raw)
-                self.assertEqual(headers.get("x-carry-durability"), "unavailable")
+                self.assertNotIn("x-carry-durability", headers)
                 self.assertEqual(json.loads(raw), completed(response_id="resp_concurrent_2"))
-                self.assertEqual(self.authority_rows(root), authority, "the second owner cannot spend the first promise")
+                owners = {row[4] for row in authority if row[0] == "snapshots"}
+                self.assertEqual([r for r in self.authority_rows(root) if r[4] in owners],
+                                 [r for r in authority if r[4] in owners], "concurrent writes preserve the held owner's authority")
             finally:
                 release.set()
                 worker.join(timeout=15)
@@ -149,12 +176,11 @@ class StorageForwarding(unittest.TestCase):
             self.assertEqual(json.loads(outcome["first"][2]), completed(response_id="resp_concurrent_1"))
             self.assertEqual(fixture.primaries, [first, second])
             self.assertEqual(fixture.reviews, [])
-            saved = proxy.saved()
-            self.assertEqual(saved["primary"]["calls"], 1)
-            self.assertEqual(saved["primary"]["input_tokens"], 100)
-            self.assertFalse(saved["primary_pending"])
-            self.assertEqual(saved["last_response_id"], "resp_concurrent_1")
-            self.assertNotIn("resp_concurrent_2", repr(self.authority_rows(root)))
+            saved = [json.loads(p.read_text()) for p in root.glob("*.json")]
+            self.assertEqual(len(saved), 2)
+            self.assertTrue(all(s["primary"]["calls"] == 1 and s["primary"]["input_tokens"] == 100
+                                and not s["primary_pending"] for s in saved))
+            self.assertEqual({s["last_response_id"] for s in saved}, {"resp_concurrent_1", "resp_concurrent_2"})
 
     def test_corrupt_authority_is_not_mistaken_for_storage_pressure(self):
         with self.directory() as directory:
@@ -245,8 +271,11 @@ static int refused(int fd) {
     if (n < 0) return 0;
     path[n] = 0;
     if (!strncmp(path, root, strlen(root)) && path[strlen(root)] == '/') {
+        int log = strstr(path + strlen(root), "/diagnostics/") != NULL;
+        const char *allow_logs = getenv("CARRY_FIXTURE_ALLOW_LOGS");
+        if (log && allow_logs && !strcmp(allow_logs, "1")) return 0;
         int witness = open(marker, O_WRONLY | O_APPEND);
-        if (witness >= 0) { syscall(SYS_write, witness, "E", 1); close(witness); }
+        if (witness >= 0) { syscall(SYS_write, witness, log ? "L" : "E", 1); close(witness); }
         errno = ENOSPC; return 1;
     }
     return 0;
@@ -267,6 +296,101 @@ ssize_t pwrite64(int fd, const void *buf, size_t n, off64_t at) {
         subprocess.run([os.environ.get("CC", "cc"), "-shared", "-fPIC", "-O0", str(source),
                         "-o", str(library), "-ldl"], check=True, capture_output=True, timeout=30)
         return library
+
+    def test_enospc_after_client_receives_first_sse_event_preserves_the_entire_stream(self):
+        with self.directory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            marker = root / "stream-fault"
+            lib = self.fault_library(root)
+            resume = threading.Event()
+            self.addCleanup(resume.set)
+            prefix = b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"fixture delta"}\n\n'
+            receipt = completed(response_id="resp_stream_fault")
+            suffix = b"event: response.completed\ndata: " + wire({"type": "response.completed", "response": receipt}) + b"\n\n"
+            payload = prefix + suffix
+            def resume_with_storage_failure():
+                self.assertTrue(resume.wait(8), "client must receive the first event before fault injection")
+                marker.touch()
+            proxy, fixture = self.setup_proxy(state, primary=lambda body, n: (200, payload), environment={
+                "LD_PRELOAD": str(lib), "CARRY_FIXTURE_STORAGE_ROOT": str(state),
+                "CARRY_FIXTURE_STORAGE_FAULT": str(marker)})
+            fixture.split_response = (payload, len(prefix), resume_with_storage_failure)
+            body = self.body(True)
+            conn = http.client.HTTPConnection(*proxy.address, timeout=12)
+            try:
+                conn.request("POST", "/v1/responses", wire(body), {
+                    "Content-Type": "application/json", "x-carry-session": "storage-fixture"})
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                first = response.read(len(prefix))
+                self.assertEqual(first, prefix)
+                self.assertFalse(marker.exists(), "fault must be later than real client delivery")
+                resume.set()
+                self.assertEqual(first + response.read(), payload)
+            finally:
+                resume.set()
+                conn.close()
+            self.assertGreater(marker.stat().st_size, 0, "storage write must actually encounter ENOSPC")
+            self.assertEqual(fixture.primaries, [body])
+            self.assertEqual(fixture.reviews, [])
+            pending = proxy.saved()
+            self.assertTrue(pending["primary_pending"])
+            self.assertEqual(pending["primary"]["calls"], 0)
+            # The zero above is the old pending snapshot, NOT an invented receipt.
+            before = self.authority_rows(state)
+            proxy.close()
+            marker.unlink()
+            proxy.start()
+            self.assertNotEqual(self.request(proxy, {**body, "stream": False,
+                "previous_response_id": "resp_stream_fault"})[0], 200)
+            self.assertEqual(fixture.primaries, [body])
+            self.assertEqual(self.authority_rows(state), before)
+
+    def test_storage_warning_is_private_and_failed_log_sink_does_not_gate_delivery(self):
+        with self.directory() as directory:
+            root = Path(directory)
+            lib = self.fault_library(root)
+            for fail_logs in (False, True):
+                with self.subTest(fail_logs=fail_logs):
+                    state = root / f"state-logs-{fail_logs}"
+                    state.mkdir()
+                    marker = root / f"fault-logs-{fail_logs}"
+                    proxy, fixture = self.setup_proxy(state, environment={
+                        "LD_PRELOAD": str(lib), "CARRY_FIXTURE_STORAGE_ROOT": str(state),
+                        "CARRY_FIXTURE_STORAGE_FAULT": str(marker),
+                        "CARRY_FIXTURE_ALLOW_LOGS": "0" if fail_logs else "1"})
+                    marker.touch()
+                    body = self.body()
+                    body["input"][0]["content"] = "private-fixture-prompt-never-log"
+                    status, _, raw = self.request(proxy, body, {"Cookie": "private-fixture-cookie"})
+                    self.assertEqual(status, 200, raw)
+                    self.assertEqual(fixture.primaries, [body])
+                    self.assertEqual(fixture.reviews, [])
+                    deadline = time.monotonic() + 3
+                    warnings = []
+                    while time.monotonic() < deadline:
+                        logs = "\n".join(p.read_text() for p in state.rglob("*.jsonl"))
+                        warnings = []
+                        for line in logs.splitlines():
+                            try:
+                                record = json.loads(line)
+                            except ValueError:
+                                continue  # A concurrent best-effort append may be partial.
+                            if record.get("event") == "storage_unavailable":
+                                warnings.append(record)
+                        if warnings or (fail_logs and b"L" in marker.read_bytes()):
+                            break
+                        time.sleep(.01)
+                    self.assertNotIn("private-fixture-prompt-never-log", logs)
+                    self.assertNotIn("private-fixture-cookie", logs)
+                    if fail_logs:
+                        self.assertIn(b"L", marker.read_bytes(), "actual log write must hit ENOSPC")
+                    else:
+                        self.assertEqual(len(warnings), 1)
+                        self.assertEqual(warnings[0]["data"], {"stage": "preparation", "recorded": False})
+                    proxy.close()
 
     def test_subscription_adapter_keeps_converted_json_on_storage_failure(self):
         with self.directory() as directory:

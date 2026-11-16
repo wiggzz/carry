@@ -87,8 +87,8 @@ impl Drop for Pin {
     }
 }
 pub(super) fn pin(service: &Service, id: &str) -> Result<Pin, Failure> {
-    // Serialize admission with durable writes, always IO before PINS. Otherwise
-    // a new promise could race a transaction's already-frozen capacity budget.
+    // Serialize live ancestry ownership with durable writes, always IO before
+    // PINS. Pins do not reserve disk space for optional future persistence.
     let _guard = IO.lock().unwrap();
     pin_owner(service, id, &mut PINS.lock().unwrap())
 }
@@ -107,28 +107,16 @@ fn pin_owner(
             "history owners busy",
         ));
     }
-    if !pins.contains_key(&key) {
-        let owners = pins.keys().filter(|(dir, _)| dir == &key.0).count() + 1;
-        // A normal pin is read-only: do not expire the authority the caller is
-        // about to protect. Under pressure, maintenance spends its independent
-        // promise before retrying admission, not the new owner's headroom.
-        if storage::admit_owner(service, owners).is_err() {
-            storage::maintain(
-                service,
-                pins.keys()
-                    .filter(|(dir, _)| dir == &key.0)
-                    .map(|(_, id)| id.clone())
-                    .collect(),
-            )
-            .map_err(read_failure)?;
-            storage::admit_owner(service, owners).map_err(|_| {
-                storage_failure(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "durable history disk admission refused",
-                )
-            })?;
-        }
-    }
+    // Pins protect live ancestry and bound in-memory owners, not future disk
+    // capacity. Validate existing authority without making a storage promise.
+    storage::initialize(
+        service,
+        pins.keys()
+            .filter(|(dir, _)| dir == &key.0)
+            .map(|(_, id)| id.clone())
+            .collect(),
+    )
+    .map_err(read_failure)?;
     pins.entry(key.clone())
         .or_insert(Owner {
             count: 0,

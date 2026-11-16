@@ -69,21 +69,12 @@ struct Pending {
     at: u64,
     owner: String,
 }
-// A paid-only transaction writes at most a bounded checkpoint and accounting
-// observation, two small sequence rows, and a staged checkpoint file. Ordinary
-// publications cannot spend this headroom, including their own owner's promise.
+// Bound actual SQL pages and WAL copies, not future receipts.
 fn write_charge(bytes: u64) -> u64 {
     bytes.saturating_mul(4).saturating_add(16384)
 }
-fn settlement_reserve(max_record: u64) -> u64 {
-    write_charge(max_record)
-        .saturating_mul(2)
-        .saturating_add(write_charge(128).saturating_mul(2))
-        .saturating_add(max_record.saturating_mul(2))
-        .saturating_add(65536)
-}
-// Maintenance has its own bounded promise. Ordinary writes and paid settlement
-// both leave it intact, so expiry never depends on admitting another owner.
+// Preserve bounded maintenance/atomicity headroom for retained authority.
+// This does not scale with in-flight owners or hypothetical future receipts.
 fn maintenance_reserve(physical_record_bound: u64, disk_limit: u64) -> u64 {
     // Keep the transaction's startup charge separate from the complete charge
     // of one deletion. Otherwise the largest admitted rows never fit, even in
@@ -91,11 +82,6 @@ fn maintenance_reserve(physical_record_bound: u64, disk_limit: u64) -> u64 {
     write_charge(physical_record_bound)
         .saturating_add(65536 + write_charge(0))
         .min(disk_limit / 2)
-}
-fn protected_bytes(max_record: u64, physical_bound: u64, owners: usize, disk_limit: u64) -> u64 {
-    settlement_reserve(max_record)
-        .saturating_mul(owners as u64)
-        .saturating_add(maintenance_reserve(physical_bound, disk_limit))
 }
 fn admit_extent(
     directory: &Path,
@@ -170,32 +156,6 @@ fn filesystem_capacity_preserves_platform_widths_and_saturates() {
     assert_eq!(filesystem_available_bytes(3u64, 4096u64), 12288);
     assert_eq!(filesystem_available_bytes(u32::MAX, u64::MAX), u64::MAX);
     assert_eq!(filesystem_available_bytes(0u32, u64::MAX), 0);
-}
-pub(super) fn admit_owner(service: &Service, owners: usize) -> std::io::Result<()> {
-    // Measure the connected store, not its smaller last-connection-closed
-    // footprint. SQLite recreates WAL sidecars even for a read-only view;
-    // admitting against the closed footprint can spend maintenance's promise
-    // before the next publication opens its connection. Keep this view alive
-    // through the physical measurement, without modifying retained authority.
-    let view = Store::open(service, HashSet::new(), false)?;
-    let reserve = protected_bytes(
-        service.config.history_max_bytes as u64,
-        view.physical_record_bound,
-        owners,
-        service.config.history_disk_bytes,
-    );
-    admit_extent(
-        &service.config.state_dir,
-        service.config.history_disk_bytes,
-        reserve,
-        0,
-    )
-}
-pub(super) fn maintain(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
-    if !service.config.state_dir.join("history.index").exists() {
-        return Ok(());
-    }
-    Store::open(service, pins, true)?.maintain().map(|_| ())
 }
 pub(super) fn initialize(service: &Service, pins: HashSet<String>) -> std::io::Result<()> {
     let path = service.config.state_dir.join("history.index");
@@ -292,12 +252,7 @@ impl Store {
             admit_extent(
                 &policy.directory,
                 policy.disk_limit,
-                protected_bytes(
-                    policy.max_record as u64,
-                    policy.max_record as u64,
-                    pins.len(),
-                    policy.disk_limit,
-                ),
+                maintenance_reserve(policy.max_record as u64, policy.disk_limit),
                 write_charge(16 * 4096),
             )?;
             drop(private_file(path, false)?);
@@ -372,10 +327,8 @@ impl Store {
             physical_record_bound,
             publish_record_bound: recorded != Some(physical_record_bound),
             at: now(),
-            reserved_bytes: std::cell::Cell::new(protected_bytes(
-                policy.max_record as u64,
+            reserved_bytes: std::cell::Cell::new(maintenance_reserve(
                 physical_record_bound,
-                pins.len(),
                 policy.disk_limit,
             )),
             pins,
@@ -856,8 +809,8 @@ impl Store {
     fn maintain(&self) -> std::io::Result<bool> {
         let allowance = maintenance_reserve(self.physical_record_bound, self.policy.disk_limit);
         let reserved = self.reserved_bytes.get();
-        // Spend maintenance's promise only; every paid owner keeps its full
-        // settlement reserve. Restore the normal reservation even on failure.
+        // Spend maintenance's bounded allowance. Restore it on every exit;
+        // there are no separate per-inference future receipt promises.
         self.reserved_bytes.set(reserved.saturating_sub(allowance));
         let result = (|| {
             self.start()?;
@@ -891,16 +844,9 @@ impl Store {
             .map_err(error)?;
         result
     }
-    pub(super) fn begin_settlement(&self, owner: &str) -> std::io::Result<()> {
-        // Only a bounded paid-only publication may use its owner's promise.
-        // Do not run ancestry maintenance inside this emergency transaction.
-        if self.pins.contains(owner) {
-            self.reserved_bytes.set(
-                self.reserved_bytes
-                    .get()
-                    .saturating_sub(settlement_reserve(self.policy.max_record as u64)),
-            );
-        }
+    pub(super) fn begin_settlement(&self, _owner: &str) -> std::io::Result<()> {
+        // Numeric-only publication has the same actual-write limits. There is
+        // no reserved future accounting capacity and no ancestry maintenance.
         self.settlement.set(true);
         Ok(())
     }

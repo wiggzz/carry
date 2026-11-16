@@ -220,8 +220,6 @@ pub(crate) mod history;
 mod planning;
 #[path = "proxy_advice.rs"]
 mod semantic;
-#[path = "proxy_settlement.rs"]
-pub(crate) mod settlement;
 use planning::plan;
 #[path = "proxy_log.rs"]
 mod logging;
@@ -720,8 +718,6 @@ fn save_paid_accounting(
     durable.failed_primaries = paid.failed_primaries;
     durable.primary_pending = paid.primary_pending;
     durable.background_review_pending = paid.background_review_pending;
-    durable.primary_settlement_bytes = paid.primary_settlement_bytes;
-    durable.reviewer_settlement_bytes = paid.reviewer_settlement_bytes;
     durable.request_evidence = paid.request_evidence.clone();
     if primary_calls > 0
         && let Some(evidence) = &mut durable.request_evidence
@@ -795,12 +791,6 @@ fn save_publication(
     publish: impl FnOnce(&Session, &history::Publication) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let mut persisted = session.clone();
-    if !persisted.primary_pending {
-        persisted.primary_settlement_bytes = None;
-    }
-    if !persisted.background_review_pending {
-        persisted.reviewer_settlement_bytes = None;
-    }
     let policy = history::FilePolicy::new(&service.config);
     if let Some(evidence) = &mut persisted.request_evidence
         && evidence.archive_tracking()
@@ -887,13 +877,6 @@ fn save_checkpoint(
     // The full staged file coexists with its old target through SQL publication.
     let mut size = CheckpointSize(0);
     serde_json::to_writer(&mut size, session)?;
-    let outstanding = settlement::outstanding(session);
-    if outstanding > 0 && size.0.saturating_add(outstanding) > max_bytes as u64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            "checkpoint cannot admit its mandatory terminal representation",
-        ));
-    }
     let path = service.config.state_dir.join(format!("{id}.json"));
     let temporary = service.config.state_dir.join(format!(".{id}.tmp"));
     let reusable = match std::fs::symlink_metadata(&temporary) {
@@ -2461,16 +2444,10 @@ async fn prepare_primary(
             let review_body = review_body_for_view(&bounded.config, &session, &projection, &view);
             session.last_reviewer_dispatch =
                 Some(dispatch_measurement(&request_id, "reviewer", &review_body));
-            settlement::reserve(&service, &mut session, &review_body, false).map_err(|_| {
-                storage_failure(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "cannot admit exceptional review settlement",
-                )
-            })?;
             save(&service, &id, &session).map_err(|_| {
                 storage_failure(
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "cannot reserve exceptional review",
+                    "cannot persist exceptional review",
                 )
             })?;
             let mut run = ReviewRun {
@@ -2640,12 +2617,6 @@ async fn prepare_primary(
             .collect();
         let mut reserved = session;
         reserved.primary_pending = true;
-        settlement::reserve(&service, &mut reserved, &outbound, true).map_err(|_| {
-            storage_failure(
-                StatusCode::INSUFFICIENT_STORAGE,
-                "cannot admit primary settlement",
-            )
-        })?;
         save(&service, &id, &reserved).map_err(|error| {
             if error.kind() == std::io::ErrorKind::StorageFull {
                 storage_failure(
@@ -2779,12 +2750,11 @@ async fn forward_timed(
                     validate_review_request(&original_body)?;
                 }
             }
-            journal(
+            logging::storage_warning(
                 &fallback_service,
                 &timing.session_id,
                 &request_id,
-                "primary_non_durable",
-                &json!({"reason":"local_storage_unavailable","accounting_persisted":false}),
+                "preparation",
             );
             (
                 PreparedPrimary {
@@ -2935,6 +2905,12 @@ async fn forward_timed(
                     commit.reviewed.primary.calls += 1;
                     commit.reviewed.primary.unavailable_cost_calls += 1;
                     if save(&service, &commit.id, &commit.reviewed).is_err() {
+                        logging::storage_warning(
+                            &service,
+                            &commit.id,
+                            &commit.request_id,
+                            "transport_failure",
+                        );
                         let _ = save_paid_accounting(
                             &service,
                             &commit.id,
@@ -3222,10 +3198,8 @@ async fn dispatch_review_for(
     session.last_review_request = session.completed_requests;
     session.review_epoch = next_review_generation();
     session.last_reviewer_dispatch = Some(dispatch_measurement(&request_id, "reviewer", &body));
-    if settlement::reserve(&service, session, &body, false)
-        .and_then(|_| save(&service, &id, session))
-        .is_err()
-    {
+    if save(&service, &id, session).is_err() {
+        logging::storage_warning(&service, &id, &request_id, "review_preparation");
         session.background_review_pending = false;
         service.background_reviews.lock().await.remove(&id);
         return;
@@ -3257,6 +3231,9 @@ async fn dispatch_review_for(
             let settled = save(&service, &id, &current)
                 .or_else(|_| save_paid_accounting(&service, &id, &current, &run.request_id))
                 .is_ok();
+            if !settled {
+                logging::storage_warning(&service, &id, &run.request_id, "review_completion");
+            }
             // Reusable completion cannot precede its known durable receipt.
             // The paid owner may have advanced; semantic authority still keys H.
             #[cfg(test)]
@@ -4715,6 +4692,12 @@ async fn relay(
                 )
                 .is_err()
                 {
+                    logging::storage_warning(
+                        &commit.service,
+                        &commit.id,
+                        &commit.request_id,
+                        "completion",
+                    );
                     let accounting_committed = save_paid_accounting(
                         &commit.service,
                         &commit.id,
@@ -4793,6 +4776,12 @@ async fn relay(
                     commit.reviewed.primary.unavailable_cost_calls += 1;
                 }
                 if save(&commit.service, &commit.id, &commit.reviewed).is_err() {
+                    logging::storage_warning(
+                        &commit.service,
+                        &commit.id,
+                        &commit.request_id,
+                        "incomplete_response",
+                    );
                     let _ = save_paid_accounting(
                         &commit.service,
                         &commit.id,

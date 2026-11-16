@@ -17,21 +17,6 @@ const REVIEW_USAGE_DETAILS: [&str; 4] = [
 ];
 const REVIEW_USAGE_CONTAINERS: [&str; 2] = ["input_tokens_details", "output_tokens_details"];
 
-/// Complete possible shape of the same bounded numeric projection, for
-/// pre-dispatch representation admission only.
-pub(super) fn review_usage_shape() -> Value {
-    let mut shape = json!({});
-    for field in REVIEW_USAGE_FIELDS {
-        shape[field] = json!(0);
-    }
-    for field in REVIEW_USAGE_CONTAINERS {
-        for key in REVIEW_USAGE_DETAILS {
-            shape[field][key] = json!(0);
-        }
-    }
-    shape
-}
-
 /// One content-free numeric receipt projection for synchronous and background review.
 /// Invalid presence stays a bounded sentinel, not an invented zero partition.
 pub(crate) fn numeric_review_usage(usage: &Value) -> Value {
