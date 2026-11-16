@@ -228,6 +228,28 @@ class StorageForwarding(unittest.TestCase):
             self.assertEqual(status, 200, raw)
             self.assertEqual(fixture.primaries, [body])
 
+    def test_provider_owned_references_remain_forwardable_when_tracking_fails(self):
+        # Off and unsupported-model forwarding never require Carry ancestry.
+        # The ordinary provider owns these references, including under pressure.
+        for mode, model in (("off", "gpt-6-luna"), ("audit", "synthetic-unknown-model")):
+            for field in ("previous_response_id", "conversation"):
+                for pressured in (False, True):
+                    with self.subTest(mode=mode, field=field, pressured=pressured), self.directory() as directory, contextlib.ExitStack() as stack:
+                        fixture = RecordingFixture(lambda body, n: (200, completed(response_id="provider-resolved")),
+                                                   lambda body, n: self.fail("forwarding must not review"))
+                        stack.callback(fixture.close)
+                        options = ("--history-disk-bytes", "65536") if pressured else ()
+                        proxy = Proxy(Path(directory), fixture, extra=options, mode=mode, wait_reviews=False)
+                        stack.callback(proxy.close)
+                        body = {**self.body(), "model": model, field: "provider-owned-reference"}
+                        status, headers, raw = self.request(proxy, body)
+                        self.assertEqual(status, 200, raw)
+                        self.assertEqual(json.loads(raw), completed(response_id="provider-resolved"))
+                        self.assertEqual(fixture.primaries, [body])
+                        self.assertEqual(fixture.reviews, [])
+                        self.assertEqual(headers.get("x-carry-durability"), "unavailable" if pressured else None)
+                        proxy.close()
+
     def test_literal_wire_auth_privacy_and_upstream_error_under_quota(self):
         with self.directory() as directory:
             root = Path(directory)

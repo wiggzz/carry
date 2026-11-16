@@ -119,8 +119,10 @@ durable accounting. Pre-dispatch degradation returns
 `x-carry-durability: unavailable`. No new local response/history handle is promised;
 provider response IDs still appear in the actual output but cannot be used as
 Carry ancestry unless publication succeeded. Requests requiring missing or
-unreadable local ancestry still fail closed. After upstream dispatch, persistence
-failure never retries generation or aborts otherwise valid JSON/SSE output; an
+unreadable local ancestry still fail closed. Off and unsupported-model forwarding
+leave provider-owned response/conversation references intact even when optional
+tracking fails. After upstream dispatch, persistence failure never retries
+generation or aborts otherwise valid JSON/SSE output; an
 existing pending marker remains conservative if even paid-only settlement fails.
 Already-sent response headers cannot report a later persistence failure; the
 bounded diagnostic lane receives a privacy-safe `storage_unavailable` warning

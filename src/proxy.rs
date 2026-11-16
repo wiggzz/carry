@@ -2724,18 +2724,7 @@ async fn forward_timed(
     let (prepared, degraded) = match preparation {
         Ok(prepared) => (prepared, false),
         Err(error) if error.2 => {
-            // An identifier-only continuation is not self-contained. Do not
-            // silently discard Carry-owned ancestry or invent provider storage.
-            if original_body
-                .get("previous_response_id")
-                .is_some_and(|v| !v.is_null())
-                || original_body
-                    .get("conversation")
-                    .is_some_and(|v| !v.is_null())
-            {
-                return Err(error);
-            }
-            if configured_review {
+            let local_history = if configured_review {
                 if original_body["model"].as_str().is_none_or(str::is_empty) {
                     return Err(failure(StatusCode::BAD_REQUEST, "model is required"));
                 }
@@ -2746,9 +2735,23 @@ async fn forward_timed(
                     None,
                 )
                 .await?;
-                if primary.capacity_tokens.is_some() && primary.rates.is_some() {
-                    validate_review_request(&original_body)?;
+                primary.capacity_tokens.is_some() && primary.rates.is_some()
+            } else {
+                false
+            };
+            if local_history {
+                // Review-mode references require Carry-owned ancestry. Off and
+                // unsupported-model forwarding leave provider references intact.
+                if original_body
+                    .get("previous_response_id")
+                    .is_some_and(|v| !v.is_null())
+                    || original_body
+                        .get("conversation")
+                        .is_some_and(|v| !v.is_null())
+                {
+                    return Err(error);
                 }
+                validate_review_request(&original_body)?;
             }
             logging::storage_warning(
                 &fallback_service,
