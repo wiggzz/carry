@@ -557,19 +557,8 @@ impl Store {
                 "invalid accounting sequence authority",
             )
         };
-        if let Some(marker) = self.get::<Value>("accounted", &identity)? {
-            let sequence = marker["sequence"].as_u64().ok_or_else(invalid)?;
-            // Set membership is not observation identity: A -> B -> A must
-            // retain the final transition, including a cumulative decrease or
-            // recovered coverage. Only suppress this owner's immediate repeat.
-            let latest: Option<String> = self.connection.query_row(
-                "SELECT key FROM records INDEXED BY records_owner WHERE kind='accounting' AND owner=?1 ORDER BY key DESC LIMIT 1",
-                [id], |row| row.get(0),
-            ).optional().map_err(error)?;
-            if latest == Some(format!("{sequence:064x}")) {
-                return Ok(());
-            }
-        }
+        // Even an immediate-repeat save must validate the sequence authority
+        // before allowing another dispatch. Dedup is not a corruption bypass.
         let clock = self.get::<Value>("metadata", "accounting_clock")?;
         let (previous, previous_at) = if let Some(clock) = clock {
             (
@@ -590,6 +579,19 @@ impl Store {
             }
             (0, 0)
         };
+        if let Some(marker) = self.get::<Value>("accounted", &identity)? {
+            let sequence = marker["sequence"].as_u64().ok_or_else(invalid)?;
+            // Set membership is not observation identity: A -> B -> A must
+            // retain the final transition, including a cumulative decrease or
+            // recovered coverage. Only suppress this owner's immediate repeat.
+            let latest: Option<String> = self.connection.query_row(
+                "SELECT key FROM records INDEXED BY records_owner WHERE kind='accounting' AND owner=?1 ORDER BY key DESC LIMIT 1",
+                [id], |row| row.get(0),
+            ).optional().map_err(error)?;
+            if latest == Some(format!("{sequence:064x}")) {
+                return Ok(());
+            }
+        }
         let sequence = previous.checked_add(1).ok_or_else(full)?;
         let order_at = self.at.max(previous_at);
         let key = format!("{sequence:064x}");

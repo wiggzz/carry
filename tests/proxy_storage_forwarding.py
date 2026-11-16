@@ -220,6 +220,55 @@ class StorageForwarding(unittest.TestCase):
             self.assertEqual(fixture.primaries, [])
             self.assertEqual((root / "history.index").read_bytes(), corrupt)
 
+    def test_corrupt_accounting_records_reject_before_primary_or_review_dispatch(self):
+        # These are malformed records in a valid SQLite authority, not an I/O
+        # outage. Preparation must not turn their validation error into fallback.
+        for kind in (None, "accounted", "metadata"):
+            with self.subTest(kind=kind), self.directory() as directory, contextlib.ExitStack() as stack:
+                root = Path(directory)
+                proxy, fixture = self.setup_proxy(root)
+                stack.callback(fixture.close)
+                stack.callback(proxy.close)
+                body = self.body()
+                self.assertEqual(self.request(proxy, body)[0], 200)
+                self.assertEqual(proxy.saved()["primary"]["calls"], 1)
+                proxy.close()  # Join every legitimate publisher before injection.
+                if kind is not None:
+                    with contextlib.closing(sqlite3.connect(root / "history.index")) as db:
+                        with db:
+                            changed = db.execute(
+                                "UPDATE records SET data=? WHERE kind=?" +
+                                (" AND key='accounting_clock'" if kind == "metadata" else ""),
+                                (b"{}", kind)).rowcount
+                        self.assertGreater(changed, 0, "must corrupt existing accounting authority")
+                        self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                before = self.authority_rows(root)
+                proxy, fresh = self.setup_proxy(root)
+                stack.callback(fresh.close)
+                stack.callback(proxy.close)
+                status, headers, raw = self.request(proxy, body)
+                # Check dispatch and retained bytes even when status is wrong.
+                rejected = {
+                    "status": status,
+                    "durability": headers.get("x-carry-durability"),
+                    "primaries": fresh.primaries,
+                    "reviews": fresh.reviews,
+                    "authority_unchanged": self.authority_rows(root) == before,
+                    "fixture_errors": fresh.errors,
+                }
+                if kind is None:
+                    self.assertEqual(status, 200, raw)
+                    self.assertNotIn("x-carry-durability", headers)
+                    self.assertEqual(fresh.primaries, [body])
+                    self.assertEqual(proxy.saved()["primary"]["calls"], 2)
+                else:
+                    self.assertEqual(rejected, {
+                        "status": 409, "durability": None, "primaries": [],
+                        "reviews": [], "authority_unchanged": True, "fixture_errors": [],
+                    })
+                self.assertFalse(fresh.errors, fresh.errors)
+                self.assertEqual(fresh.reviews, [])
+
     def test_unsupported_model_keeps_forwarding_semantics_under_pressure(self):
         with self.directory() as directory:
             proxy, fixture = self.setup_proxy(Path(directory), extra=("--history-disk-bytes", "65536"))

@@ -2403,7 +2403,7 @@ async fn prepare_primary(
             &json!({"native_compaction":native}),
         );
         session.review_context = cache_base(&body);
-        session.upstream_cache = history::cache(&service).map_err(history::read_failure)?;
+        session.upstream_cache = history::cache(&service).map_err(history::authority_failure)?;
         // One branch-qualified lookup owns advice and prior dispatch evidence.
         // Paid-owner tips are indexes, never authority for a sibling's selection.
         history::hydrate(&service, &mut session, &body, &original_body)?;
@@ -2444,12 +2444,7 @@ async fn prepare_primary(
             let review_body = review_body_for_view(&bounded.config, &session, &projection, &view);
             session.last_reviewer_dispatch =
                 Some(dispatch_measurement(&request_id, "reviewer", &review_body));
-            save(&service, &id, &session).map_err(|_| {
-                storage_failure(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "cannot persist exceptional review",
-                )
-            })?;
+            save(&service, &id, &session).map_err(history::authority_failure)?;
             let mut run = ReviewRun {
                 request_id: request_id.clone(),
                 ..ReviewRun::default()
@@ -2475,13 +2470,14 @@ async fn prepare_primary(
             // run_review already meters synchronous work; publish its receipts
             // before a no-help/failure exit or the primary attempt.
             save(&service, &id, &session)
-                .or_else(|_| save_paid_accounting(&service, &id, &session, &request_id))
-                .map_err(|_| {
-                    storage_failure(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "review settlement failed",
-                    )
-                })?;
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::InvalidData {
+                        Err(error)
+                    } else {
+                        save_paid_accounting(&service, &id, &session, &request_id)
+                    }
+                })
+                .map_err(history::authority_failure)?;
             if run.accepted {
                 let _ = history::publish(&bounded, &session, &session);
             }
@@ -2617,16 +2613,7 @@ async fn prepare_primary(
             .collect();
         let mut reserved = session;
         reserved.primary_pending = true;
-        save(&service, &id, &reserved).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::StorageFull {
-                storage_failure(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "history capacity unavailable",
-                )
-            } else {
-                storage_failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
-            }
-        })?;
+        save(&service, &id, &reserved).map_err(history::authority_failure)?;
         // Schedule only after primary admission. The transport task owns the
         // async dispatch below; no cancellation point may split this promise
         // from transfer to that owner.
