@@ -280,7 +280,7 @@ fn unsupported_namespace_rejects_without_rewriting_persisted_authority() {
             let outcome = history::namespace(&service, &headers, &body);
             match outcome {
                 Ok(namespace) if !legacy => assert_eq!(namespace, original_namespace),
-                Err((status, axum::Json(error))) if legacy => {
+                Err(Failure(status, axum::Json(error), _)) if legacy => {
                     if status != StatusCode::CONFLICT
                         || !error["error"]["message"]
                             .as_str()
@@ -369,7 +369,10 @@ fn unsupported_receipt_history_rejects_before_loading_persisted_authority() {
                 if shared {
                     let mut saved: Value = serde_json::from_slice(&index).unwrap();
                     saved["snapshots"][&id]["request_evidence"] = unsupported;
-                    history::fixture::write_index(&index_path, &serde_json::to_vec(&saved).unwrap());
+                    history::fixture::write_index(
+                        &index_path,
+                        &serde_json::to_vec(&saved).unwrap(),
+                    );
                     std::fs::write(&mirror_path, &mirror).unwrap();
                 } else {
                     let mut saved: Value = serde_json::from_slice(&mirror).unwrap();

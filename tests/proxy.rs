@@ -73,6 +73,20 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn local_storage_failure_preserves_upstream_output() {
+    let output = python_fixture("proxy_storage_forwarding.py")
+        .arg("-v")
+        .output()
+        .expect("Python must exercise real storage faults and loopback forwarding");
+    assert!(
+        output.status.success(),
+        "storage forwarding failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn durable_retention_accounting_http() {
     let output = python_fixture("proxy_retention.py")
         .output()

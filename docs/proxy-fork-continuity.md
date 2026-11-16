@@ -108,8 +108,20 @@ Detailed history defaults to seven days (`--history-max-age-secs`); numeric
 observations default to 180 days (`--accounting-max-age-secs`). Disk/reference
 pressure cannot shorten detailed retention. Node/record limits bound decoded
 working sets, and the reference limit bounds concurrently pinned owners, not
-total retained sessions. The separate `--history-disk-bytes` ceiling rejects
-admission rather than evicting unexpired evidence; HTTP507 is not a reset request.
+total retained sessions. The separate `--history-disk-bytes` ceiling refuses
+local persistence rather than evicting unexpired evidence. If admission or local
+storage writes fail, self-contained requests instead use the ordinary upstream
+transport with the caller's original payload, without selection, new reviews or
+durable accounting. Pre-dispatch degradation returns
+`x-carry-durability: unavailable`. No new local response/history handle is promised;
+provider response IDs still appear in the actual output but cannot be used as
+Carry ancestry unless publication succeeded. Requests requiring missing or
+unreadable local ancestry still fail closed. After upstream dispatch, persistence
+failure never retries generation or aborts otherwise valid JSON/SSE output; an
+existing pending marker remains conservative if even paid-only settlement fails.
+Already-sent response headers cannot report a later persistence failure; the
+bounded diagnostic lane records checkpoint/accounting publication outcomes when
+available. Absence of that diagnostic is not proof of persistence or zero cost.
 Maintenance collects expired history within its own bounded disk reserve.
 See `carry proxy --help` for supported ranges and environment names.
 

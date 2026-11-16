@@ -102,7 +102,7 @@ fn pin_owner(
         && pins.keys().filter(|(dir, _)| dir == &key.0).count()
             >= service.config.history_max_references as usize
     {
-        return Err(failure(
+        return Err(storage_failure(
             StatusCode::INSUFFICIENT_STORAGE,
             "history owners busy",
         ));
@@ -122,7 +122,7 @@ fn pin_owner(
             )
             .map_err(read_failure)?;
             storage::admit_owner(service, owners).map_err(|_| {
-                failure(
+                storage_failure(
                     StatusCode::INSUFFICIENT_STORAGE,
                     "durable history disk admission refused",
                 )
@@ -229,20 +229,23 @@ pub(super) fn initialize(service: &Service) -> std::io::Result<()> {
 fn read(service: &Service) -> std::io::Result<Store> {
     Store::open(service, pinned(service), false)
 }
-fn read_failure(error: std::io::Error) -> Failure {
+pub(super) fn read_failure(error: std::io::Error) -> Failure {
     let status = match error.kind() {
         std::io::ErrorKind::StorageFull => StatusCode::INSUFFICIENT_STORAGE,
         std::io::ErrorKind::InvalidData => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    failure(
+    let unavailable = error.kind() != std::io::ErrorKind::InvalidData;
+    let mut result = failure(
         status,
         if error.kind() == std::io::ErrorKind::InvalidData {
             "unsupported or invalid history index format"
         } else {
             "history authority unavailable"
         },
-    )
+    );
+    result.2 = unavailable;
+    result
 }
 pub(super) fn namespace(
     service: &Service,

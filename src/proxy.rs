@@ -229,10 +229,31 @@ use logging::journal;
 #[path = "proxy_timing.rs"]
 mod timing;
 
-type Failure = (StatusCode, axum::Json<Value>);
+/// Local storage availability is distinct from invalid history or caller errors.
+/// Only preparation may consume this classification; transport is never retried.
+#[derive(Debug)]
+struct Failure(StatusCode, axum::Json<Value>, bool);
+
+impl IntoResponse for Failure {
+    fn into_response(self) -> Response {
+        (self.0, self.1).into_response()
+    }
+}
 
 fn failure(status: StatusCode, message: &str) -> Failure {
-    (status, axum::Json(json!({"error": {"message": message}})))
+    Failure(
+        status,
+        axum::Json(json!({"error": {"message": message}})),
+        false,
+    )
+}
+
+fn storage_failure(status: StatusCode, message: &str) -> Failure {
+    Failure(
+        status,
+        axum::Json(json!({"error": {"message": message}})),
+        true,
+    )
 }
 
 fn validate_url(endpoint: &str) -> Result<()> {
@@ -651,9 +672,13 @@ fn load_with_restore(
                 })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Session::default()),
-        _ => Err(failure(
+        Err(_) => Err(storage_failure(
             StatusCode::INTERNAL_SERVER_ERROR,
             "proxy checkpoint unavailable",
+        )),
+        Ok(_) => Err(failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "proxy checkpoint exceeds working-set bound",
         )),
     }
 }
@@ -2027,56 +2052,74 @@ async fn forward_request(
     result
 }
 
-async fn forward_timed(
+fn history_policy(headers: &HeaderMap) -> Result<bool, Failure> {
+    Ok(match headers.get("x-carry-history-policy") {
+        None => false,
+        Some(value) if value == "strict" => false,
+        Some(value) if value == "reset-on-divergence" => true,
+        Some(_) => {
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "unsupported explicit history policy",
+            ));
+        }
+    })
+}
+
+fn replay_policy(service: &Service, headers: &HeaderMap) -> Result<bool, Failure> {
+    Ok(match headers.get("x-carry-replay-history") {
+        None => service.config.review_replayed_history,
+        Some(value) if value == "before-latest-user" => true,
+        Some(_) => {
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "unsupported explicit replay history policy",
+            ));
+        }
+    })
+}
+
+fn validate_review_request(body: &Value) -> Result<(), Failure> {
+    if body["background"] == true {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "review modes do not support background",
+        ));
+    }
+    if !body["input"].is_array() {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "review modes require array-valued native input",
+        ));
+    }
+    Ok(())
+}
+
+struct PreparedPrimary {
+    service: Arc<Service>,
+    outbound: Value,
+    commit: Option<Commit>,
+    native: bool,
+    body: Value,
+    review: Option<planning::Projection>,
+}
+
+async fn prepare_primary(
     mut service: Arc<Service>,
-    headers: HeaderMap,
-    bytes: Bytes,
+    headers: &HeaderMap,
+    mut body: Value,
+    mut id: Option<String>,
     legacy_native: bool,
     request_id: String,
-    phases: &mut Option<timing::Phases>,
-) -> Result<Response, Failure> {
-    let timing = phases.as_mut().unwrap();
-    // Responses writes are a native-client interface, not a browser API.
-    // This also rejects opaque/null origins and simple text/plain CSRF posts.
-    // The dashboard remains GET-only; no Origin header is forwarded upstream.
-    if headers.contains_key("origin") {
-        return Err(failure(
-            StatusCode::FORBIDDEN,
-            "browser-origin writes are not supported",
-        ));
-    }
-    authorize(&service, &headers)?;
-    let mut id = identity(&headers)?;
-    if let Some(id) = &id {
-        timing.session_id = id.clone();
-    }
-    if headers.contains_key("x-carry-fork-parent") || headers.contains_key("x-carry-fork-point") {
-        return Err(failure(
-            StatusCode::BAD_REQUEST,
-            "fork headers are obsolete; send ordinary history",
-        ));
-    }
-    if service.config.codex_login && legacy_native {
-        return Err(failure(
-            StatusCode::NOT_IMPLEMENTED,
-            "Codex subscription native /compact is not supported; Pi summary requests use /responses",
-        ));
-    }
-    let mut body: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
-    if !body.is_object() {
-        return Err(failure(
-            StatusCode::BAD_REQUEST,
-            "request must be an object",
-        ));
-    }
+    timing: &mut timing::Phases,
+) -> Result<PreparedPrimary, Failure> {
     let original_body = body.clone();
     let configured_review = service.config.mode != Mode::Off;
     let implicit = configured_review && id.is_none();
-    // Namespace is based on the client request and process policy, never on an
-    // effective budget/mode derived later for a particular primary attempt.
+    let reset_divergence = history_policy(headers)?;
+    let replay_history = replay_policy(&service, headers)?;
     let namespace = configured_review
-        .then(|| history::namespace(&service, &headers, &body))
+        .then(|| history::namespace(&service, headers, &body))
         .transpose()?;
     let mut history_pin = None;
     if implicit {
@@ -2103,29 +2146,9 @@ async fn forward_timed(
                 .iter()
                 .any(|item| item["type"] == "compaction_trigger")
         });
-    let reset_divergence = match headers.get("x-carry-history-policy") {
-        None => false,
-        Some(value) if value == "strict" => false,
-        Some(value) if value == "reset-on-divergence" => true,
-        Some(_) => {
-            return Err(failure(
-                StatusCode::BAD_REQUEST,
-                "unsupported explicit history policy",
-            ));
-        }
-    };
-    let replay_history = match headers.get("x-carry-replay-history") {
-        None => service.config.review_replayed_history,
-        Some(value) if value == "before-latest-user" => true,
-        Some(_) => {
-            return Err(failure(
-                StatusCode::BAD_REQUEST,
-                "unsupported explicit replay history policy",
-            ));
-        }
-    };
     let mut outbound = body.clone();
     let mut commit = None;
+    let mut review = None;
     if let Some(mut id) = id {
         let mut history_pin = history_pin;
         let mut lock;
@@ -2173,12 +2196,7 @@ async fn forward_timed(
             // Keep the raw request separate until its owner and decision settle.
             body = original_body.clone();
             if effective.config.mode != Mode::Off {
-                if body["background"] == true {
-                    return Err(failure(
-                        StatusCode::BAD_REQUEST,
-                        "review modes do not support background",
-                    ));
-                }
+                validate_review_request(&body)?;
                 history::expand(&service, namespace.as_ref().unwrap(), &mut body)?;
             }
             timing.active_phase = "primary_lock_wait";
@@ -2382,11 +2400,6 @@ async fn forward_timed(
                     .remove("previous_response_id");
                 session.ingest_with_rebase(input, reset_divergence || implicit).map_err(|_| failure(StatusCode::CONFLICT, "history diverged, invalid checkpoint or lineage limit; use explicit branch/native checkpoint or opt into x-carry-history-policy: reset-on-divergence"))?;
             }
-        } else if service.config.mode != Mode::Off {
-            return Err(failure(
-                StatusCode::BAD_REQUEST,
-                "review modes require array-valued native input",
-            ));
         }
         if !native
             && standard(&body)
@@ -2407,8 +2420,7 @@ async fn forward_timed(
             &json!({"native_compaction":native}),
         );
         session.review_context = cache_base(&body);
-        session.upstream_cache = history::cache(&service)
-            .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "cache index unavailable"))?;
+        session.upstream_cache = history::cache(&service).map_err(history::read_failure)?;
         // One branch-qualified lookup owns advice and prior dispatch evidence.
         // Paid-owner tips are indexes, never authority for a sibling's selection.
         history::hydrate(&service, &mut session, &body, &original_body)?;
@@ -2450,13 +2462,13 @@ async fn forward_timed(
             session.last_reviewer_dispatch =
                 Some(dispatch_measurement(&request_id, "reviewer", &review_body));
             settlement::reserve(&service, &mut session, &review_body, false).map_err(|_| {
-                failure(
+                storage_failure(
                     StatusCode::INSUFFICIENT_STORAGE,
                     "cannot admit exceptional review settlement",
                 )
             })?;
             save(&service, &id, &session).map_err(|_| {
-                failure(
+                storage_failure(
                     StatusCode::INSUFFICIENT_STORAGE,
                     "cannot reserve exceptional review",
                 )
@@ -2488,7 +2500,7 @@ async fn forward_timed(
             save(&service, &id, &session)
                 .or_else(|_| save_paid_accounting(&service, &id, &session, &request_id))
                 .map_err(|_| {
-                    failure(
+                    storage_failure(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "review settlement failed",
                     )
@@ -2506,6 +2518,10 @@ async fn forward_timed(
         } else {
             planning::Projection::canonical(&session)
         };
+        let schedule_review = active
+            && !acquired
+            && standard(&body)
+            && primary_rates(&service.config, body["model"].as_str().unwrap_or(""), 0.0).is_some();
         if active {
             session.last_plan = report.clone();
             let _ = trace(&service, &id, "paired_plan", &report);
@@ -2515,20 +2531,6 @@ async fn forward_timed(
             // caller's primary request; let the provider enforce its limits.
             if !projection.omitted.is_empty() {
                 session.compactions += 1;
-            }
-            if !acquired
-                && standard(&body)
-                && primary_rates(&service.config, body["model"].as_str().unwrap_or(""), 0.0)
-                    .is_some()
-            {
-                dispatch_review_for(
-                    service.clone(),
-                    id.clone(),
-                    &mut session,
-                    projection.clone(),
-                    request_id.clone(),
-                )
-                .await;
             }
             outbound["input"] = json!(projection.input);
         }
@@ -2636,25 +2638,30 @@ async fn forward_timed(
             .filter(|i| !projection.omitted.contains(&i.id))
             .map(|i| i.id)
             .collect();
-        let reviewed = session.clone();
-        let mut reserved = session.clone();
+        let mut reserved = session;
         reserved.primary_pending = true;
         settlement::reserve(&service, &mut reserved, &outbound, true).map_err(|_| {
-            failure(
+            storage_failure(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "cannot admit primary settlement",
             )
         })?;
         save(&service, &id, &reserved).map_err(|error| {
             if error.kind() == std::io::ErrorKind::StorageFull {
-                failure(
+                storage_failure(
                     StatusCode::INSUFFICIENT_STORAGE,
                     "history capacity unavailable",
                 )
             } else {
-                failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
+                storage_failure(StatusCode::INTERNAL_SERVER_ERROR, "checkpoint write failed")
             }
         })?;
+        // Schedule only after primary admission. The transport task owns the
+        // async dispatch below; no cancellation point may split this promise
+        // from transfer to that owner.
+        review = schedule_review.then_some(projection);
+        let session = reserved;
+        let reviewed = session.clone();
         let _ = trace(&service, &id, "primary_submitted", &outbound);
         journal(
             &service,
@@ -2666,7 +2673,7 @@ async fn forward_timed(
         commit = Some(Commit {
             service: service.clone(),
             id,
-            request_id,
+            request_id: request_id.clone(),
             candidate: session,
             reviewed,
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
@@ -2677,6 +2684,130 @@ async fn forward_timed(
             _lock: lock,
         });
     }
+    Ok(PreparedPrimary {
+        service,
+        outbound,
+        commit,
+        native,
+        body,
+        review,
+    })
+}
+
+async fn forward_timed(
+    service: Arc<Service>,
+    headers: HeaderMap,
+    bytes: Bytes,
+    legacy_native: bool,
+    request_id: String,
+    phases: &mut Option<timing::Phases>,
+) -> Result<Response, Failure> {
+    let timing = phases.as_mut().unwrap();
+    // Responses writes are a native-client interface, not a browser API.
+    // This also rejects opaque/null origins and simple text/plain CSRF posts.
+    // The dashboard remains GET-only; no Origin header is forwarded upstream.
+    if headers.contains_key("origin") {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "browser-origin writes are not supported",
+        ));
+    }
+    authorize(&service, &headers)?;
+    let id = identity(&headers)?;
+    if let Some(id) = &id {
+        timing.session_id = id.clone();
+    }
+    if headers.contains_key("x-carry-fork-parent") || headers.contains_key("x-carry-fork-point") {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "fork headers are obsolete; send ordinary history",
+        ));
+    }
+    if service.config.codex_login && legacy_native {
+        return Err(failure(
+            StatusCode::NOT_IMPLEMENTED,
+            "Codex subscription native /compact is not supported; Pi summary requests use /responses",
+        ));
+    }
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid JSON request"))?;
+    if !body.is_object() {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "request must be an object",
+        ));
+    }
+    let original_body = body.clone();
+    let configured_review = service.config.mode != Mode::Off;
+    let fallback_service = service.clone();
+    let preparation = prepare_primary(
+        service,
+        &headers,
+        body,
+        id,
+        legacy_native,
+        request_id.clone(),
+        timing,
+    )
+    .await;
+    let (prepared, degraded) = match preparation {
+        Ok(prepared) => (prepared, false),
+        Err(error) if error.2 => {
+            // An identifier-only continuation is not self-contained. Do not
+            // silently discard Carry-owned ancestry or invent provider storage.
+            if original_body
+                .get("previous_response_id")
+                .is_some_and(|v| !v.is_null())
+                || original_body
+                    .get("conversation")
+                    .is_some_and(|v| !v.is_null())
+            {
+                return Err(error);
+            }
+            if configured_review {
+                if original_body["model"].as_str().is_none_or(str::is_empty) {
+                    return Err(failure(StatusCode::BAD_REQUEST, "model is required"));
+                }
+                let (primary, _) = resolved_catalog(
+                    &fallback_service,
+                    original_body["model"].as_str().unwrap(),
+                    original_body["service_tier"].as_str().unwrap_or("default"),
+                    None,
+                )
+                .await?;
+                if primary.capacity_tokens.is_some() && primary.rates.is_some() {
+                    validate_review_request(&original_body)?;
+                }
+            }
+            journal(
+                &fallback_service,
+                &timing.session_id,
+                &request_id,
+                "primary_non_durable",
+                &json!({"reason":"local_storage_unavailable","accounting_persisted":false}),
+            );
+            (
+                PreparedPrimary {
+                    service: fallback_service,
+                    outbound: original_body.clone(),
+                    commit: None,
+                    native: legacy_native,
+                    body: original_body.clone(),
+                    review: None,
+                },
+                true,
+            )
+        }
+        Err(error) => return Err(error),
+    };
+    let PreparedPrimary {
+        service,
+        mut outbound,
+        mut commit,
+        native,
+        body,
+        review,
+    } = prepared;
     if service.config.codex_login && commit.is_none() {
         outbound = primary_wire_body(&service.config, &outbound);
     }
@@ -2686,6 +2817,19 @@ async fn forward_timed(
     let mut phases = phases.take();
     tokio::spawn(async move {
         let timing = phases.as_mut().unwrap();
+        if let (Some(commit), Some(projection)) = (&mut commit, review) {
+            // A degraded primary never starts a reviewer. Retain the durable
+            // primary promise while the existing reviewer owner admits itself.
+            dispatch_review_for(
+                service.clone(),
+                commit.id.clone(),
+                &mut commit.candidate,
+                projection,
+                commit.request_id.clone(),
+            )
+            .await;
+            commit.reviewed = commit.candidate.clone();
+        }
         let endpoint = if legacy_native {
             format!(
                 "{}/compact",
@@ -2742,7 +2886,7 @@ async fn forward_timed(
                     } else {
                         (None, None)
                     };
-                let response = relay(
+                let mut response = relay(
                     upstream,
                     commit,
                     Some(attempt),
@@ -2750,6 +2894,11 @@ async fn forward_timed(
                     converted,
                 )
                 .await;
+                if degraded {
+                    response
+                        .headers_mut()
+                        .insert("x-carry-durability", "unavailable".parse().unwrap());
+                }
                 if let Some(conversion) = conversion {
                     // The relay's single Observer supplies both accounting and JSON.
                     // Its frame/output bounds do not count discarded historic deltas.
@@ -2757,7 +2906,15 @@ async fn forward_timed(
                         .await
                         .ok()
                         .flatten()
-                        .map(|v| axum::Json(v).into_response())
+                        .map(|v| {
+                            let mut response = axum::Json(v).into_response();
+                            if degraded {
+                                response
+                                    .headers_mut()
+                                    .insert("x-carry-durability", "unavailable".parse().unwrap());
+                            }
+                            response
+                        })
                         .ok_or_else(|| {
                             failure(StatusCode::BAD_GATEWAY, "Codex stream did not complete")
                         });
@@ -4406,7 +4563,6 @@ async fn relay(
             };
         }
         let sse_completed = observer.completed();
-        let mut conversion_allowed = sse_completed;
         let observed = if is_sse {
             observer.observed
         } else {
@@ -4573,10 +4729,10 @@ async fn relay(
                         "primary_checkpoint_failed",
                         &json!({"candidate_committed":false,"accounting_committed":accounting_committed}),
                     );
-                    conversion_allowed = false;
-                    let _ = sender
-                        .send(Err(std::io::Error::other("proxy checkpoint failed")))
-                        .await;
+                    // The provider already generated and the caller owns its
+                    // output. Local persistence cannot invalidate that output
+                    // or induce an upstream retry. Missing authority remains
+                    // missing; the durable pending marker is conservative.
                 } else {
                     logging::changes(
                         &commit.service,
@@ -4664,7 +4820,7 @@ async fn relay(
             // Conversion still requires clean HTTP EOF: a timeout/transport
             // error is a 502 even after a terminal. Accounting above retains
             // the existing terminal-authoritative streaming commit policy.
-            let _ = converted.send(if complete_transport && conversion_allowed {
+            let _ = converted.send(if complete_transport && sse_completed {
                 observed
             } else {
                 None

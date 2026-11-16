@@ -215,17 +215,18 @@ class TransparentHistory(regressions.FixtureCase):
         options = ["--history-max-bytes","100000","--review-every-requests","100"]
         h = [{"role":"user","content":"fit before paid dispatch"}]
         proxy = self.proxy(fixture,options)
-        # A known-paid result that cannot be published terminates the already
-        # started HTTP stream. Observe that failure rather than demand a false
-        # successful terminal/ID from the ordinary JSON helper.
+        # The real provider result remains deliverable even when it cannot
+        # become durable local ancestry. Accounting and IDs are graded below.
         import http.client
         connection = http.client.HTTPConnection(*proxy.address, timeout=30)
         connection.request("POST", "/v1/responses", json.dumps({"model":"gpt-6-luna","input":h}),
                            headers={"Content-Type":"application/json"})
         response = connection.getresponse()
         self.assertEqual(response.status,200)
-        with self.assertRaises(http.client.IncompleteRead):
-            response.read()
+        delivered = json.loads(response.read())
+        self.assertEqual(delivered["id"], "paid_growth_1")
+        self.assertEqual(delivered["output"][0]["content"][0]["text"],
+                         "UNPUBLISHED_LARGE_RESULT_" + "x" * 200000)
         connection.close()
         deadline = time.monotonic() + 5
         while True:
@@ -1593,23 +1594,24 @@ class TransparentHistory(regressions.FixtureCase):
                 with self.assertRaises(AssertionError, msg="impossible history byte limits must reject startup"):
                     unexpected = self.proxy(fixture, ["--history-max-bytes", str(limit)])
                     unexpected.close()
-        # The envelope is accepted, but cannot reserve an active selected owner.
-        # Backpressure must not publish an unreadable generation or dispatch work.
+        # The envelope cannot reserve a durable owner. Forward each request
+        # once without publishing an unreadable generation or reusable IDs.
         options = ["--history-max-bytes", str(minimum), "--review-every-requests", "100"]
         proxy = self.proxy(fixture, options)
         for attempt in range(2):
             status, result = proxy.send([{"role": "user", "content": f"minimum request {attempt}"}])
-            self.assertEqual(status, 507, result)
-            self.assertNotIn("id", result)
+            self.assertEqual(status, 200, result)
+            self.assertEqual(result["id"], f"minimum_{attempt + 1}")
             index = proxy.state / "history.index"
             if index.exists():
                 self.assertFalse(read_index(index)["snapshots"])
                 self.assertFalse(read_index(index)["transcripts"])
-        self.assertEqual(fixture.primaries, [])
+        self.assertEqual(len(fixture.primaries), 2)
         proxy.close()
         proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send([{"role": "user", "content": "minimum after restart"}])[0], 507)
-        self.assertEqual(fixture.primaries, [])
+        self.assertEqual(proxy.send([{"role": "user", "content": "minimum after restart"}])[0], 200)
+        self.assertEqual(len(fixture.primaries), 3)
+        self.assertEqual(fixture.primaries[-1]["input"], [{"role": "user", "content": "minimum after restart"}])
 
     def test_empty_input_response_is_observed_and_resumable(self):
         answer = {"role": "assistant", "content": "EMPTY_INPUT_ACTUAL_OUTPUT"}
@@ -1765,10 +1767,11 @@ class TransparentHistory(regressions.FixtureCase):
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"resp_{n}")))
         proxy = TransparentProxy(self.state, fixture, ["--review-every-requests", "100"], env)
         self.stack.callback(proxy.close)
-        # 4 KiB cannot hold the real selected session snapshot. Protecting a
-        # live owner now backpressures instead of deleting its authority.
-        self.assertEqual(proxy.send([{"role": "user", "content": "TOO_SMALL_OWNER"}])[0], 507)
-        self.assertEqual(fixture.primaries, [])
+        # 4 KiB cannot hold the selected snapshot. Forward without deleting
+        # authority or pretending this response is durably stored.
+        self.assertEqual(proxy.send([{"role": "user", "content": "TOO_SMALL_OWNER"}])[0], 200)
+        self.assertEqual(len(fixture.primaries), 1)
+        self.assertEqual(fixture.primaries[0]["input"], [{"role": "user", "content": "TOO_SMALL_OWNER"}])
         # Admission can now reject before creating the history store at all.
         # If initialization did occur, it must contain no published authority.
         if (self.state / "history.index").exists():
@@ -1778,7 +1781,7 @@ class TransparentHistory(regressions.FixtureCase):
         self.assertEqual(list(self.state.glob("*.json")),[])
         proxy.close()
         # The roomy arm must fit a completed selected snapshot, including its
-        # numeric dispatch evidence. Keep the 4 KiB no-dispatch rejection above;
+        # numeric dispatch evidence. Keep the 4 KiB non-durable control above;
         # every publication below must still obey this declared byte bound.
         env["CARRY_PROXY_HISTORY_MAX_BYTES"] = "32768"
         env["CARRY_PROXY_HISTORY_MAX_AGE_SECS"] = "604800"
@@ -1792,7 +1795,7 @@ class TransparentHistory(regressions.FixtureCase):
                     self.assertLessEqual(len(wire(value)), 32768, "decoded record bound, not global eviction")
         self.assertGreater(len(index["nodes"]), 4)
         self.assertGreater(len(index["transcripts"]), 4)
-        self.assertEqual(proxy.send([], previous_response_id="resp_1")[0], 200,
+        self.assertEqual(proxy.send([], previous_response_id="resp_2")[0], 200,
                          "working-set pressure cannot expire an observed ID")
         proxy.close()
         env["CARRY_PROXY_HISTORY_MAX_AGE_SECS"] = "1"
