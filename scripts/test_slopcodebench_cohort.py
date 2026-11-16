@@ -47,7 +47,8 @@ class CohortPreparationTests(unittest.TestCase):
         task_id = selection.get('id', selection.get('problem'))
         task = next(t for t in self.selection['problems'] if t['id'] == task_id)
         return {'prompt': self.prompt, 'pass_policy': 'any', 'timeout_seconds': 7200,
-                'environment': {'type': 'docker', 'docker': {'image': 'unprepared'}},
+                'environment': {'type': 'docker', 'docker': {'image': 'unprepared'},
+                    'setup': {'eval_commands': ['uv init', 'uv add -r requirements.txt']}},
                 'test_dependencies': ['pytest', task_id+'-dependency==1'],
                 'checkpoints': task['checkpoints']}
 
@@ -67,7 +68,7 @@ class CohortPreparationTests(unittest.TestCase):
             uvx.chmod(0o755)
             log = self.root/'warm.jsonl'
             subprocess.run(['/bin/sh', str(context/'warm-cache.sh')], check=True,
-                env={'PATH': str(tools), 'WARM_LOG': str(log)}, timeout=5)
+                env={'PATH': str(tools)+os.pathsep+os.defpath, 'WARM_LOG': str(log)}, timeout=5)
             self.warm_commands = [json.loads(line) for line in log.read_text().splitlines()]
             self.assertEqual(sorted(p.name for p in context.iterdir()), ['Dockerfile', 'carry', 'warm-cache.sh'])
         if args[:3] == ['docker', 'image', 'inspect']:
@@ -81,6 +82,62 @@ class CohortPreparationTests(unittest.TestCase):
             self.assertNotIn('OPENAI_API_KEY', kwargs['env'])
             self.assertNotIn('--allow-paid', args)
         return subprocess.CompletedProcess(args, 0, '', '')
+
+    def test_requirements_warm_native_project_then_replay_fresh_offline(self):
+        manifest = b"# exact native declaration\ndeepdiff; python_version >= '3.12'\n"
+        reference = self.problems/'first/solutions/checkpoint_1'
+        reference.mkdir(parents=True)
+        (reference/'requirements.txt').write_bytes(manifest)
+        (reference/'main.py').write_text('NEVER_COPY_REFERENCE_IMPLEMENTATION')
+        commands = ['uv init', 'uv add -r requirements.txt']
+        original_definition = self.definition
+        def definition(*args):
+            value = original_definition(*args)
+            value['environment']['setup'] = {'eval_commands': commands}
+            return value
+        original_execute = self.execute
+        def execute(args, **kwargs):
+            if args[:2] == ['docker', 'build']:
+                tools = self.root/'bin'; tools.mkdir(exist_ok=True)
+                uv = tools/'uv'
+                uv.write_text('#!'+sys.executable+"\n"+r'''
+import json,os,pathlib,sys
+p = pathlib.Path.cwd()
+a = sys.argv[1:]
+if a == ['init']:
+    assert not (p/'pyproject.toml').exists(), 'offline replay reused warm project'
+    (p/'pyproject.toml').write_text('synthetic native init')
+if a == ['add', '-r', 'requirements.txt']:
+    assert (p/'pyproject.toml').is_file(), 'native init must precede add'
+with open(os.environ['WARM_LOG'], 'a') as f:
+    f.write(json.dumps({'args': a, 'offline': os.environ.get('UV_OFFLINE'),
+        'project': str(p), 'requirements': (p/'requirements.txt').read_text()
+        if (p/'requirements.txt').exists() else None})+'\n')
+''')
+                uv.chmod(0o755)
+            return original_execute(args, **kwargs)
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
+                patch.object(preparation, 'official_definition', side_effect=definition), \
+                patch.object(runtime.evaluator, 'install', return_value=runtime.evaluator.identity()), \
+                patch.object(runtime, 'verify_checkout'):
+            frozen, prepared = preparation.prepare(self.root/'prepared-native', self.upstream,
+                self.problems, self.carry, selection_path=self.selection_path,
+                repetitions=3, execute=execute)
+        projects = [entry for entry in self.warm_commands if isinstance(entry, dict)]
+        self.assertEqual([entry['args'] for entry in projects],
+            [['init'], ['add', '-r', 'requirements.txt']]*2,
+            'tool/environment warming cannot certify native project resolution')
+        self.assertEqual([entry['offline'] for entry in projects], ['0', '0', '1', '1'])
+        self.assertTrue(all(entry['requirements'] == manifest.decode() for entry in projects))
+        self.assertNotEqual(projects[0]['project'], projects[2]['project'])
+        self.assertTrue(all(not Path(entry['project']).exists() for entry in projects))
+        import hashlib
+        binding = {'policy': 'native-offline-requirements-v2', 'requirements_sha256': {
+            'first/solutions/checkpoint_1/requirements.txt': hashlib.sha256(manifest).hexdigest()}}
+        self.assertEqual(frozen['dependency_preparation'], binding)
+        self.assertEqual(prepared['dependency_preparation'], binding)
+        self.assertNotIn('NEVER_COPY_REFERENCE_IMPLEMENTATION',
+            (self.root/'prepared-native/image-context/warm-cache.sh').read_text())
 
     def test_invalid_selection_or_repetitions_never_reach_image_build(self):
         variants = []

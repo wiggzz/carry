@@ -45,6 +45,21 @@ def official_definition(upstream, problems, selection):
             'checkpoints': [name for name, _ in problem.iterate_checkpoint_items()]}
 
 
+def native_requirements_warmup(data, commands):
+    """Warm the native project resolver, then prove a fresh offline setup."""
+    # Use only the trusted manifest, preserving markers/comments verbatim.
+    # Each arm starts empty: installed packages or a warm lock cannot mask gaps.
+    arms = []
+    for offline in ('0', '1'):
+        arms.append('\n'.join([
+            '(', 'set -eu', 'project=$(mktemp -d)',
+            'trap \'rm -rf "$project"\' EXIT', 'cd "$project"',
+            'export UV_OFFLINE='+offline,
+            'printf %s '+shlex.quote(data.decode())+' > requirements.txt',
+            *commands, ')']))
+    return '\n'.join(arms)
+
+
 def prepare(root, upstream, problems, carry, *, selection_path=None, repetitions=1, execute=subprocess.run):
     # Trusted setup must never inherit provider authority, even on a manual run.
     if any(os.environ.get(key) for key in ('OPENAI_API_KEY', 'OPENAI_ADMIN_KEY',
@@ -96,22 +111,23 @@ def prepare(root, upstream, problems, carry, *, selection_path=None, repetitions
     # while trusted setup still has network. Evaluation installs them offline
     # through the pinned environment's ordinary eval_commands.
     requirements, dependency_sets = {}, set()
-    for task in tasks:
+    project_warmups = []
+    for task, item in zip(tasks, definitions):
         for checkpoint in task['checkpoints']:
             path = problems/task['id']/'solutions'/checkpoint/'requirements.txt'
             if not path.is_file():
                 continue
             data = path.read_bytes()
             requirements[path.relative_to(problems).as_posix()] = hashlib.sha256(data).hexdigest()
-            deps = tuple(line.strip() for line in data.decode().splitlines()
-                         if line.strip() and not line.lstrip().startswith('#'))
-            if deps and deps not in dependency_sets:
-                dependency_sets.add(deps)
-                warm.append(['uv', 'run', '--isolated', '--no-project',
-                             *['--with='+dep for dep in deps], 'python', '-c', 'pass'])
-    dependency_preparation = {'policy': 'native-offline-requirements-v1',
+            commands = item['environment']['setup']['eval_commands']
+            identity = (data, tuple(commands))
+            if identity not in dependency_sets:
+                dependency_sets.add(identity)
+                project_warmups.append(native_requirements_warmup(data, commands))
+    dependency_preparation = {'policy': 'native-offline-requirements-v2',
                               'requirements_sha256': requirements}
-    (context/'warm-cache.sh').write_text('#!/bin/sh\nset -eu\n'+'\n'.join(map(shlex.join, warm))+'\n')
+    (context/'warm-cache.sh').write_text('#!/bin/sh\nset -eu\n'+
+        '\n'.join([*map(shlex.join, warm), *project_warmups])+'\n')
     # Reuse the fixture's proven immutable bases/cache layout, not its fake Codex,
     # provider, TLS, task, or expensive synthetic role overrides.
     (context/'Dockerfile').write_text(f'''FROM {NODE_BASE} AS codex

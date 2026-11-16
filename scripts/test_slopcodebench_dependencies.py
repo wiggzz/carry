@@ -22,6 +22,31 @@ class RuntimeDependencyPreparationTests(unittest.TestCase):
     definition = cohort_fixture.CohortPreparationTests.definition
     execute = cohort_fixture.CohortPreparationTests.execute
 
+    def test_failed_offline_replay_stops_warmer_and_cleans_projects(self):
+        tools = self.root/'bin'; tools.mkdir()
+        uv = tools/'uv'
+        uv.write_text('#!'+sys.executable+"\n"+r'''
+import json,os,pathlib,sys
+with open(os.environ['WARM_LOG'], 'a') as f:
+    f.write(json.dumps({'cwd': str(pathlib.Path.cwd()), 'args': sys.argv[1:],
+        'offline': os.environ['UV_OFFLINE']})+'\n')
+if os.environ['UV_OFFLINE'] == '1' and sys.argv[1] == 'add':
+    raise SystemExit(23)
+''')
+        uv.chmod(0o755)
+        log = self.root/'warm.jsonl'
+        result = subprocess.run(['/bin/sh', '-c', 'set -eu\n'+
+            preparation.native_requirements_warmup(b'owned==1\n',
+                ['uv init', 'uv add -r requirements.txt'])+'\nprintf SHOULD_NOT_RUN'],
+            env={'PATH': str(tools)+os.pathsep+os.defpath, 'WARM_LOG': str(log),
+                 'TMPDIR': str(self.root)}, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertNotIn('SHOULD_NOT_RUN', result.stdout)
+        rows = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual([r['offline'] for r in rows], ['0', '0', '1', '1'])
+        self.assertNotEqual(rows[0]['cwd'], rows[2]['cwd'])
+        self.assertTrue(all(not Path(row['cwd']).exists() for row in rows))
+
     def test_pinned_application_requirements_are_warmed_separately_from_pytest(self):
         manifests = {}
         for task in self.selection['problems']:
@@ -44,11 +69,11 @@ class RuntimeDependencyPreparationTests(unittest.TestCase):
             contract, prepared = preparation.prepare(self.root/'prepared', self.upstream, self.problems,
                 self.carry, selection_path=self.selection_path, repetitions=3, execute=self.execute)
         application_commands = [row for row in self.warm_commands if row[0] == 'uv']
-        self.assertEqual(application_commands, [
-            ['uv', 'run', '--isolated', '--no-project', '--with=owned-app==1', 'python', '-c', 'pass'],
-            ['uv', 'run', '--isolated', '--no-project', '--with=other-app==2; python_version >= "3.12"',
-             'python', '-c', 'pass']])
-        provenance = {'policy': 'native-offline-requirements-v1', 'requirements_sha256': manifests}
+        # Each distinct byte-identical manifest gets online native setup plus
+        # an independent empty-project offline replay; duplicate checkpoints share it.
+        self.assertEqual(application_commands,
+            [['uv', 'init'], ['uv', 'add', '-r', 'requirements.txt']]*4)
+        provenance = {'policy': 'native-offline-requirements-v2', 'requirements_sha256': manifests}
         self.assertEqual(contract['dependency_preparation'], provenance)
         self.assertEqual(prepared['dependency_preparation'], provenance)
         for path in (self.root/'prepared/image-context').iterdir():
