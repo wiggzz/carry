@@ -182,6 +182,33 @@ class StorageForwarding(unittest.TestCase):
                                 and not s["primary_pending"] for s in saved))
             self.assertEqual({s["last_response_id"] for s in saved}, {"resp_concurrent_1", "resp_concurrent_2"})
 
+    def test_unreadable_existing_sqlite_authority_forwards_self_contained_input_once(self):
+        with self.directory() as directory:
+            state = Path(directory)
+            proxy, fixture = self.setup_proxy(state)
+            self.assertEqual(self.request(proxy, self.body())[0], 200)
+            before = self.authority_rows(state)
+            authority = state / "history.index"
+            mode = authority.stat().st_mode & 0o777
+            authority.chmod(0)
+            try:
+                try:
+                    authority.open("rb").close()
+                except PermissionError:
+                    pass
+                else:
+                    self.fail("permission fault requires an unprivileged process; do not skip its qualification")
+                body = {**self.body(), "input": [{"role": "user", "content": "self-contained permission-fault request"}]}
+                status, headers, raw = self.request(proxy, body)
+                self.assertEqual(status, 200, raw)
+                self.assertEqual(headers.get("x-carry-durability"), "unavailable")
+                self.assertEqual(fixture.primaries, [self.body(), body])
+                self.assertEqual(fixture.reviews, [])
+            finally:
+                authority.chmod(mode)
+            self.assertEqual(self.authority_rows(state), before,
+                "failed reads must not replace valid prior authority with fresh history")
+
     def test_corrupt_authority_is_not_mistaken_for_storage_pressure(self):
         with self.directory() as directory:
             root = Path(directory)
