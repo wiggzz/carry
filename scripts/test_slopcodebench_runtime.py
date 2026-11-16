@@ -92,6 +92,33 @@ class OfficialProtectedRuntimeTests(unittest.TestCase):
         networks = subprocess.check_output(['docker', 'network', 'ls', '--format', '{{.Name}}'], text=True).splitlines()
         self.assertFalse(any(name.startswith('carry-agent-') for name in networks))
 
+    def test_actual_offline_native_application_requirements_setup(self):
+        runtime.activate_upstream(self.prepared)
+        from slop_code.execution import runtime as registry
+        _, environment, _ = runtime.official_components(self.prepared, self.contract, 'synthetic_evolution')
+        environment = environment.model_copy(deep=True)
+        environment.setup.eval_commands = ['uv init', 'uv add -r requirements.txt']
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            workspace = Path(directory)
+            # deepdiff exists in the warmed pytest cache, NOT base Python.
+            # This requires the application environment to be installed offline.
+            (workspace/'requirements.txt').write_text('deepdiff\n')
+            (workspace/'main.py').write_text('import deepdiff\nprint("offline-native-dependency-ready")\n')
+            with runtime.protected_runtimes({}, self.prepared):
+                baseline = registry.EXEC_RUNTIME_REGISTRY['docker'].spawn(environment,
+                    working_dir=workspace, command="python -c 'import deepdiff'", is_evaluation=False,
+                    static_assets={}, mounts={}, env_vars={}).execute(timeout=60)
+                self.assertNotEqual(baseline.exit_code, 0)
+                self.assertIn('ModuleNotFoundError', baseline.stderr)
+                runner = registry.EXEC_RUNTIME_REGISTRY['docker'].spawn(environment,
+                    working_dir=workspace, command='uv run main.py', is_evaluation=True,
+                    static_assets={}, mounts={}, env_vars={})
+                result = runner.execute(timeout=60)
+            self.assertEqual(result.exit_code, 0, result.setup_stderr+'\n'+result.stderr)
+            self.assertEqual(result.stdout.strip(), 'offline-native-dependency-ready')
+            self.assertTrue((workspace/'uv.lock').is_file())
+            self.assertTrue(result.setup_stdout or result.setup_stderr)
+
     def test_actual_native_trace_helpers_use_owned_input_before_read_or_copy(self):
         runtime.activate_upstream(self.prepared)
         from slop_code.agent_runner.agents.codex.agent import CodexAgent

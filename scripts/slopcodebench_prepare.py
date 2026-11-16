@@ -91,6 +91,26 @@ def prepare(root, upstream, problems, carry, *, selection_path=None, repetitions
     shutil.copyfile(carry, context/'carry')
     warm = [['uvx', *['--with='+dep for dep in item['test_dependencies']], 'pytest', '--version']
             for item in definitions]
+    # Pytest's uvx environment is not the submitted application's uv project.
+    # Cache declared reference dependencies, never implementation/test bytes,
+    # while trusted setup still has network. Evaluation installs them offline
+    # through the pinned environment's ordinary eval_commands.
+    requirements, dependency_sets = {}, set()
+    for task in tasks:
+        for checkpoint in task['checkpoints']:
+            path = problems/task['id']/'solutions'/checkpoint/'requirements.txt'
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            requirements[path.relative_to(problems).as_posix()] = hashlib.sha256(data).hexdigest()
+            deps = tuple(line.strip() for line in data.decode().splitlines()
+                         if line.strip() and not line.lstrip().startswith('#'))
+            if deps and deps not in dependency_sets:
+                dependency_sets.add(deps)
+                warm.append(['uv', 'run', '--isolated', '--no-project',
+                             *['--with='+dep for dep in deps], 'python', '-c', 'pass'])
+    dependency_preparation = {'policy': 'native-offline-requirements-v1',
+                              'requirements_sha256': requirements}
     (context/'warm-cache.sh').write_text('#!/bin/sh\nset -eu\n'+'\n'.join(map(shlex.join, warm))+'\n')
     # Reuse the fixture's proven immutable bases/cache layout, not its fake Codex,
     # provider, TLS, task, or expensive synthetic role overrides.
@@ -129,6 +149,7 @@ RUN chmod 0555 /opt/swebench-harness/bin/carry
                 'source_commit': source_commit, 'runner_commit': lock['runner_commit'],
                 'dataset_commit': lock['problems_commit'], 'repetitions': repetitions,
                 'study_selection_sha256': fingerprint(selection),
+                'dependency_preparation': dependency_preparation,
                 'evaluator_identity': evaluator_identity,
                 'selection': [{'id': task['id'], 'checkpoints': task['checkpoints']} for task in tasks],
                 'settings': {'codex_version': CODEX_VERSION, 'codex_sha256': native[1].split()[0],
@@ -145,6 +166,7 @@ RUN chmod 0555 /opt/swebench-harness/bin/carry
                 'agent_image': image, 'evaluator_image': image, 'gateway_image': gateway, 'carry_image': image,
                 'prompt': str(prompt), 'environment': str(environment),
                 'selection': str(root/'selection.json'), 'evaluator_identity': evaluator_identity,
+                'dependency_preparation': dependency_preparation,
                 'tasks': {task['id']: {'definition_sha256': runtime.tree_digest(problems/task['id']),
                                   'readiness': str(root/'readiness'/f'{task["id"]}.json')} for task in tasks}}
     plan(contract)

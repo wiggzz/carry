@@ -57,6 +57,35 @@ class CohortReadinessTests(unittest.TestCase):
     def preflight(self, contract, prepared, **kwargs):
         return PREFLIGHT(contract, prepared, execute=self.execute, verify_sources=False, **kwargs)
 
+    def test_dependency_recipe_is_paired_and_bound_to_readiness(self):
+        recipe = {'policy': 'native-offline-requirements-v1', 'requirements_sha256': {'first/requirements.txt': 'a'*64}}
+        self.config['dependency_preparation'] = recipe
+        with self.assertRaisesRegex(ValueError, 'dependency preparation'):
+            self.preflight(self.config, self.prepared, require_readiness=False)
+        self.assertEqual(self.calls, [])
+        self.prepared['dependency_preparation'] = copy.deepcopy(recipe)
+        self.preflight(self.config, self.prepared, require_readiness=False)
+        self.calls.clear()
+        for task in self.config['selection']:
+            binding = runtime.readiness_binding(self.config, self.prepared, task)
+            self.assertEqual(binding['dependency_preparation'], recipe)
+            path = Path(self.prepared['tasks'][task['id']]['readiness'])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({'status': 'ready', 'binding': binding}))
+        self.preflight(self.config, self.prepared)
+        self.prepared['dependency_preparation']['requirements_sha256']['first/requirements.txt'] = 'b'*64
+        self.calls.clear()
+        with self.assertRaisesRegex(ValueError, 'dependency preparation'):
+            self.preflight(self.config, self.prepared)
+        self.assertEqual(self.calls, [])
+        self.prepared['dependency_preparation'] = copy.deepcopy(recipe)
+        for task in self.config['selection']:
+            path = Path(self.prepared['tasks'][task['id']]['readiness'])
+            receipt = json.loads(path.read_text()); receipt['binding'].pop('dependency_preparation')
+            path.write_text(json.dumps(receipt))
+        with self.assertRaisesRegex(ValueError, 'readiness'):
+            self.preflight(self.config, self.prepared)
+
     def test_missing_evaluator_provenance_rejected_before_external_runtime(self):
         self.config.pop('evaluator_identity')
         with self.assertRaisesRegex(ValueError, 'evaluator'):
