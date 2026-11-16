@@ -264,11 +264,12 @@ impl Drop for Phases {
             "downstream_disconnected":self.downstream_disconnected,
             "receipt":self.receipt,"persistence":self.persistence
         });
-        logging::phase_summary(
+        logging::deferred_event(
             &self.service,
             &self.session_id,
             &self.request_id,
             self.review_attempt_id.as_deref(),
+            "phase_timing",
             &data,
         );
     }

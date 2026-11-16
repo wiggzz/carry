@@ -89,6 +89,22 @@ async fn phase_timing_separates_local_transport_body_and_settlement_without_wire
         "one correlated terminal phase summary is missing"
     );
     writeln!(std::io::stdout(), "SYNTHETIC_PHASE_TIMING {}", timings[0]).unwrap();
+    let persistence: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "receipt_persistence")
+        .collect();
+    assert_eq!(
+        persistence.len(),
+        1,
+        "persistence evidence has its own event identity"
+    );
+    assert_eq!(persistence[0]["request_id"], "timing-fixture");
+    assert_eq!(persistence[0]["data"]["durable"], true);
+    assert_eq!(persistence[0]["data"]["pricing_available"], true);
+    assert_eq!(
+        persistence[0]["data"]["attempt_id"],
+        timings[0]["data"]["native_attempt_id"]
+    );
     let t = &timings[0]["data"];
     assert_eq!(timings[0]["request_id"], "timing-fixture");
     assert_eq!(t["role"], "primary");

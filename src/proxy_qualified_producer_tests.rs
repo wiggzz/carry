@@ -102,6 +102,11 @@ async fn synthetic_qualified_terminal_restart(sse: bool) {
             _lock: lock,
         };
         let start = commit.dispatched_at;
+        // This direct relay seam must freeze the same client-layer receipt
+        // as forward_request, before its real loopback dispatch.
+        let mut attempt =
+            Attempt::start("primary", "gpt-6.1-sol", false, true, Some(&resolved), true);
+        attempt.freeze(&body, &config.upstream_url, None);
         let upstream = service
             .client
             .post(&config.upstream_url)
@@ -110,7 +115,7 @@ async fn synthetic_qualified_terminal_restart(sse: bool) {
             .send()
             .await
             .unwrap();
-        let response = relay(upstream, Some(commit), None, false, None).await;
+        let response = relay(upstream, Some(commit), Some(attempt), false, None).await;
         assert_eq!(
             response.status(),
             if step == 3 {

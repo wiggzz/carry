@@ -144,7 +144,16 @@ async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     headers_ready.notify_one();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Caller cancellation does not revoke already-dispatched receipt ownership.
+    // While the body is held, settlement must stay pending, not invent an
+    // unknown-cost failure. Then release the real native paid terminal.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let held = load(&service, &id).unwrap();
+    assert!(held.primary_pending);
+    assert_eq!(held.primary.calls, 1);
+    assert_eq!(held.primary.cost_usd, seed.primary.cost_usd);
+    body_ready.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(5);
     let settled = loop {
         let session = load(&service, &id).unwrap();
         if !session.primary_pending || Instant::now() >= deadline {
@@ -152,19 +161,19 @@ async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    // Release/abort owned provider resources before grading even the RED arm.
-    body_ready.notify_one();
+    // Provider body was released before waiting for actual paid settlement.
     assert!(
         !settled.primary_pending,
-        "CANCEL: caller cancellation before headers must still settle the reserved attempt"
+        "caller disconnect must still drain and settle the later native receipt"
     );
     assert_eq!(settled.primary.calls, 2);
-    assert_eq!(settled.completed_requests, 1);
-    assert_eq!(settled.failed_primaries, 1);
-    assert_eq!(settled.primary.unavailable_cost_calls, 1);
+    assert_eq!(settled.completed_requests, 2);
+    assert_eq!(settled.failed_primaries, 0);
+    assert_eq!(settled.primary.unavailable_cost_calls, 0);
     assert_eq!(
-        settled.primary.cost_usd, seed.primary.cost_usd,
-        "never invent cancelled-request usage or money"
+        settled.primary.cost_usd,
+        2.0 * seed.primary.cost_usd,
+        "preserve every later observed paid receipt after caller cancellation"
     );
     let evidence = serde_json::to_value(settled.request_evidence.as_ref().unwrap()).unwrap();
     assert_eq!(evidence["prior_untracked"], 0);
@@ -177,9 +186,21 @@ async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
             .dashboard(false),
     )
     .unwrap();
-    assert_eq!(dashboard["whole_window"], Value::Null);
-    assert_eq!(dashboard["observed_primary_cost"], seed.primary.cost_usd);
-    assert_eq!(dashboard["excluded_failed_calls"], 1);
+    assert_eq!(
+        dashboard["observed_primary_cost"],
+        2.0 * seed.primary.cost_usd
+    );
+    assert_eq!(dashboard["excluded_failed_calls"], 0);
+    let mut receipts = Vec::new();
+    settled
+        .request_evidence
+        .as_ref()
+        .unwrap()
+        .visit_latest_receipts(|r| receipts.push(r.clone()));
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0].downstream_disconnected);
+    assert_eq!(receipts[0].provider_status.as_deref(), Some("completed"));
+    assert_eq!(receipts[0].cost, Some(seed.primary.cost_usd));
     let mut restarted = checkpoint_service(directory.path());
     restarted.config = service.config.clone();
     let restarted = Arc::new(restarted);
@@ -199,10 +220,10 @@ async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
     let final_state = load(&restarted, &id).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(final_state.primary.calls, 3);
-    assert_eq!(final_state.completed_requests, 2);
-    assert_eq!(final_state.failed_primaries, 1);
-    assert_eq!(final_state.primary.input_tokens, 2000);
-    assert_eq!(final_state.primary.cost_usd, 2.0 * seed.primary.cost_usd);
+    assert_eq!(final_state.completed_requests, 3);
+    assert_eq!(final_state.failed_primaries, 0);
+    assert_eq!(final_state.primary.input_tokens, 3000);
+    assert_eq!(final_state.primary.cost_usd, 3.0 * seed.primary.cost_usd);
     let dashboard = serde_json::to_value(
         final_state
             .request_evidence
@@ -212,10 +233,10 @@ async fn cancelled_preheader_caller_does_not_leave_an_unresolved_attempt() {
     )
     .unwrap();
     assert_eq!(dashboard["coverage"]["prior_untracked_calls"], 0);
-    assert_eq!(dashboard["whole_window"], Value::Null);
+    assert_eq!(dashboard["excluded_failed_calls"], 0);
     assert_eq!(
         dashboard["observed_primary_cost"],
-        2.0 * seed.primary.cost_usd
+        3.0 * seed.primary.cost_usd
     );
     provider.abort();
 }

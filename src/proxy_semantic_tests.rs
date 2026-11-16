@@ -158,12 +158,17 @@ async fn reviewer_deadline_includes_subscription_auth_wait_and_censors_spend() {
     service.config.classifier_timeout_secs = 1;
     let mut session = semantic_subject();
     let projection = planning::Projection::canonical(&session);
-    let mut run = ReviewRun::default();
+    let mut run = ReviewRun {
+        request_id: "auth-held-deadline".into(),
+        ..Default::default()
+    };
     // The auth lock is also taken during a 401 refresh. No network or real
     // credential is involved: this exercises the production subscription wait.
     let _auth = session_lock(&service, "codex-auth").await;
     let result = tokio::time::timeout(
-        Duration::from_secs(2),
+        // Outer fixture slack includes cold tokenization and local journal work;
+        // production's one-second auth/transport deadline is unchanged.
+        Duration::from_secs(5),
         run_review(&service, "deadline", &mut session, &projection, &mut run),
     )
     .await;
@@ -172,11 +177,22 @@ async fn reviewer_deadline_includes_subscription_auth_wait_and_censors_spend() {
         "review deadline must include subscription auth waits"
     );
     assert!(!result.unwrap());
-    assert_eq!(session.shadow.calls, 1);
     assert_eq!(
-        session.shadow.unavailable_cost_calls, 1,
-        "cancelled work is not free"
+        session.shadow.calls, 0,
+        "auth wait never dispatched a provider attempt"
     );
+    assert_eq!(session.shadow.unavailable_cost_calls, 0);
+    assert_eq!(session.shadow.cost_usd, 0.0);
+    assert_eq!(
+        session.last_reviewer_dispatch.as_ref().unwrap().outcome,
+        "not_dispatched"
+    );
+    let record = timing_record(directory.path(), "deadline", "auth-held-deadline");
+    assert_eq!(record["data"]["outcome"], "review_deadline_expired");
+    assert_eq!(record["data"]["actual_dispatch"], false);
+    assert_eq!(record["data"]["attempts"], json!([]));
+    assert_eq!(record["data"]["receipt"], Value::Null);
+    assert_eq!(record["data"]["incomplete"], true);
     assert!(!run.accepted);
 }
 
@@ -256,7 +272,8 @@ fn canonical_source_survives_disposable_projection_and_owner_serialization() {
     )
     .unwrap();
     let record: semantic::Record =
-        serde_json::from_value(serde_json::to_value(semantic::Record::capture(&s)).unwrap()).unwrap();
+        serde_json::from_value(serde_json::to_value(semantic::Record::capture(&s)).unwrap())
+            .unwrap();
     let omitted = HashSet::from([2]);
     let projection = s.render_projection(&omitted);
     assert!(!projection.contains(&canonical[1]));
@@ -274,12 +291,19 @@ fn canonical_source_survives_disposable_projection_and_owner_serialization() {
 
 fn assert_joined_fact_placement(session: &Session) {
     let input = session.render_projection(&HashSet::from([2]));
-    let latest_source = &session.history.iter().find(|item| item.id == 4).unwrap().value;
-    let position = input.iter().position(|item| item == latest_source).unwrap();
-    assert!(input[position + 1]["content"]
-        .as_str()
+    let latest_source = &session
+        .history
+        .iter()
+        .find(|item| item.id == 4)
         .unwrap()
-        .contains(&session.memories[0].text));
+        .value;
+    let position = input.iter().position(|item| item == latest_source).unwrap();
+    assert!(
+        input[position + 1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&session.memories[0].text)
+    );
 }
 
 #[test]

@@ -780,7 +780,7 @@ fn save_publication(
     let result = save_publication_inner(service, id, session, paid_only, publish);
     if let Some(evidence) = &session.request_evidence {
         evidence.visit_latest_receipts(|receipt| {
-            logging::phase_summary(
+            logging::deferred_event(
                 service,
                 id,
                 receipt
@@ -788,6 +788,7 @@ fn save_publication(
                     .as_deref()
                     .unwrap_or(&receipt.request_id),
                 None,
+                "receipt_persistence",
                 &json!({"schema_version":2,"stage":"receipt_persistence",
                     "role":receipt.role,"attempt_id":receipt.request_id,
                     "durable":result.is_ok(),"paid_only":paid_only,

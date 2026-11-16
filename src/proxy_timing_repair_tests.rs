@@ -175,7 +175,10 @@ async fn phase_timing_stalled_sink_does_not_block_predispatch_cancel() {
     assert!(cancelled);
     assert_eq!(load(&service, &id).unwrap().primary.calls, 0);
     let record = timing_record(directory.path(), &id, "stalled-cancel");
-    assert_eq!(record["data"]["outcome"], "cancelled");
+    assert_eq!(record["data"]["outcome"], "dropped_before_terminal");
+    assert_eq!(record["data"]["actual_dispatch"], false);
+    assert_eq!(record["data"]["explicit_local_cancellation"], Value::Null);
+    assert_eq!(record["data"]["attempts"], json!([]));
     assert!(!record.to_string().contains("PRIVATE_"));
     assert!(
         prompt_join,

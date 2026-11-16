@@ -398,17 +398,18 @@ impl PhaseSink {
 
 // Phase-only handoff: bounded serialization + try_send; no filesystem, log lock,
 // worker startup, await, retry, or flushing on the request/cancel/EOF owner.
-pub(super) fn phase_summary(
+pub(super) fn deferred_event(
     service: &Service,
     id: &str,
     request_id: &str,
     review_attempt_id: Option<&str>,
+    event: &'static str,
     data: &Value,
 ) {
     let result = (|| -> Option<()> {
         let sender = service.phase_sink.sender.as_ref()?;
         let record = Record {
-            event: "phase_timing",
+            event,
             at: now(),
             session_id: id,
             request_id,

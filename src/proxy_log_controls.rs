@@ -384,7 +384,14 @@ fn queued_phase_writer_uses_dispatch_policy_without_spending_physical_promises()
             assert!(publication.admit_file(directory.path(), 0).is_ok());
         }
         let (fault, entered) = logging::phase_sink_fault::hold(directory.path());
-        logging::phase_summary(&service, &id, "queued", None, &json!({"count":1}));
+        logging::deferred_event(
+            &service,
+            &id,
+            "queued",
+            None,
+            "phase_timing",
+            &json!({"count":1}),
+        );
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         // A queued observation owns its original policy, not whichever service
         // config would happen to be current when its filesystem writer runs.
@@ -435,7 +442,14 @@ fn queued_phase_writer_waits_for_physical_owner_but_enqueue_does_not() {
     let id = pr154_session_id("phase-publication-race");
     let (fault, entered) = logging::phase_sink_fault::hold(directory.path());
     let publication = history::FilePolicy::new(&service.config).acquire().unwrap();
-    logging::phase_summary(&service, &id, "queued", None, &json!({"count":1}));
+    logging::deferred_event(
+        &service,
+        &id,
+        "queued",
+        None,
+        "phase_timing",
+        &json!({"count":1}),
+    );
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     fault.release();
     let raced = fault.wait_appended(Duration::from_millis(500));
