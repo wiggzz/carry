@@ -1527,13 +1527,19 @@ mod tests {
             // retained output too, so the next native increment subtracts it.
             expected += traditional as f64 * 2e-6;
             if i == 2 {
-                expected += ((3700 + retained - fixed) * 2 + 100 * 10) as f64 / 1e6;
+                expected += ((3700 + retained - fixed + 64) * 2 + 100 * 10) as f64 / 1e6;
             }
         }
-        let actual = evidence.snapshot().chronological.unwrap();
+        let bytes = serde_json::to_vec(&evidence).unwrap();
+        let snapshot = evidence.snapshot();
+        let paid = (2000.0 + 3700.0 + 2000.0 + 2100.0) * 2e-6;
+        assert!((snapshot.observed_primary_cost.unwrap() - paid).abs() < 1e-12);
+        let actual = snapshot.chronological.unwrap();
         assert_eq!(actual.primary_responses, 4);
         assert_eq!(actual.traditional_compactions, 1);
-        let summary_cost = ((3700 + retained - fixed) * 2 + 100 * 10) as f64 / 1e6;
+        // The replacement summarizes only the removable suffix and pays for
+        // 64 new instruction units; the protected fixed floor still survives.
+        let summary_cost = ((3700 + retained - fixed + 64) * 2 + 100 * 10) as f64 / 1e6;
         assert!(
             (actual.summary_cost - summary_cost).abs() < 1e-12,
             "L1 summary retired protected floor: actual={} expected={} fixed={}",
@@ -1548,6 +1554,12 @@ mod tests {
             expected,
             fixed,
             retained
+        );
+        assert_eq!(serde_json::to_vec(&evidence).unwrap(), bytes);
+        let restarted: RequestEvidence = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(restarted.snapshot().chronological).unwrap(),
+            serde_json::to_value(actual).unwrap()
         );
     }
 
@@ -1602,7 +1614,10 @@ mod tests {
             expected += (input * 2 + if opaque { 10000 } else { 0 }) as f64 / 1e6;
             let total = input + if opaque { 1000 } else { 0 };
             if total > 3900 {
-                expected += ((total - 1500) * 2 + 100 * 10) as f64 / 1e6;
+                // Disabled explicit caching makes the replacement request cold:
+                // retired input plus 64 new instruction units, then 100 output
+                // units. Neither instructions nor generated output is cached.
+                expected += ((total - 1500 + 64) * 2 + 100 * 10) as f64 / 1e6;
                 retired += total - 1500 - summary;
                 summary = 100;
             }

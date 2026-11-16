@@ -30,6 +30,9 @@ fn pending_mixed_output_uses_admitted_member_remainder_before_primary_price() {
                     let native = initial + local + residual;
                     let mut m = crate::proxy_quantity::InputMeasurements::default();
                     let mut t = Trajectory {
+                        // Isolate delayed member retention from strategy selection:
+                        // this lifecycle explicitly requests replacement-cold.
+                        summary_strategy: crate::savings::SummaryStrategy::ReplacementCold,
                         scenario: Scenario {
                             context_window: 4000,
                             reserve: 100,
@@ -102,16 +105,10 @@ fn pending_mixed_output_uses_admitted_member_remainder_before_primary_price() {
                     };
                     assert_eq!(t.history.retired, expected_retired);
                     let expected_summary = if current_summary {
-                        modeled_cost(
-                            "gpt-6.1-sol",
-                            &Usage {
-                                input_tokens: priced_input - keep_recent,
-                                output_tokens: 100,
-                                ..Usage::default()
-                            },
-                            None,
-                        )
-                        .unwrap()
+                        // Absolute cold oracle: only the removable suffix plus
+                        // 64 new instruction units pay the frozen implicit miss
+                        // rate (2 input + 0.5 write); 100 output units pay 10.
+                        ((priced_input - keep_recent + 64) as f64 * 2.5 + 100.0 * 10.0) / 1e6
                     } else {
                         0.0
                     };
@@ -138,7 +135,19 @@ fn pending_mixed_output_uses_admitted_member_remainder_before_primary_price() {
                     );
                     assert_eq!(t.snapshot().matched_primary_responses, 1);
                     assert_eq!(t.snapshot().observed_primary_cost.unwrap(), 0.123 + 0.456);
-                    assert_eq!(t.snapshot().carry_cost, 0.456);
+                    // Missing comparison retention does not erase native money.
+                    assert_eq!(t.snapshot().carry_cost, 0.123 + 0.456);
+                    assert_eq!(t.snapshot().coverage.primary_responses, 2);
+                    assert_eq!(t.snapshot().unavailable_primary_cost_calls, 0);
+                    assert!(!t.snapshot().priced);
+                    let frozen_state = state(&t);
+                    let restarted: Trajectory =
+                        serde_json::from_value(frozen_state.clone()).unwrap();
+                    assert_eq!(state(&restarted), frozen_state);
+                    assert_eq!(
+                        serde_json::to_value(restarted.snapshot()).unwrap(),
+                        serde_json::to_value(t.snapshot()).unwrap()
+                    );
                     assert_eq!(t.snapshot().initial_compactions, 0);
                 }
             }
@@ -674,7 +683,17 @@ fn dashboard_aggregates_partial_scope_quality_and_legacy_provenance() {
     let mut legacy = complete.snapshot();
     legacy.quantity_policy_version = None;
     legacy.coverage.measured_quantity_calls = 0;
+    let partial_state = state(&partial);
     let p = partial.snapshot().dashboard(false);
+    assert!(p.carry_cost.is_none() && p.traditional_cost.is_none());
+    assert!((p.observed_primary_cost.unwrap() - (1000.0 + 1100.0) * 2e-6).abs() < 1e-12);
+    assert_eq!(p.unavailable_primary_cost_calls, 0);
+    assert_eq!(state(&partial), partial_state);
+    let restarted: Trajectory = serde_json::from_value(partial_state).unwrap();
+    assert_eq!(
+        serde_json::to_value(restarted.snapshot().dashboard(false)).unwrap(),
+        serde_json::to_value(&p).unwrap()
+    );
     let c = complete.snapshot().dashboard(false);
     let l = legacy.dashboard(false);
     let mut totals = DashboardTotals::default();
@@ -682,7 +701,7 @@ fn dashboard_aggregates_partial_scope_quality_and_legacy_provenance() {
     let serialized = serde_json::to_value(&totals).unwrap();
     assert_eq!(
         serialized["quantity_evidence"]["comparison_scope"],
-        "matched_completed_primary_window"
+        "matched_all_outcome_attempt_window"
     );
     totals.observe(&p);
     totals.observe(&l);
@@ -695,7 +714,14 @@ fn dashboard_aggregates_partial_scope_quality_and_legacy_provenance() {
         serialized["quantity_evidence"]["total_primary_responses"],
         4
     );
-    assert_eq!(serialized["matched_primary_responses"], 3);
+    // Only the two complete one-call sessions enter the paired denominator.
+    // The partial session's known paid receipts remain in all-session expense.
+    assert_eq!(serialized["matched_primary_responses"], 2);
+    assert_eq!(serialized["included_sessions"], 2);
+    assert_eq!(serialized["excluded_sessions"], 1);
+    let observed = serialized["observed_primary_cost"].as_f64().unwrap();
+    assert!((observed - (1000.0 + 1100.0 + 1000.0 + 1000.0) * 2e-6).abs() < 1e-12);
+    assert_eq!(serialized["unavailable_primary_cost_calls"], 0);
     assert_eq!(serialized["quantity_evidence"]["measured_priced_calls"], 2);
     assert_eq!(
         serialized["quantity_evidence"]["unavailable_quantity_calls"],
@@ -708,6 +734,9 @@ fn dashboard_aggregates_partial_scope_quality_and_legacy_provenance() {
     );
     let carry = serialized["carry_cost"].as_f64().unwrap();
     let traditional = serialized["traditional_cost"].as_f64().unwrap();
+    let paired = 2.0 * 1000.0 * 2e-6;
+    assert!((carry - paired).abs() < 1e-12);
+    assert!((traditional - paired).abs() < 1e-12);
     assert_eq!(
         serialized["savings_percent"].as_f64().unwrap(),
         100.0 * (traditional - carry) / traditional
