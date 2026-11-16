@@ -637,7 +637,7 @@ fn resolved_zero_projection_gap_recovers_transitions_not_historical_money() {
                 gap.matched_primary_responses
             );
             assert_eq!(t.snapshot().traditional_cost, gap.traditional_cost);
-            assert_eq!(t.snapshot().carry_cost, gap.carry_cost);
+            assert!((t.snapshot().carry_cost - gap.carry_cost - 0.8 - 0.9).abs() < 1e-12);
             assert_eq!(
                 t.snapshot().coverage.unavailable_quantity_calls,
                 gap.coverage.unavailable_quantity_calls + 2
@@ -668,6 +668,28 @@ fn resolved_zero_projection_gap_recovers_transitions_not_historical_money() {
         assert_eq!(
             t.snapshot().observed_primary_cost.unwrap(),
             expected_observed
+        );
+        assert!((t.snapshot().carry_cost - expected_observed).abs() < 1e-12);
+        assert_eq!(
+            t.snapshot().unavailable_primary_cost_calls,
+            u64::from(!successful)
+        );
+        let frozen = state(&t);
+        let dashboard = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
+        assert!(dashboard["carry_cost"].is_null() && dashboard["traditional_cost"].is_null());
+        assert_eq!(
+            dashboard["quantity_evidence"]["comparison_scope"],
+            "matched_subset_not_whole_session"
+        );
+        assert_eq!(
+            state(&t),
+            frozen,
+            "unavailable comparison must not backfill past money"
+        );
+        let restarted: Trajectory = serde_json::from_value(frozen).unwrap();
+        assert_eq!(
+            serde_json::to_value(restarted.snapshot().dashboard(false)).unwrap(),
+            dashboard
         );
     }
 }
@@ -815,10 +837,26 @@ fn calibrated_partial_projection_replaces_omission_through_summary_restart_and_f
     assert_eq!(t.snapshot().traditional_compactions, 1);
     assert_eq!(t.snapshot().initial_compactions, 0);
     assert_eq!(t.snapshot().coverage.estimated_quantity_calls, 4);
-    let dashboard = serde_json::to_value(t.snapshot().dashboard(false)).unwrap();
+    let before_dashboard = state(&t);
+    let snapshot = t.snapshot();
+    let known_paid = (1000.0 + 5000.0 + 3000.0 + 3000.0 + 3100.0) * 2e-6;
+    assert!((snapshot.observed_primary_cost.unwrap() - known_paid).abs() < 1e-12);
+    assert!((snapshot.carry_cost - known_paid).abs() < 1e-12);
+    assert_eq!(snapshot.coverage.failed_calls, 1);
+    assert_eq!(snapshot.unavailable_primary_cost_calls, 1);
+    assert_eq!(snapshot.excluded_failed_calls, 1);
+    let dashboard = serde_json::to_value(snapshot.dashboard(false)).unwrap();
     assert_eq!(
         dashboard["quantity_evidence"]["comparison_scope"],
-        "matched_completed_primary_window"
+        "matched_subset_not_whole_session"
+    );
+    assert!(dashboard["carry_cost"].is_null() && dashboard["traditional_cost"].is_null());
+    assert_eq!(dashboard["matched_primary_responses"], 5);
+    assert_eq!(state(&t), before_dashboard, "projection is read-only");
+    let restarted: Trajectory = serde_json::from_value(before_dashboard).unwrap();
+    assert_eq!(
+        serde_json::to_value(restarted.snapshot().dashboard(false)).unwrap(),
+        dashboard
     );
     // A larger replacement memory is a NEGATIVE current restoration, not zero
     // and not the previous omission plus a new edit.

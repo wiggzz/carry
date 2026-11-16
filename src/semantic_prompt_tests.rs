@@ -79,9 +79,36 @@ fn semantic_prompt_projection_and_retained_quantities_ignore_only_transport_mark
     );
 }
 
-fn semantic_markers_preserve_summarized_growth(initialized: bool) {
+fn semantic_markers_preserve_summarized_growth(initialized: bool, supported_summary: bool) {
+    use carry::models::{ScenarioCacheMode, ScenarioCachePolicy};
     let mut request = semantic_marker_body();
-    let mut t = Trajectory::default();
+    if supported_summary {
+        // Monetary control uses ordinary caller data. The original lookalikes
+        // remain in the separate Unknown-mode and semantic-fence controls.
+        for pointer in ["/input/1/metadata", "/input/2/output"] {
+            let fields = request
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            let caller = fields.remove("prompt_cache_breakpoint").unwrap();
+            fields.insert("caller_annotation".into(), caller);
+        }
+        request["prompt_cache_options"] = json!({"mode":"implicit","ttl":"30m"});
+    }
+    assert_eq!(
+        ScenarioCachePolicy::for_model("gpt-6.1-sol").request_mode(&request),
+        if supported_summary {
+            ScenarioCacheMode::Implicit
+        } else {
+            ScenarioCacheMode::Unknown
+        }
+    );
+    let mut t = Trajectory {
+        // Isolate history continuity from conservative strategy selection.
+        summary_strategy: crate::savings::SummaryStrategy::ReplacementCold,
+        ..Trajectory::default()
+    };
     if !initialized {
         t.primary(
             &request,
@@ -122,7 +149,28 @@ fn semantic_markers_preserve_summarized_growth(initialized: bool) {
     );
     assert_eq!(before.initial_compactions, u64::from(initialized));
     assert_eq!(before.traditional_compactions, u64::from(!initialized));
-    assert_eq!(before.summary_cost > 0.0, !initialized);
+    if !initialized && supported_summary {
+        // 280k retired + 64 instructions at the long implicit miss/write tier
+        // (2.5 * 2); 1000 output units at 10 * 1.5. No cache-read credit.
+        let expected_summary = ((280000.0 + 64.0) * 5.0 + 1000.0 * 15.0) / 1e6;
+        assert!(
+            (before.summary_cost - expected_summary).abs() < 1e-12,
+            "supported cold summary: {} versus {}",
+            before.summary_cost,
+            expected_summary
+        );
+    } else {
+        assert_eq!(before.summary_cost, 0.0);
+        if !initialized {
+            assert!(
+                before.excluded_unpriced_calls > 0,
+                "unknown summary tariff is unavailable, not free"
+            );
+            assert!(!before.priced);
+            let public = serde_json::to_value(before.clone().dashboard(false)).unwrap();
+            assert!(public["carry_cost"].is_null() && public["traditional_cost"].is_null());
+        }
+    }
     assert!(before.reviewer_cost > 0.0);
     let mut differences = Vec::new();
     let mut paid = before.observed_primary_cost.unwrap();
@@ -182,12 +230,22 @@ fn semantic_markers_preserve_summarized_growth(initialized: bool) {
 
 #[test]
 fn semantic_markers_preserve_free_initialized_growth_across_restart() {
-    semantic_markers_preserve_summarized_growth(true);
+    semantic_markers_preserve_summarized_growth(true, false);
 }
 
 #[test]
 fn semantic_markers_preserve_paid_summary_growth_across_restart() {
-    semantic_markers_preserve_summarized_growth(false);
+    semantic_markers_preserve_summarized_growth(false, false);
+}
+
+#[test]
+fn semantic_markers_preserve_supported_paid_summary_growth_across_restart() {
+    semantic_markers_preserve_summarized_growth(false, true);
+}
+
+#[test]
+fn semantic_markers_preserve_supported_free_initialized_growth_across_restart() {
+    semantic_markers_preserve_summarized_growth(true, true);
 }
 
 // Current semantic cursors preserve explicit true, false and unknown lifetime
