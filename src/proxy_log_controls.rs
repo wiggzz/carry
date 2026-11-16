@@ -235,9 +235,9 @@ fn pr154_usage_diagnostics_are_numeric_and_preserve_censoring() {
     assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_"));
 }
 
-// R2: sink-local ceilings are not authority to spend a paid owner's promise.
+// Sink-local ceilings cannot spend maintenance or fabricate missing receipts.
 #[test]
-fn diagnostic_writers_leave_paid_and_maintenance_promises_intact() {
+fn diagnostic_writers_leave_maintenance_and_prior_receipts_intact() {
     let mut violations = Vec::new();
     for raw in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -285,25 +285,25 @@ fn diagnostic_writers_leave_paid_and_maintenance_promises_intact() {
         let publication = policy.acquire().unwrap();
         let promises_intact = publication.admit_file(directory.path(), 0).is_ok();
         drop(publication);
-        // Complete the genuinely captured native receipt even on the old bad
-        // writer, then verify cold monetary/count/pending controls before RED.
+        // Optional accounting may fail at the actual-write bound. Keep the
+        // already committed receipt unchanged instead of inventing success.
         numeric_primary(&mut session, 1);
         session.primary_pending = false;
-        save_paid_accounting(&service, &id, &session, "diagnostic-promise").unwrap();
+        assert!(save_paid_accounting(&service, &id, &session, "diagnostic-promise").is_err());
         drop(pin);
         let cold = checkpoint_service(directory.path());
         let restored = load(&cold, &id).unwrap();
-        assert_eq!(restored.primary.calls, 2);
-        assert!((restored.primary.cost_usd - 0.004).abs() < 1e-12);
-        assert!(!restored.primary_pending);
-        assert_eq!(restored.completed_requests, 2);
+        assert_eq!(restored.primary.calls, 1);
+        assert!((restored.primary.cost_usd - 0.002).abs() < 1e-12);
+        assert!(restored.primary_pending);
+        assert_eq!(restored.completed_requests, 1);
         if !promises_intact {
             violations.push(if raw { "raw" } else { "journal" });
         }
     }
     assert!(
         violations.is_empty(),
-        "diagnostic writers consumed protected paid/maintenance capacity: {violations:?}"
+        "diagnostic writers consumed protected maintenance capacity: {violations:?}"
     );
 }
 
@@ -348,7 +348,7 @@ fn diagnostic_writers_cannot_race_a_held_physical_publication() {
 }
 
 #[test]
-fn queued_phase_writer_uses_dispatch_policy_without_spending_physical_promises() {
+fn queued_phase_writer_uses_dispatch_policy_and_preserves_prior_receipts() {
     let _serial = logging::phase_sink_fault::SERIAL.blocking_lock();
     for pressured in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -418,12 +418,14 @@ fn queued_phase_writer_uses_dispatch_policy_without_spending_physical_promises()
         );
         numeric_primary(&mut session, 1);
         session.primary_pending = false;
-        save_paid_accounting(&service, &id, &session, "phase-promise").unwrap();
+        let publication = save_paid_accounting(&service, &id, &session, "phase-promise");
+        assert_eq!(publication.is_ok(), !pressured);
         drop(pin);
         let restored = load(&checkpoint_service(directory.path()), &id).unwrap();
-        assert_eq!(restored.primary.calls, 2);
-        assert!((restored.primary.cost_usd - 0.004).abs() < 1e-12);
-        assert!(!restored.primary_pending);
+        assert_eq!(restored.primary.calls, if pressured { 1 } else { 2 });
+        let known_cost = if pressured { 0.002 } else { 0.004 };
+        assert!((restored.primary.cost_usd - known_cost).abs() < 1e-12);
+        assert_eq!(restored.primary_pending, pressured);
     }
 }
 

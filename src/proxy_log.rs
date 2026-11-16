@@ -396,19 +396,20 @@ impl PhaseSink {
     }
 }
 
-// Phase-only handoff: bounded serialization + try_send; no filesystem, log lock,
+// Bounded handoff: serialization + try_send; no filesystem, log lock,
 // worker startup, await, retry, or flushing on the request/cancel/EOF owner.
-pub(super) fn phase_summary(
+fn queued(
     service: &Service,
     id: &str,
     request_id: &str,
     review_attempt_id: Option<&str>,
+    event: &str,
     data: &Value,
 ) {
     let result = (|| -> Option<()> {
         let sender = service.phase_sink.sender.as_ref()?;
         let record = Record {
-            event: "phase_timing",
+            event,
             at: now(),
             session_id: id,
             request_id,
@@ -430,6 +431,36 @@ pub(super) fn phase_summary(
     if result.is_none() {
         JOURNAL_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+pub(super) fn phase_summary(
+    service: &Service,
+    id: &str,
+    request_id: &str,
+    review_attempt_id: Option<&str>,
+    data: &Value,
+) {
+    queued(
+        service,
+        id,
+        request_id,
+        review_attempt_id,
+        "phase_timing",
+        data,
+    );
+}
+
+pub(super) fn storage_warning(service: &Service, id: &str, request_id: &str, stage: &str) {
+    // Fixed enum-like stage and outcome only; never caller input, credentials,
+    // exception strings or provider output. The shared queue never waits/flushes.
+    queued(
+        service,
+        id,
+        request_id,
+        None,
+        "storage_unavailable",
+        &json!({"stage":stage,"recorded":false}),
+    );
 }
 
 pub(super) fn raw(service: &Service, id: &str, event: &str, data: &Value) {

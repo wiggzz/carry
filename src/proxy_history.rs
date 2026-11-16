@@ -87,8 +87,8 @@ impl Drop for Pin {
     }
 }
 pub(super) fn pin(service: &Service, id: &str) -> Result<Pin, Failure> {
-    // Serialize admission with durable writes, always IO before PINS. Otherwise
-    // a new promise could race a transaction's already-frozen capacity budget.
+    // Serialize live ancestry ownership with durable writes, always IO before
+    // PINS. Pins do not reserve disk space for optional future persistence.
     let _guard = IO.lock().unwrap();
     pin_owner(service, id, &mut PINS.lock().unwrap())
 }
@@ -102,33 +102,21 @@ fn pin_owner(
         && pins.keys().filter(|(dir, _)| dir == &key.0).count()
             >= service.config.history_max_references as usize
     {
-        return Err(failure(
+        return Err(storage_failure(
             StatusCode::INSUFFICIENT_STORAGE,
             "history owners busy",
         ));
     }
-    if !pins.contains_key(&key) {
-        let owners = pins.keys().filter(|(dir, _)| dir == &key.0).count() + 1;
-        // A normal pin is read-only: do not expire the authority the caller is
-        // about to protect. Under pressure, maintenance spends its independent
-        // promise before retrying admission, not the new owner's headroom.
-        if storage::admit_owner(service, owners).is_err() {
-            storage::maintain(
-                service,
-                pins.keys()
-                    .filter(|(dir, _)| dir == &key.0)
-                    .map(|(_, id)| id.clone())
-                    .collect(),
-            )
-            .map_err(read_failure)?;
-            storage::admit_owner(service, owners).map_err(|_| {
-                failure(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "durable history disk admission refused",
-                )
-            })?;
-        }
-    }
+    // Pins protect live ancestry and bound in-memory owners, not future disk
+    // capacity. Validate existing authority without making a storage promise.
+    storage::initialize(
+        service,
+        pins.keys()
+            .filter(|(dir, _)| dir == &key.0)
+            .map(|(_, id)| id.clone())
+            .collect(),
+    )
+    .map_err(authority_failure)?;
     pins.entry(key.clone())
         .or_insert(Owner {
             count: 0,
@@ -150,7 +138,7 @@ fn reserve(service: &Service, key: String, store: &Store) -> Result<(String, Pin
     for ((dir, id), owner) in pins.iter() {
         if dir == &service.config.state_dir
             && owner.reservation.as_ref() == Some(&key)
-            && !store.contains("snapshots", id).map_err(read_failure)?
+            && !store.contains("snapshots", id).map_err(authority_failure)?
         {
             let id = id.clone();
             return pin_owner(service, &id, &mut pins).map(|pin| (id, pin));
@@ -158,8 +146,10 @@ fn reserve(service: &Service, key: String, store: &Store) -> Result<(String, Pin
     }
     let mut id = key.clone();
     let mut generation = 0u64;
-    while store.contains("owners", &id).map_err(read_failure)?
-        || store.contains("snapshots", &id).map_err(read_failure)?
+    while store.contains("owners", &id).map_err(authority_failure)?
+        || store
+            .contains("snapshots", &id)
+            .map_err(authority_failure)?
         || pins.contains_key(&(service.config.state_dir.clone(), id.clone()))
         || service.config.state_dir.join(format!("{id}.json")).exists()
     {
@@ -229,20 +219,23 @@ pub(super) fn initialize(service: &Service) -> std::io::Result<()> {
 fn read(service: &Service) -> std::io::Result<Store> {
     Store::open(service, pinned(service), false)
 }
-fn read_failure(error: std::io::Error) -> Failure {
+pub(super) fn authority_failure(error: std::io::Error) -> Failure {
     let status = match error.kind() {
         std::io::ErrorKind::StorageFull => StatusCode::INSUFFICIENT_STORAGE,
         std::io::ErrorKind::InvalidData => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    failure(
+    let unavailable = error.kind() != std::io::ErrorKind::InvalidData;
+    let mut result = failure(
         status,
         if error.kind() == std::io::ErrorKind::InvalidData {
             "unsupported or invalid history index format"
         } else {
             "history authority unavailable"
         },
-    )
+    );
+    result.2 = unavailable;
+    result
 }
 pub(super) fn namespace(
     service: &Service,
@@ -255,7 +248,7 @@ pub(super) fn namespace(
     }
     let owner = identity(&owner)?;
     let namespace = observed_namespace(&service.config, &owner, body);
-    initialize(service).map_err(read_failure)?;
+    initialize(service).map_err(authority_failure)?;
     Ok(namespace)
 }
 fn observed_namespace(config: &ProxyCli, owner: &Option<String>, body: &Value) -> String {
@@ -309,9 +302,9 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
         return Ok(());
     };
     let _guard = IO.lock().unwrap();
-    let store = read(service).map_err(read_failure)?;
+    let store = read(service).map_err(authority_failure)?;
     let key = hash(&(namespace, kind, external));
-    if !store.live("transcripts", &key).map_err(read_failure)? {
+    if !store.live("transcripts", &key).map_err(authority_failure)? {
         return Err(failure(
             StatusCode::CONFLICT,
             "unknown, expired or unobserved transcript identifier",
@@ -319,11 +312,11 @@ pub(super) fn expand(service: &Service, namespace: &str, body: &mut Value) -> Re
     }
     let reference: Transcript = store
         .get("transcripts", &key)
-        .map_err(read_failure)?
+        .map_err(authority_failure)?
         .ok_or_else(|| failure(StatusCode::CONFLICT, "transcript unavailable"))?;
     let mut input = store
         .ancestry(namespace, &reference.frontier)
-        .map_err(read_failure)?;
+        .map_err(authority_failure)?;
     input.extend(
         body["input"]
             .as_array()
@@ -352,13 +345,13 @@ pub(super) fn candidate(
     let mut owner = None;
     if let Some((kind, id)) = external {
         let key = hash(&(namespace, kind, id));
-        if store.live("transcripts", &key).map_err(read_failure)?
+        if store.live("transcripts", &key).map_err(authority_failure)?
             && let Some(reference) = store
                 .get::<Transcript>("transcripts", &key)
-                .map_err(read_failure)?
+                .map_err(authority_failure)?
             && store
                 .live("snapshots", &reference.session)
-                .map_err(read_failure)?
+                .map_err(authority_failure)?
         {
             owner = Some(reference.session);
         }
@@ -366,7 +359,7 @@ pub(super) fn candidate(
     if owner.is_none()
         && let Some(input) = body["input"].as_array()
     {
-        owner = prefix_owner(&store, namespace, input).map_err(read_failure)?;
+        owner = prefix_owner(&store, namespace, input).map_err(authority_failure)?;
     }
     owner
         .map(|id| pin_owner(service, &id, &mut PINS.lock().unwrap()).map(|pin| (id, pin)))
@@ -401,11 +394,11 @@ pub(super) fn resolve(
     previous: Option<Pin>,
 ) -> Result<(String, Pin), Failure> {
     let _guard = IO.lock().unwrap();
-    let store = read(service).map_err(read_failure)?;
+    let store = read(service).map_err(authority_failure)?;
     let input = body["input"]
         .as_array()
         .ok_or_else(|| failure(StatusCode::BAD_REQUEST, "array input required"))?;
-    if let Some(id) = prefix_owner(&store, namespace, input).map_err(read_failure)? {
+    if let Some(id) = prefix_owner(&store, namespace, input).map_err(authority_failure)? {
         // Preserve the admitted owner's protection through selection. Transfer
         // a different hint's slot only under the same publication/admission lock.
         if let Some(pin) =
@@ -621,10 +614,10 @@ pub(super) fn hydrate(
     // Only review-mode array histories have a namespace. Off-mode forwarding
     // still accepts non-array provider input without consulting shared state.
     let input = body["input"].as_array().unwrap();
-    let view = ReadView::new(service).map_err(read_failure)?;
+    let view = ReadView::new(service).map_err(authority_failure)?;
     let continuation = view
         .continuation(namespace, input, original)
-        .map_err(read_failure)?;
+        .map_err(authority_failure)?;
     let advice = view.advice(namespace, input);
     if let Some(continuation) = continuation {
         if let Some(evidence) = &mut session.request_evidence {

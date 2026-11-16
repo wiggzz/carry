@@ -300,10 +300,11 @@ class DashboardDispatchContract(unittest.TestCase):
             proxy = ImplicitProxy(root, fixture, ["--history-max-bytes", "32768"], wait_reviews=False)
             stack.callback(proxy.close)
             source = [{"role": "user", "content": "Small admitted request."}]
-            # Headers are already forwarded when persistence rejects completed
-            # response material; Carry aborts the downstream chunked body.
-            with self.assertRaises(http.client.IncompleteRead):
-                proxy.send(source)
+            # Persistence failure must not abort the actual provider result.
+            status, delivered = proxy.send(source)
+            self.assertEqual(status, 200)
+            self.assertEqual(delivered["output"], output)
+            self.assertEqual(delivered["id"], "resp_unpublished")
             events = [json.loads(line) for p in (root / "diagnostics").glob("*.jsonl") for line in p.read_text().splitlines()]
             failed = [event for event in events if event["event"] == "primary_checkpoint_failed"]
             self.assertEqual(len(failed), 1, events)

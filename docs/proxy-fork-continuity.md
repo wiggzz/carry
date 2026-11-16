@@ -95,8 +95,9 @@ new review until a permissible projection fits; protection is never bypassed.
 native-value graph, prefix-bound advice, wire evidence, transcript references,
 paid-owner snapshots and independent numeric observations. Snapshots do not store
 semantic authority; diagnostic JSON mirrors are not fallback authority. Atomic
-transactions, in-flight owner pins and reserved disk headroom protect settlement.
-Only one process may own a state directory.
+transactions and in-flight ancestry pins protect existing history. Persistence
+is best-effort: owners do not reserve maximum-size future receipt/checkpoint
+capacity before inference. Only one process may own a state directory.
 
 Observed successful `previous_response_id` and `conversation` references expand
 only retained original input plus actual provider output. They are mutually
@@ -108,8 +109,28 @@ Detailed history defaults to seven days (`--history-max-age-secs`); numeric
 observations default to 180 days (`--accounting-max-age-secs`). Disk/reference
 pressure cannot shorten detailed retention. Node/record limits bound decoded
 working sets, and the reference limit bounds concurrently pinned owners, not
-total retained sessions. The separate `--history-disk-bytes` ceiling rejects
-admission rather than evicting unexpired evidence; HTTP507 is not a reset request.
+total retained sessions. Ordinary bounded writes are attempted optimistically;
+actual transaction/file limits and maintenance headroom still apply. The separate
+`--history-disk-bytes` ceiling refuses local persistence rather than evicting
+unexpired evidence. If actual write admission, SQLite open/permission/I/O, or local
+storage writes fail, self-contained requests instead use the ordinary upstream
+transport with the caller's original payload, without selection, new reviews or
+durable accounting. Pre-dispatch degradation returns
+`x-carry-durability: unavailable`. No new local response/history handle is promised;
+provider response IDs still appear in the actual output but cannot be used as
+Carry ancestry unless publication succeeded. Requests requiring missing or
+unreadable local ancestry still fail closed. Off and unsupported-model forwarding
+leave provider-owned response/conversation references intact even when optional
+tracking fails. After upstream dispatch, persistence failure never retries
+generation or aborts otherwise valid JSON/SSE output; an
+existing pending marker remains conservative if even paid-only settlement fails.
+Already-sent response headers cannot report a later persistence failure; the
+bounded diagnostic lane receives a privacy-safe `storage_unavailable` warning
+and checkpoint/accounting publication outcomes when available. These warnings use
+the existing fixed-capacity nonblocking queue; full queues or failed sinks may drop
+them and never create a retry/flush obligation on the response owner. Lost local
+history/accounting is accepted, not backfilled or represented as known zero cost.
+Absence of a diagnostic is not proof of persistence or complete coverage.
 Maintenance collects expired history within its own bounded disk reserve.
 See `carry proxy --help` for supported ranges and environment names.
 

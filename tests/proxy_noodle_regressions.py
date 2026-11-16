@@ -16,7 +16,7 @@ class NoodleRegressions(unittest.TestCase):
     proxy = history_fixture.TransparentHistory.proxy
 
     def explicit_paid_pressure(self, *, pressure):
-        """Hold a real first Off receipt while preserving every promised byte."""
+        """Hold a real Off receipt while consuming ordinary actual-write space."""
         import threading
         import http.client
 
@@ -50,21 +50,20 @@ class NoodleRegressions(unittest.TestCase):
         self.assertIsNone(pending.get("history_namespace"))
         self.assertEqual(fixture.primaries, [body], "Off forwarding preserves the entire wire")
         self.assertEqual(fixture.reviews, [])
-        # Default policy: one paid owner plus independent maintenance. Sparse
-        # synthetic external pressure consumes ordinary headroom, not promises.
+        # Ordinary actual-write pressure leaves only bounded transaction slack
+        # and maintenance; no future paid-settlement promise exists.
         max_record, disk_limit = 32 * 1024**2, 1024**3
         charge = lambda size: size * 4 + 16384
-        paid = charge(max_record) * 2 + charge(128) * 2 + max_record * 2 + 65536
         maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
         before_bytes = sum(p.stat().st_size for p in self.state.rglob("*"))
         pressure_file = self.state / "ordinary-pressure.bin"
         if pressure:
-            extent = disk_limit - paid - maintenance - 65536 - before_bytes
+            extent = disk_limit - maintenance - 65536 - before_bytes
             self.assertGreater(extent, 0)
             with pressure_file.open("wb") as file:
                 file.truncate(extent)
             self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
-                             disk_limit - paid - maintenance - 65536)
+                             disk_limit - maintenance - 65536)
         schema_before_receipt = (self.state / "history.index").exists()
         release.set()
         worker.join(timeout=25)
@@ -85,13 +84,13 @@ class NoodleRegressions(unittest.TestCase):
         outcome = {"result": result, "pending": pending, "settled": settled,
                    "restarted": cold, "primaries": fixture.primaries,
                    "reviews": fixture.reviews, "schema_before_receipt": schema_before_receipt,
-                   "paid_promise": paid, "maintenance_promise": maintenance,
+                   "maintenance_promise": maintenance,
                    "disk_limit": disk_limit, "ordinary_slack": 65536,
                    "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
         self.evidence[str(pressure)] = outcome
         return outcome
 
-    def test_first_explicit_off_receipt_survives_default_limit_pressure_and_restart(self):
+    def test_first_explicit_off_delivery_survives_actual_limit_pressure_and_restart(self):
         root = self.state
         for pressure in (False, True):
             with self.subTest(pressure=pressure):
@@ -99,29 +98,33 @@ class NoodleRegressions(unittest.TestCase):
                 self.state.mkdir()
                 outcome = self.explicit_paid_pressure(pressure=pressure)
                 known = (100 * .10 + .50) / 1e6
-                # Ordinary history publication may fail closed while the paid
-                # accounting transaction succeeds. Grade native receipt facts
-                # independently of that deliberate client-delivery failure.
+                # Failed optional settlement preserves the actual old pending
+                # record, not a fictional successful receipt or known zero cost.
                 with self.subTest(phase="settled"):
-                    self.assertEqual(outcome["settled"]["primary"]["calls"], 1)
-                    self.assertEqual(outcome["settled"]["primary"]["unavailable_cost_calls"], 0)
-                    self.assertAlmostEqual(outcome["settled"]["primary"]["cost_usd"], known, places=12)
-                    self.assertFalse(outcome["settled"]["primary_pending"])
+                    if pressure:
+                        self.assertEqual(outcome["settled"], outcome["pending"])
+                    else:
+                        self.assertEqual(outcome["settled"]["primary"]["calls"], 1)
+                        self.assertEqual(outcome["settled"]["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(outcome["settled"]["primary"]["cost_usd"], known, places=12)
+                        self.assertFalse(outcome["settled"]["primary_pending"])
                 with self.subTest(phase="delivery"):
                     if pressure:
-                        self.assertEqual(outcome["result"], {"error": "IncompleteRead"})
+                        self.assertNotIn("error", outcome["result"])
+                        self.assertEqual(outcome["result"]["response"][0], 200)
+                        self.assertEqual(outcome["result"]["response"][1], completed(response_id="explicit_paid_1"))
                         self.assertIsNone(outcome["settled"].get("last_response_id"),
-                                          "paid facts must not publish the rejected response ancestry")
+                                          "failed persistence must not publish response ancestry")
                     else:
                         self.assertNotIn("error", outcome["result"])
                         self.assertEqual(outcome["result"]["response"][0], 200)
                 with self.subTest(phase="restart"):
                     self.assertEqual(outcome["restarted"]["primary"]["calls"], 2)
-                    self.assertEqual(outcome["restarted"]["primary"]["unavailable_cost_calls"], 0)
-                    self.assertAlmostEqual(outcome["restarted"]["primary"]["cost_usd"], known * 2, places=12)
+                    self.assertEqual(outcome["restarted"]["primary"]["unavailable_cost_calls"], int(pressure))
+                    self.assertAlmostEqual(outcome["restarted"]["primary"]["cost_usd"], known * (1 if pressure else 2), places=12)
                     self.assertFalse(outcome["restarted"]["primary_pending"])
 
-    def test_explicit_checkpoint_bound_refuses_oversize_before_paid_dispatch(self):
+    def test_explicit_checkpoint_bound_forwards_oversize_without_claiming_durability(self):
         fixture = self.fixture(lambda _b, n: (200, completed(response_id=f"bounded_explicit_{n}")))
         options = ["--history-max-bytes", "65536", "--history-disk-bytes", "8388608"]
         proxy = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
@@ -139,11 +142,12 @@ class NoodleRegressions(unittest.TestCase):
         proxy.close()
         self.evidence["oversize"] = {"result": result, "seed": seed, "after": after,
                                      "primaries": fixture.primaries, "reviews": fixture.reviews}
-        # A safe pre-dispatch rejection is not a successfully settled paid call.
-        # Keep it separate from the admitted-large pressure controls below.
+        # This call is forwarded non-durably, not a successfully persisted paid
+        # call. Existing paid authority must remain unchanged.
         with self.subTest(phase="admission"):
-            self.assertIn(result[0], (500, 507))
-            self.assertEqual(fixture.primaries, [small])
+            self.assertEqual(result[0], 200)
+            self.assertEqual(result[1], completed(response_id="bounded_explicit_2"))
+            self.assertEqual(fixture.primaries, [small, large])
         with self.subTest(phase="authority"):
             self.assertEqual(path.read_bytes(), seed_bytes)
             self.assertEqual(after["primary"], seed["primary"])
@@ -157,16 +161,16 @@ class NoodleRegressions(unittest.TestCase):
         self.evidence["oversize"]["restarted"] = cold
         self.evidence["oversize"]["primaries"] = fixture.primaries
         with self.subTest(phase="restart"):
-            self.assertEqual(fixture.primaries, [small, small])
+            self.assertEqual(fixture.primaries, [small, large, small])
             self.assertEqual(cold["primary"]["calls"], 2)
             self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
             self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * (100 * .10 + .50) / 1e6, places=12)
         restarted.close()
 
-    def test_admitted_large_explicit_checkpoint_settles_protected_pressure_and_restart(self):
+    def test_admitted_large_explicit_checkpoint_delivers_under_actual_limit_pressure_and_restart(self):
         self.admitted_large_explicit_checkpoint()
 
-    def test_near_bound_explicit_checkpoint_never_loses_known_paid_receipt(self):
+    def test_near_bound_explicit_checkpoint_delivers_without_fabricating_unstored_receipt(self):
         root = self.state
         self.state = root / "calibration"
         self.state.mkdir()
@@ -202,9 +206,8 @@ class NoodleRegressions(unittest.TestCase):
                     return 200, completed(response_id=f"admitted_large_{n}")
                 fixture = self.fixture(primary)
                 self.stack.callback(release.set)
-                # The SAME record bound owns SQL, explicit checkpoint admission
-                # and the paid promise. This declares a legal large record; it
-                # does not raise the configured cap while the request is paid.
+                # The unchanged bound owns actual SQL/checkpoint writes. It is
+                # not a reservation for the largest possible future receipt.
                 disk_limit = 64 * 1024**2
                 options = ["--request-timeout-secs", "20", "--history-max-bytes", str(max_record),
                            "--history-disk-bytes", str(disk_limit)]
@@ -234,42 +237,39 @@ class NoodleRegressions(unittest.TestCase):
                         finished.set()
                 worker = threading.Thread(target=send, daemon=True)
                 worker.start()
-                if near_bound:
-                    deadline = time.monotonic() + 10
-                    while not held.is_set() and not finished.is_set() and time.monotonic() < deadline:
-                        held.wait(.02)
-                    if finished.is_set() and not held.is_set():
-                        # Refusing an impossible settlement obligation before
-                        # billing is safe, not proof that a paid receipt settled.
-                        self.assertNotIn("error", result)
-                        self.assertIn(result["response"][0], (500, 507))
-                        self.assertEqual(fixture.primaries, [small])
-                        self.assertEqual(fixture.reviews, [])
-                        self.assertEqual(seed_path.read_bytes(), seed_bytes)
-                        self.assertEqual(list(self.state.glob(".*.tmp")), [])
-                        release.set()  # The restarted small request is now fixture arrival two.
-                        worker.join(timeout=1)
-                        self.assertFalse(worker.is_alive())
-                        proxy.close()
-                        restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
-                        self.stack.callback(restarted.close)
-                        self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
-                        cold = restarted.saved()
-                        restarted.close()
-                        self.assertEqual(fixture.primaries, [small, small])
-                        self.assertEqual(cold["primary"]["calls"], 2)
-                        self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
-                        self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * known, places=12)
-                        self.assertFalse(cold["primary_pending"])
-                        self.evidence[str(pressure)] = {
-                            "classification": "safe_before_billing_refusal", "result": result,
-                            "seed": seed, "restarted": cold, "record_bound": max_record,
-                            "primaries": fixture.primaries, "reviews": fixture.reviews}
-                        continue
                 self.assertTrue(held.wait(10), "legal large checkpoint must reach upstream")
                 pending = proxy.saved()
                 path, = self.state.glob("*.json")
                 checkpoint_bytes = path.stat().st_size
+                pending_bytes = path.read_bytes()
+                if near_bound and not pending["primary_pending"]:
+                    # Storage-only admission failure now forwards the original
+                    # large call, without claiming it in the durable seed.
+                    self.assertEqual(path.read_bytes(), seed_bytes)
+                    self.assertEqual(pending["primary"], seed["primary"])
+                    self.assertEqual(fixture.primaries, [small, large])
+                    self.assertEqual(fixture.reviews, [])
+                    release.set()
+                    worker.join(timeout=25)
+                    self.assertFalse(worker.is_alive())
+                    self.assertNotIn("error", result)
+                    self.assertEqual(result["response"], (200, completed(response_id="admitted_large_2")))
+                    self.assertEqual(path.read_bytes(), seed_bytes)
+                    proxy.close()
+                    restarted = Proxy(self.state, fixture, options, mode="off", wait_reviews=False)
+                    self.stack.callback(restarted.close)
+                    self.assertEqual(restarted.request("POST", "/v1/responses", small)[0], 200)
+                    cold = restarted.saved()
+                    self.assertEqual(fixture.primaries, [small, large, small])
+                    self.assertEqual(cold["primary"]["calls"], 2)
+                    self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                    self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * known, places=12)
+                    self.assertFalse(cold["primary_pending"])
+                    restarted.close()
+                    self.evidence[str(pressure)] = {"classification": "non_durable_primary",
+                        "result": result, "seed": seed, "restarted": cold,
+                        "primaries": fixture.primaries, "reviews": fixture.reviews}
+                    continue
                 self.assertGreater(checkpoint_bytes, 1024**2)
                 self.assertLessEqual(checkpoint_bytes, max_record)
                 if near_bound:
@@ -282,21 +282,24 @@ class NoodleRegressions(unittest.TestCase):
                 self.assertEqual(fixture.primaries, [small, large])
                 self.assertEqual(fixture.reviews, [])
                 charge = lambda size: 4 * size + 16384
-                paid = 2 * charge(max_record) + 2 * charge(128) + 2 * max_record + 65536
                 maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
                 before = sum(p.stat().st_size for p in self.state.rglob("*"))
                 pressure_file = self.state / "ordinary-pressure.bin"
                 if pressure:
-                    extent = disk_limit - paid - maintenance - 65536 - before
+                    extent = disk_limit - maintenance - 65536 - before
                     self.assertGreater(extent, 0)
                     with pressure_file.open("wb") as file:
                         file.truncate(extent)
                     self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
-                                     disk_limit - paid - maintenance - 65536)
+                                     disk_limit - maintenance - 65536)
                 release.set()
                 worker.join(timeout=25)
                 self.assertFalse(worker.is_alive())
                 settled = proxy.saved()
+                lost_receipt = pressure or near_bound
+                if lost_receipt:
+                    self.assertEqual(path.read_bytes(), pending_bytes,
+                        "failed settlement must leave exact prior checkpoint bytes unchanged")
                 proxy.close()
                 if pressure:
                     pressure_file.unlink()
@@ -311,37 +314,35 @@ class NoodleRegressions(unittest.TestCase):
                     "result": result, "seed": seed, "pending": pending, "settled": settled,
                     "restarted": cold, "primaries": fixture.primaries, "reviews": fixture.reviews,
                     "checkpoint_bytes": checkpoint_bytes, "record_bound": max_record,
-                    "paid_promise": paid, "maintenance_promise": maintenance,
+                    "maintenance_promise": maintenance,
                     "disk_limit": disk_limit, "ordinary_slack": 65536,
                     "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
                 with self.subTest(phase="settled"):
-                    self.assertEqual(settled["primary"]["calls"], 2)
-                    self.assertEqual(settled["primary"]["unavailable_cost_calls"], 0)
-                    self.assertAlmostEqual(settled["primary"]["cost_usd"], 2 * known, places=12)
-                    self.assertFalse(settled["primary_pending"])
-                with self.subTest(phase="delivery"):
-                    if pressure:
-                        self.assertEqual(result, {"error": "IncompleteRead"})
-                        self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id"),
-                                         "paid fallback must not publish rejected new ancestry")
-                    elif near_bound and "error" in result:
-                        self.assertEqual(result, {"error": "IncompleteRead"})
-                        self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id"),
-                                         "record-bound rejection must not publish new ancestry")
+                    if lost_receipt:
+                        self.assertEqual(settled, pending)
                     else:
-                        self.assertNotIn("error", result)
-                        self.assertEqual(result["response"][0], 200)
+                        self.assertEqual(settled["primary"]["calls"], 2)
+                        self.assertEqual(settled["primary"]["unavailable_cost_calls"], 0)
+                        self.assertAlmostEqual(settled["primary"]["cost_usd"], 2 * known, places=12)
+                        self.assertFalse(settled["primary_pending"])
+                with self.subTest(phase="delivery"):
+                    self.assertNotIn("error", result)
+                    self.assertEqual(result["response"][0], 200)
+                    self.assertEqual(result["response"][1], completed(response_id="admitted_large_2"))
+                    self.assertEqual(settled.get("last_response_id"), pending.get("last_response_id")
+                        if lost_receipt else "admitted_large_2",
+                        "only successful actual persistence may publish response ancestry")
                 with self.subTest(phase="restart"):
                     self.assertEqual(cold["primary"]["calls"], 3)
-                    self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
-                    self.assertAlmostEqual(cold["primary"]["cost_usd"], 3 * known, places=12)
+                    self.assertEqual(cold["primary"]["unavailable_cost_calls"], int(lost_receipt))
+                    self.assertAlmostEqual(cold["primary"]["cost_usd"], (2 if lost_receipt else 3) * known, places=12)
                     self.assertFalse(cold["primary_pending"])
         self.state = root
 
-    def test_reviewer_receipt_growth_preserves_known_money(self):
+    def test_reviewer_receipt_growth_preserves_delivery_and_committed_money(self):
         self.reviewer_receipt_growth()
 
-    def test_near_bound_reviewer_receipt_growth_preserves_known_money(self):
+    def test_near_bound_reviewer_receipt_growth_never_fabricates_unstored_money(self):
         root = self.state
         self.state = root / "calibration"
         self.state.mkdir()
@@ -393,16 +394,32 @@ class NoodleRegressions(unittest.TestCase):
                          {"role": "user", "content": "REVIEWER_GROWTH_TASK"}]
                     body = {"model": "gpt-6-luna", "input": h}
                     initial = proxy.send(h, wait=False)
-                    if near_bound and initial[0] in (500, 507) and not fixture.primaries and not fixture.reviews:
-                        self.assertEqual(list(self.state.glob(".*.tmp")), [])
-                        self.evidence[f"extension-{extension}-pressure-{pressure}"] = {
-                            "classification": "safe_before_any_billing_refusal", "result": initial,
-                            "record_bound": max_record, "primaries": fixture.primaries,
-                            "reviews": fixture.reviews}
-                        proxy.close()
-                        continue
                     self.assertEqual(initial[0], 200)
                     arrived = held.wait(1 if near_bound else 10)
+                    snapshot = proxy.saved()
+                    if near_bound and not snapshot.get("primary_pending") and snapshot.get("primary", {}).get("calls", 0) == 0:
+                        self.assertEqual(fixture.reviews, [], "degraded primaries must not launch paid background reviews")
+                        self.assertEqual(fixture.primaries, [body])
+                        self.assertEqual(initial, (200, completed(response_id="reviewer_growth_1")))
+                        self.assertEqual(list(self.state.glob("*.json")), [])
+                        if (self.state / "history.index").exists():
+                            index = read_index(self.state / "history.index")
+                            self.assertFalse(index["snapshots"])
+                            self.assertFalse(index["transcripts"])
+                        proxy.close()
+                        restarted = TransparentProxy(self.state, fixture, options, mode="audit", wait_reviews=False)
+                        self.stack.callback(restarted.close)
+                        self.assertEqual(restarted.send(h, wait=False), (200, completed(response_id="reviewer_growth_2")))
+                        self.assertEqual(fixture.primaries, [body, body])
+                        self.assertEqual(fixture.reviews, [])
+                        self.assertEqual(list(self.state.glob("*.json")), [])
+                        if (self.state / "history.index").exists():
+                            self.assertFalse(read_index(self.state / "history.index")["snapshots"])
+                        restarted.close()
+                        self.evidence[f"extension-{extension}-pressure-{pressure}"] = {
+                            "classification": "non_durable_primary_without_reviewer", "primaries": fixture.primaries,
+                            "reviews": fixture.reviews, "record_bound": max_record}
+                        continue
                     if near_bound and not arrived:
                         self.assertTrue(proxy.reviewers_settled())
                         safe = proxy.saved()
@@ -448,17 +465,16 @@ class NoodleRegressions(unittest.TestCase):
                     self.assertEqual(replies[0]["usage"]["input_tokens"], 100)
                     self.assertEqual(replies[0]["usage"]["output_tokens"], 1)
                     charge = lambda size: 4 * size + 16384
-                    paid = 2 * charge(max_record) + 2 * charge(128) + 2 * max_record + 65536
                     maintenance = min(charge(max_record) + 65536 + charge(0), disk_limit // 2)
                     pressure_file = self.state / "ordinary-pressure.bin"
                     before = sum(p.stat().st_size for p in self.state.rglob("*"))
                     if pressure:
-                        extent = disk_limit - paid - maintenance - 65536 - before
+                        extent = disk_limit - maintenance - 65536 - before
                         self.assertGreater(extent, 0)
                         with pressure_file.open("wb") as file:
                             file.truncate(extent)
                         self.assertEqual(sum(p.stat().st_size for p in self.state.rglob("*")),
-                                         disk_limit - paid - maintenance - 65536)
+                                         disk_limit - maintenance - 65536)
                     release.set()
                     deadline = time.monotonic() + 10
                     while not any(e["event"] == "background_review_merged" for e in self.events()):
@@ -479,36 +495,43 @@ class NoodleRegressions(unittest.TestCase):
                     cold_index = read_index(self.state / "history.index")
                     cold, = cold_index["snapshots"].values()
                     restarted.close()
-                    self.assertEqual(fixture.primaries, [body] if restart_result[0] == 507 else [body, body])
+                    self.assertEqual(restart_result, (200, completed(response_id="reviewer_growth_2")))
+                    self.assertEqual(fixture.primaries, [body, body])
                     self.assertEqual(len(fixture.reviews), 1, "restart must not rebill reviewer")
                     key = f"extension-{extension}-pressure-{pressure}"
                     self.evidence[key] = {"pending": pending, "settled": settled, "restarted": cold,
                         "primaries": fixture.primaries, "reviews": fixture.reviews, "provider_responses": replies,
                         "restart_result": restart_result, "events": completed_events, "advice_records": index["reviews"],
                         "record_bound": max_record, "snapshot_bytes": snapshot_bytes, "disk_limit": disk_limit,
-                        "paid_promise": paid, "maintenance_promise": maintenance,
+                        "maintenance_promise": maintenance,
                         "logs": {p.name: p.read_text() for p in self.state.glob("fixture-*.log")}}
                     known = (100 * .10 + .50) / 1e6
+                    lost_receipt = pressure or near_bound
                     with self.subTest(phase="settled"):
-                        self.assertEqual(settled["shadow"]["calls"], 1)
-                        self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
-                        self.assertAlmostEqual(settled["shadow"]["cost_usd"], known, places=12)
-                        self.assertEqual(settled["shadow"]["input_tokens"], 100)
-                        self.assertEqual(settled["shadow"]["output_tokens"], 1)
-                        self.assertFalse(settled["background_review_pending"])
+                        if lost_receipt:
+                            self.assertEqual(settled, pending,
+                                "failed reviewer persistence must preserve actual prior authority")
+                            self.assertEqual(index["reviews"], {}, "unrecorded advice cannot be reusable authority")
+                            merge, = [e for e in completed_events if e["event"] == "background_review_merged"]
+                            self.assertFalse(merge["data"]["receipt_durable"])
+                        else:
+                            self.assertEqual(settled["shadow"]["calls"], 1)
+                            self.assertEqual(settled["shadow"]["unavailable_cost_calls"], 0)
+                            self.assertAlmostEqual(settled["shadow"]["cost_usd"], known, places=12)
+                            self.assertEqual(settled["shadow"]["input_tokens"], 100)
+                            self.assertEqual(settled["shadow"]["output_tokens"], 1)
+                            self.assertFalse(settled["background_review_pending"])
                     with self.subTest(phase="restart"):
-                        # A fresh primary may itself be refused before billing
-                        # at this unchanged bound; that cannot erase the already
-                        # completed reviewer's known receipt.
-                        self.assertIn(restart_result[0], (200, 507))
-                        self.assertEqual(cold["shadow"]["calls"], 1)
-                        self.assertEqual(cold["shadow"]["unavailable_cost_calls"], 0)
-                        self.assertAlmostEqual(cold["shadow"]["cost_usd"], known, places=12)
-                        primary_calls = len(fixture.primaries)
-                        self.assertEqual(cold["primary"]["calls"], primary_calls)
-                        self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
-                        self.assertAlmostEqual(cold["primary"]["cost_usd"], primary_calls * known, places=12)
-                        self.assertFalse(cold["background_review_pending"])
+                        if near_bound:
+                            self.assertEqual(cold, pending,
+                                "an unchanged decode bound may still prevent optional recovery writes")
+                        else:
+                            self.assertEqual(cold["shadow"]["calls"], 1)
+                            self.assertEqual(cold["shadow"]["unavailable_cost_calls"], int(lost_receipt))
+                            self.assertAlmostEqual(cold["shadow"]["cost_usd"], 0.0 if lost_receipt else known, places=12)
+                            self.assertEqual(cold["primary"]["calls"], 2)
+                            self.assertEqual(cold["primary"]["unavailable_cost_calls"], 0)
+                            self.assertAlmostEqual(cold["primary"]["cost_usd"], 2 * known, places=12)
         self.state = root
 
     def history(self):
@@ -517,8 +540,10 @@ class NoodleRegressions(unittest.TestCase):
                 {"role": "user", "content": "NOODLE_TASK"}]
 
     def events(self):
+        # A best-effort queued writer may currently be appending its last line.
+        # Ignore only that unfinished tail; malformed completed records still fail.
         return [json.loads(line) for p in (self.state / "diagnostics").glob("*.jsonl")
-                for line in p.read_text().splitlines()]
+                for line in p.read_text().splitlines(keepends=True) if line.endswith("\n")]
 
     def attest_cache(self):
         # Only synthetic route capability; never manufacture a native receipt.
