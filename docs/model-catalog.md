@@ -66,6 +66,13 @@ contracts are not rewritten; existing explicit limits above a fresh route defaul
 remain rejected by the existing resolver. Deployments must account for this
 prospective change; static rates/default model selections remain unchanged.
 
+Fresh discovery provenance records the actual requested URL, including its
+client-version query, alongside the response before ingestion. The process cache
+keeps that source with its projected facts; ingestion does not infer a version
+from today's fetch policy. Loopback fixtures retain their actual loopback source
+and synthetic route class. Existing frozen contracts keep their original source
+labels, including historical compatibility views and unversioned fixture labels.
+
 ## GPT-6 documented basis
 
 The four exact model pages below were checked on 2026-10-22. Prices are Standard

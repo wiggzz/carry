@@ -3,7 +3,12 @@ use carry::models::{Route, SourceCatalog, ordinary_policy, resolve_model};
 use serde_json::{Value, json};
 
 fn source(route: &Route, facts: Value) -> SourceCatalog {
-    let parsed = SourceCatalog::from_codex(&json!({"models":[facts]}), 123, true).unwrap();
+    let parsed = SourceCatalog::from_codex(
+        &json!({"models":[facts]}),
+        123,
+        "synthetic_loopback_codex_metadata",
+    )
+    .unwrap();
     let mut projection = serde_json::to_value(parsed).unwrap();
     projection["route"] = serde_json::to_value(route).unwrap();
     serde_json::from_value(projection).unwrap()
@@ -92,8 +97,22 @@ fn missing_invalid_stale_duplicate_and_maximum_only_metadata_stay_distinct() {
     assert_eq!(resolved.capacity_tokens, Some(1050000));
     assert_eq!(resolved.raw.context_window, Some(400000));
     assert!(resolved.provenance["capacity"].fallback_reason.is_none());
-    assert!(SourceCatalog::from_codex(&json!({"models":[facts(),facts()]}), 123, true).is_err());
-    assert!(SourceCatalog::from_codex(&json!({"models":vec![facts();2049]}), 123, true).is_err());
+    assert!(
+        SourceCatalog::from_codex(
+            &json!({"models":[facts(),facts()]}),
+            123,
+            "synthetic_loopback_codex_metadata"
+        )
+        .is_err()
+    );
+    assert!(
+        SourceCatalog::from_codex(
+            &json!({"models":vec![facts();2049]}),
+            123,
+            "synthetic_loopback_codex_metadata"
+        )
+        .is_err()
+    );
 }
 
 #[test]

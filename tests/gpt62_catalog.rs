@@ -30,7 +30,7 @@ fn gpt62_catalog_rates_capacity_and_subscription_defaults_are_distinct() {
                 "slug":id,"visibility":"list","context_window":default,"max_context_window":872000
             }]}),
             123,
-            true,
+            "synthetic_loopback_codex_metadata",
         )
         .unwrap();
         source.route = Some(route.clone());

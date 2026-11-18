@@ -22,7 +22,7 @@ fn exact_gpt6_entries_share_capacity_and_prices_across_routes() {
             let mut source = SourceCatalog::from_codex(
                 &json!({"models":[{"slug":"gpt-5.6-sol","visibility":"list","context_window":272000,"max_context_window":872000}]}),
                 123,
-                true,
+                "synthetic_loopback_codex_metadata",
             ).unwrap();
             source.route = Some(route.clone());
             let resolved = resolve_model(model, route, Some(&source), None, 2048, 10).unwrap();

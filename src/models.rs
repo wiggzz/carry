@@ -228,7 +228,9 @@ fn bounded_id(id: &str) -> bool {
 impl SourceCatalog {
     /// Bounded, typed allowlist projection. No provider instructions/diagnostics
     /// survive ingestion. Duplicate visible slugs invalidate ambiguous facts.
-    pub fn from_codex(value: &Value, at: u64, synthetic: bool) -> Result<Self, &'static str> {
+    /// The caller supplies the actual requested view (or an explicit fixture
+    /// identity); ingestion must not guess a version for previously fetched data.
+    pub fn from_codex(value: &Value, at: u64, source: &str) -> Result<Self, &'static str> {
         let entries = value["models"].as_array().ok_or("missing models")?;
         if entries.len() > 2048 {
             return Err("too many models");
@@ -319,12 +321,7 @@ impl SourceCatalog {
             models,
             revision,
             fetched_at: at,
-            source: if synthetic {
-                "synthetic_loopback_codex_metadata"
-            } else {
-                "https://chatgpt.com/backend-api/codex/models?client_version=0.147.0"
-            }
-            .into(),
+            source: source.into(),
             status: "fresh_at_resolution".into(),
         })
     }

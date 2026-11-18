@@ -92,6 +92,7 @@ struct Fixture {
     primary_calls: Arc<AtomicUsize>,
     review_calls: Arc<AtomicUsize>,
     metadata_calls: Arc<AtomicUsize>,
+    metadata_requests: Arc<Mutex<Vec<String>>>,
     address: SocketAddr,
     task: tokio::task::JoinHandle<()>,
 }
@@ -119,9 +120,16 @@ impl Fixture {
         let metadata_calls = Arc::new(AtomicUsize::new(0));
         let m = metadata.clone();
         let mc = metadata_calls.clone();
+        let metadata_requests = Arc::new(Mutex::new(Vec::new()));
+        let mr = metadata_requests.clone();
+        let expected_token = token.clone();
         let pc = primary_calls.clone();
         let rc = review_calls.clone();
-        let router = Router::new().route("/v1/models", get(move || { let m=m.clone();let mc=mc.clone();async move { mc.fetch_add(1,Ordering::SeqCst);axum::Json(m.lock().await.clone()) }}))
+        let router = Router::new().route("/v1/models", get(move |headers: axum::http::HeaderMap, uri: axum::http::Uri| { let m=m.clone();let mc=mc.clone();let mr=mr.clone();let token=expected_token.clone();async move {
+                assert_eq!(headers["authorization"], format!("Bearer {token}"));
+                assert_eq!(headers["chatgpt-account-id"], "synthetic-account");
+                mr.lock().await.push(uri.to_string());
+                mc.fetch_add(1,Ordering::SeqCst);axum::Json(m.lock().await.clone()) }}))
             .route("/v1/responses", post(move |axum::Json(body): axum::Json<Value>| { let pc=pc.clone();let rc=rc.clone();async move {
                 let reviewer = body["model"] == "gpt-6-luna";
                 if reviewer { rc.fetch_add(1,Ordering::SeqCst); } else { pc.fetch_add(1,Ordering::SeqCst); }
@@ -140,6 +148,7 @@ impl Fixture {
             primary_calls,
             review_calls,
             metadata_calls,
+            metadata_requests,
             address,
             task,
         }
@@ -154,6 +163,103 @@ async fn catalog(url: &str) -> Value {
         .unwrap();
     assert_eq!(response.status(), 200);
     response.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn discovery_source_survives_catalog_cache_dispatch_freeze_and_restart() {
+    let f = Fixture::new().await;
+    let state = tempfile::tempdir().unwrap();
+    let (child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
+    let exposed = catalog(&url).await;
+    let requests = f.metadata_requests.lock().await.clone();
+    assert_eq!(requests, ["/v1/models?client_version=99.0.0"]);
+    // The oracle is the authenticated HTTP request actually received, not a
+    // manually constructed SourceCatalog already stamped with the desired view.
+    let actual_source = format!("http://{}{}", f.address, requests[0]);
+    for role in ["primary", "reviewer"] {
+        assert_eq!(exposed[role]["route"]["class"], "synthetic_subscription");
+    }
+    f.metadata.lock().await["models"][0]["context_window"] = json!(60000);
+    assert_eq!(
+        catalog(&url).await,
+        exposed,
+        "the process cache keeps its original facts and source"
+    );
+    let body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"synthetic source freeze"}],"max_output_tokens":10});
+    assert_eq!(send(&url, "source-freeze", &body).await, 200);
+    assert_eq!(saved(state.path()).1["model_resolution"], exposed);
+    assert_eq!(f.metadata_calls.load(Ordering::SeqCst), 1);
+    drop(child);
+    let (_child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
+    assert_eq!(send(&url, "source-freeze", &body).await, 200);
+    let (_, after) = saved(state.path());
+    assert_eq!(
+        after["model_resolution"], exposed,
+        "restart must not relabel or refresh frozen facts"
+    );
+    assert_eq!(after["primary"]["calls"], 2);
+    assert_eq!(f.metadata_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.primary_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.review_calls.load(Ordering::SeqCst), 0);
+    // Grade the actual reloaded frozen contract only after exercising dispatch,
+    // serialization and restart, so RED also reaches the complete broken path.
+    for role in ["primary", "reviewer"] {
+        assert_eq!(
+            after["model_resolution"][role]["provenance"]["capacity"]["source"], actual_source,
+            "capacity provenance must identify the actual requested discovery view"
+        );
+    }
+}
+
+#[tokio::test]
+async fn historical_discovery_source_labels_and_contracts_are_not_rewritten() {
+    let f = Fixture::new().await;
+    // Explicitly staged historical checkpoints: neither an old official view
+    // nor the old unversioned synthetic label proves a current-version fetch.
+    for label in [
+        "https://chatgpt.com/backend-api/codex/models?client_version=0.147.0",
+        "synthetic_loopback_codex_metadata",
+    ] {
+        f.metadata.lock().await["models"][0]["context_window"] = json!(40000);
+        let state = tempfile::tempdir().unwrap();
+        let (child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
+        let body = json!({"model":"gpt-6-sol","input":[{"role":"user","content":"synthetic historical source"}],"max_output_tokens":10});
+        assert_eq!(send(&url, "historical-source", &body).await, 200);
+        drop(child);
+        let (path, mut checkpoint) = saved(state.path());
+        for role in ["primary", "reviewer"] {
+            checkpoint["model_resolution"][role]["provenance"]["capacity"]["source"] = json!(label);
+        }
+        let frozen = checkpoint["model_resolution"].clone();
+        let native = checkpoint["primary"]["cost_usd"].as_f64().unwrap();
+        let prior_observations = checkpoint["request_evidence"]["observations"]
+            .as_array()
+            .unwrap()
+            .clone();
+        std::fs::write(path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        f.metadata.lock().await["models"][0]["context_window"] = json!(60000);
+        let calls = f.metadata_calls.load(Ordering::SeqCst);
+        let (_child, url) = start(f.home.path(), state.path(), f.address, true, &[]).await;
+        assert_eq!(send(&url, "historical-source", &body).await, 200);
+        let (_, after) = saved(state.path());
+        assert_eq!(after["model_resolution"], frozen);
+        assert_eq!(
+            f.metadata_calls.load(Ordering::SeqCst),
+            calls,
+            "valid historical contracts need no refetch"
+        );
+        assert_eq!(
+            &after["request_evidence"]["observations"]
+                .as_array()
+                .unwrap()[..prior_observations.len()],
+            &prior_observations
+        );
+        let rates = &frozen["primary"]["rates"];
+        let cost =
+            (100.0 * rates["input"].as_f64().unwrap() + rates["output"].as_f64().unwrap()) / 1e6;
+        assert!((after["primary"]["cost_usd"].as_f64().unwrap() - native - cost).abs() < 1e-12);
+        assert_eq!(after["primary"]["calls"], 2);
+    }
 }
 
 #[tokio::test]
