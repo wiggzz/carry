@@ -128,6 +128,15 @@ impl Policy {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_READS: std::cell::RefCell<BTreeMap<String, u64>> = Default::default();
+}
+#[cfg(test)]
+pub(super) fn test_reads() -> BTreeMap<String, u64> {
+    TEST_READS.with(|reads| reads.borrow().clone())
+}
+
 pub(super) struct Store {
     pub(super) connection: Connection,
     policy: Policy,
@@ -326,6 +335,32 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(e),
         };
+        if exists {
+            // A retained reader can keep a valid WAL generation alive even
+            // after external damage to the main file. Do not let cache reuse
+            // turn that generation into authority for a newly opened view.
+            // This is a bounded format check, not a replay or a recovery write.
+            use std::io::Read as _;
+            let mut header = [0; 16];
+            std::fs::File::open(path)?
+                .read_exact(&mut header)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "incomplete history authority header",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if &header != b"SQLite format 3\0" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid history authority header",
+                ));
+            }
+        }
         if !exists && write {
             // The first connection also writes authority: reserve its complete
             // bounded main/WAL/SHM extent before even creating a target.
@@ -426,6 +461,8 @@ impl Store {
         kind: &str,
         key: &str,
     ) -> std::io::Result<Option<T>> {
+        #[cfg(test)]
+        TEST_READS.with(|reads| *reads.borrow_mut().entry(kind.to_owned()).or_default() += 1);
         if let Some(record) = self.pending.borrow().get(&(kind.into(), key.into())) {
             return serde_json::from_slice(&record.bytes)
                 .map(Some)
@@ -1020,6 +1057,61 @@ impl Store {
 #[cfg(test)]
 mod initialization_admission_tests {
     use super::*;
+
+    #[test]
+    fn existing_short_headers_are_invalid_authority_without_rewriting() {
+        for len in 0..16 {
+            for write in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("history.index");
+                let original = &b"SQLite format 3\0"[..len];
+                std::fs::write(&path, original).unwrap();
+                let error =
+                    Store::open_policy(&Policy::fixture(directory.path()), HashSet::new(), write)
+                        .err()
+                        .expect("existing incomplete authority must be rejected");
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData,
+                    "len={len} write={write}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_read_and_initialized_empty_wal_reopen_remain_valid() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = Policy::fixture(directory.path());
+        let path = directory.path().join("history.index");
+        drop(Store::open_policy(&policy, HashSet::new(), false).unwrap());
+        assert!(
+            !path.exists(),
+            "a missing-store read must not create authority"
+        );
+        let writer = Store::open_policy(&policy, HashSet::new(), true).unwrap();
+        let version: i64 = writer
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert!(directory.path().join("history.index-wal").exists());
+        let frozen = std::fs::read(&path).unwrap();
+        let reader = Store::open_policy(&policy, HashSet::new(), false).unwrap();
+        assert!(
+            reader
+                .get::<Value>("snapshots", "absent")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), frozen);
+        drop(reader);
+        drop(writer);
+        let frozen = std::fs::read(&path).unwrap();
+        drop(Store::open_policy(&policy, HashSet::new(), false).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), frozen);
+    }
 
     #[test]
     fn fresh_schema_refuses_before_crossing_physical_capacity() {
