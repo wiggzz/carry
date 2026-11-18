@@ -73,6 +73,20 @@ fn state_regression(selector: &str) {
 }
 
 #[test]
+fn gpt62_subscription_tool_restart_continuation() {
+    let output = python_fixture("proxy_gpt62.py")
+        .arg("-v")
+        .output()
+        .expect("Python must exercise GPT-6.2 native tool continuation");
+    assert!(
+        output.status.success(),
+        "GPT-6.2 wire failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn local_storage_failure_preserves_upstream_output() {
     let output = python_fixture("proxy_storage_forwarding.py")
         .arg("-v")
@@ -4355,7 +4369,7 @@ async fn subscription_model_discovery_authenticates_filters_and_fails_closed() {
             assert_eq!(headers["authorization"], format!("Bearer {token}"));
             assert_eq!(headers["chatgpt-account-id"], "fixture-account");
             assert_eq!(headers["accept"], "application/json");
-            assert_eq!(uri.query(), Some("client_version=0.147.0"));
+            assert_eq!(uri.query(), Some("client_version=99.0.0"));
             match mode.load(Ordering::SeqCst) {
                 1 => (StatusCode::SERVICE_UNAVAILABLE, "private upstream diagnostic").into_response(),
                 2 => axum::Json(json!({"models": [{"visibility":"list"}]})).into_response(),

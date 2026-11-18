@@ -967,9 +967,10 @@ async fn models(
     Ok(relay(upstream, None, None, false, None).await)
 }
 
-// Discovery contract used by the pinned Codex client in our HTTP fixtures:
-// openai/codex rust-v0.147.0, codex-api/src/endpoint/models.rs.
-const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
+// Older compatibility views freeze discovery before newer model families.
+// Request the current account-scoped catalog; this does not confer entitlement.
+// Fresh route defaults can narrow the static model maximum (see model-catalog.md).
+const CODEX_MODELS_CLIENT_VERSION: &str = "99.0.0";
 
 async fn fetch_codex_models(service: &Service) -> Result<Value, Failure> {
     let unavailable = || {
