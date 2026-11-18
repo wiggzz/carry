@@ -5,6 +5,77 @@ use super::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 
+#[cfg(test)]
+#[test]
+fn expired_totals_read_each_retained_observation_once() {
+    for observations in [16, 64] {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Store::open_policy(&Policy::fixture(directory.path()), HashSet::new(), true).unwrap();
+        let owners = 32;
+        let primary = carry::core::UsageLedger {
+            calls: 7,
+            cost_usd: 0.125,
+            ..Default::default()
+        };
+        let data = serde_json::to_vec(&json!({
+            "primary":primary, "reviewer":carry::core::UsageLedger::default(),
+            "estimate":null, "padding":"x".repeat(8192)
+        }))
+        .unwrap();
+        store.connection.execute_batch("BEGIN").unwrap();
+        for n in 0..owners * observations {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO records(kind,key,data,at,owner) VALUES('accounting',?1,?2,?3,?4)",
+                    params![
+                        format!("{n:064x}"),
+                        data,
+                        store.at,
+                        format!("{:064x}", n % owners)
+                    ],
+                )
+                .unwrap();
+        }
+        store.connection.execute_batch("COMMIT").unwrap();
+        for poll in 0..3 {
+            let misses = |reset| {
+                let (mut current, mut high) = (0, 0);
+                // SAFETY: this connection is alive and exclusively used by this test.
+                let result = unsafe {
+                    rusqlite::ffi::sqlite3_db_status(
+                        store.connection.handle(),
+                        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                        &mut current,
+                        &mut high,
+                        reset,
+                    )
+                };
+                assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+                current
+            };
+            misses(1);
+            let began = std::time::Instant::now();
+            let (totals, usage) = store.expired_accounting_totals().unwrap();
+            let reads = misses(0);
+            eprintln!(
+                "expired-totals-resources: observations={observations} owners={owners} poll={poll} cache_misses={reads} elapsed_us={}",
+                began.elapsed().as_micros()
+            );
+            assert_eq!(totals.excluded_sessions, owners);
+            assert_eq!(usage.primary.calls, owners * 7);
+            assert!((usage.primary.cost_usd - owners as f64 * 0.125).abs() < 1e-12);
+            // A generous deterministic page-read budget, not a machine-speed test.
+            // Includes index pages and one bounded latest payload per owner.
+            assert!(
+                reads < (owners * observations * 12) as i32,
+                "latest cumulative selection reread retained payloads: {reads}"
+            );
+        }
+    }
+}
+
 pub(super) fn error(e: rusqlite::Error) -> std::io::Error {
     let kind = match &e {
         rusqlite::Error::SqliteFailure(code, _) => match code.code {
@@ -638,16 +709,21 @@ impl Store {
         // Live owners are projected through their current authority instead;
         // prior comparison coverage cannot override a current unknown window.
         // The SQL owner index selects on disk, not in a process-sized map.
-        // Sequence keys break ties when several paid states share a second.
-        // Bound each anti-join to its owner using the existing index: SQLite
-        // otherwise chooses a kind-only primary-key scan of all observations.
+        // Publication makes sequence keys and order_at monotonic together.
+        // Fold the covering owner/key index before fetching any payload. An
+        // age scan with a correlated anti-join rereads each owner's historical
+        // payloads quadratically, even with an owner-bound inner scan.
+        // CROSS JOIN keeps the grouped index fold as a streaming coroutine,
+        // followed by one primary-key payload lookup per owner, not a temporary
+        // population-sized result. Apply retention to that latest observation.
         let mut statement = self
             .connection
             .prepare(
                 "SELECT length(r.data),CASE WHEN length(r.data)<=?1 THEN r.data ELSE NULL END,r.owner
-             FROM records r WHERE r.kind='accounting' AND r.at>=?2
-             AND NOT EXISTS(SELECT 1 FROM records n INDEXED BY records_owner WHERE n.kind='accounting' AND n.owner=r.owner
-                AND (n.at>r.at OR (n.at=r.at AND n.key>r.key)))",
+             FROM (SELECT max(key) AS key FROM records INDEXED BY records_owner
+                   WHERE kind='accounting' GROUP BY owner) latest
+             CROSS JOIN records r ON r.kind='accounting' AND r.key=latest.key
+             WHERE r.at>=?2",
             )
             .map_err(error)?;
         let mut rows = statement
