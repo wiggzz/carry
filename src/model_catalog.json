@@ -68,5 +68,25 @@
     "cache": true,
     "explicit_reviewer_cache": true,
     "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+  },
+  "gpt-6.2-sol": {
+    "context_tokens": 1050000,
+    "max_output_tokens": 128000,
+    "client_output_tokens": 128000,
+    "rates": {"input": 2.00, "cached": 0.10, "write": 2.50, "output": 10.00},
+    "long_context": {"threshold": 272000, "input_multiplier": 2.0, "output_multiplier": 1.5},
+    "cache": true,
+    "explicit_reviewer_cache": true,
+    "source": "https://developers.openai.com/api/docs/models/gpt-6.2-sol"
+  },
+  "gpt-6.2-astra": {
+    "context_tokens": 1050000,
+    "max_output_tokens": 128000,
+    "client_output_tokens": 128000,
+    "rates": {"input": 8.00, "cached": 0.40, "write": 10.00, "output": 40.00},
+    "long_context": {"threshold": 272000, "input_multiplier": 2.0, "output_multiplier": 1.5},
+    "cache": true,
+    "explicit_reviewer_cache": true,
+    "source": "https://developers.openai.com/api/docs/models/gpt-6.2-astra"
   }
 }

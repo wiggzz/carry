@@ -35,6 +35,44 @@ contracts, explicit overrides and dispatch-frozen reviewer receipts retain their
 existing semantics. The dashboard describes the last saved plan, so a historical
 plan is not relabeled as though a new request has already happened.
 
+## GPT-6.2 (checked 2026-11-17)
+
+The exact OpenAI model pages for [Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol)
+and [Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra) document
+1,050,000 total context, 922,000 maximum input and 128,000 maximum output tokens.
+These are model/API facts, not subscription defaults or account entitlement.
+Standard USD/million rates (input / cached / 30-minute write / output) are
+2 / 0.10 / 2.50 / 10 for Sol and 8 / 0.40 / 10 / 40 for Astra. Above 272,000
+input tokens the **whole request** uses 2x input/cache and 1.5x output rates.
+The ordinary target remains 272,000 with separate margin/output reservation.
+The shared native-client output allowance is 128,000, not an input allowance.
+
+Both models support the documented short prompt-cache policy (1,024-token
+minimum prefix); 12-hour writes cost 2.5x input and are not priced as short writes.
+Explicit cache transport remains restricted to the exact supported API route,
+never enabled by subscription discovery. These additions do not enable provider
+subagents, premium processing tiers, or new reasoning wire levels. Tool calling
+requires Responses. OpenAI warns that prefix edits can drop reasoning items;
+model registration does not certify unchanged reasoning across Carry rewrites.
+
+Subscription discovery now asks for `client_version=99.0.0` instead of the frozen
+`0.147.0` compatibility view. Authenticated read-only discovery on the two local
+accounts returned Sol 500,000 and Astra 272,000 default context, each with an
+872,000 maximum override. The maximum is **not** the default and does not grant
+expansion. This also exposes older IDs omitted by the old view: on a newly
+resolved namespace, 6.1 Sol can narrow from the 1.05M catalog policy to 500K and
+6 Astra / 6 Sol / 6 Luna (including the default reviewer) to 272K. Valid frozen
+contracts are not rewritten; existing explicit limits above a fresh route default
+remain rejected by the existing resolver. Deployments must account for this
+prospective change; static rates/default model selections remain unchanged.
+
+Fresh discovery provenance records the actual requested URL, including its
+client-version query, alongside the response before ingestion. The process cache
+keeps that source with its projected facts; ingestion does not infer a version
+from today's fetch policy. Loopback fixtures retain their actual loopback source
+and synthetic route class. Existing frozen contracts keep their original source
+labels, including historical compatibility views and unversioned fixture labels.
+
 ## GPT-6 documented basis
 
 The four exact model pages below were checked on 2026-10-22. Prices are Standard

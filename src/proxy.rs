@@ -967,11 +967,12 @@ async fn models(
     Ok(relay(upstream, None, None, false, None).await)
 }
 
-// Discovery contract used by the pinned Codex client in our HTTP fixtures:
-// openai/codex rust-v0.147.0, codex-api/src/endpoint/models.rs.
-const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
+// Older compatibility views freeze discovery before newer model families.
+// Request the current account-scoped catalog; this does not confer entitlement.
+// Fresh route defaults can narrow the static model maximum (see model-catalog.md).
+const CODEX_MODELS_CLIENT_VERSION: &str = "99.0.0";
 
-async fn fetch_codex_models(service: &Service) -> Result<Value, Failure> {
+async fn fetch_codex_models(service: &Service) -> Result<(Value, String), Failure> {
     let unavailable = || {
         failure(
             StatusCode::BAD_GATEWAY,
@@ -1014,16 +1015,22 @@ async fn fetch_codex_models(service: &Service) -> Result<Value, Failure> {
     if !response.status().is_success() {
         return Err(unavailable());
     }
+    // Redirects are refused and configured URLs cannot contain credentials or
+    // query parameters. This is the actual requested view, not a reconstructed
+    // version label; carry it with the response through ingestion and caching.
+    let source = response.url().to_string();
     // Catalogs may include large instructions. Bound the input and expose only
     // discovery fields, never relay provider diagnostics or instruction bodies.
     let bytes = bounded(response, 8 * 1024 * 1024)
         .await
         .map_err(|_| unavailable())?;
-    serde_json::from_slice(&bytes).map_err(|_| unavailable())
+    serde_json::from_slice(&bytes)
+        .map(|value| (value, source))
+        .map_err(|_| unavailable())
 }
 
 async fn codex_models(service: &Service) -> Result<Response, Failure> {
-    let catalog = fetch_codex_models(service).await?;
+    let (catalog, _) = fetch_codex_models(service).await?;
     let unavailable = || {
         failure(
             StatusCode::BAD_GATEWAY,
@@ -1127,19 +1134,17 @@ async fn resolved_catalog(
                     match tokio::time::timeout(Duration::from_secs(20), fetch_codex_models(service))
                         .await
                     {
-                        Ok(Ok(value)) => SourceCatalog::from_codex(
-                            &value,
-                            now(),
-                            matches!(primary_route.class, RouteClass::SyntheticSubscription),
-                        )
-                        .map(|mut source| {
-                            // Metadata was fetched for the default service, not an
-                            // arbitrary requested processing tier.
-                            source.route =
-                                Some(Route::new(&config.upstream_url, config.codex_login));
-                            source
-                        })
-                        .unwrap_or_else(|_| SourceCatalog::unavailable(now())),
+                        Ok(Ok((value, source))) => {
+                            SourceCatalog::from_codex(&value, now(), &source)
+                                .map(|mut source| {
+                                    // Metadata was fetched for the default service, not an
+                                    // arbitrary requested processing tier.
+                                    source.route =
+                                        Some(Route::new(&config.upstream_url, config.codex_login));
+                                    source
+                                })
+                                .unwrap_or_else(|_| SourceCatalog::unavailable(now()))
+                        }
                         _ => SourceCatalog::unavailable(now()),
                     }
                 })
