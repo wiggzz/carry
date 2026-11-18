@@ -87,8 +87,10 @@ class WorkflowShellTests(unittest.TestCase):
         variants['infra'][0].update(status='infrastructure-error', resolved=None)
         variants['unknown-price'][0]['events'] = [{'ledger_capture_incomplete': True}]
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); (root/'paired').mkdir()
+            root = Path(directory); (root/'paired').mkdir(); (root/'prepared').mkdir()
             (root/'paired/plan.json').write_text(json.dumps(run_plan))
+            (root/'paired/contract.json').write_text(json.dumps(config))
+            (root/'prepared/contract.json').write_text(json.dumps(config))
             for name, records in variants.items():
                 with self.subTest(name=name):
                     (root/'paired/records.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))

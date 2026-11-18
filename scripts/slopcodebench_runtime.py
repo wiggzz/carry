@@ -22,9 +22,11 @@ from collections import Counter
 
 try:
     from scripts import proxy_benchmark, swebench_smoke
+    from scripts import slopcodebench_evaluator as evaluator
     from scripts.benchmark_comparison import fingerprint
     from scripts.slopcodebench import has_executed_tests
 except ModuleNotFoundError:
+    import slopcodebench_evaluator as evaluator
     import proxy_benchmark
     import swebench_smoke
     from benchmark_comparison import fingerprint
@@ -59,6 +61,9 @@ def verify_checkout(root, expected):
 
 def readiness_binding(contract, prepared, task):
     return {'runner_commit': contract['runner_commit'], 'dataset_commit': contract['dataset_commit'],
+            'evaluator_identity': contract.get('evaluator_identity'),
+            **({'dependency_preparation': contract['dependency_preparation']}
+               if 'dependency_preparation' in contract else {}),
             'definition_sha256': prepared['tasks'][task['id']]['definition_sha256'],
             'evaluator_image': prepared['evaluator_image'],
             'environment_sha256': hashlib.sha256(Path(prepared['environment']).read_bytes()).hexdigest(),
@@ -76,6 +81,13 @@ def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True
     except ModuleNotFoundError:
         from slopcodebench import plan
     result = plan(contract)
+    if 'study_selection_sha256' in contract:
+        selection = json.loads(Path(prepared['selection']).read_text())
+        if fingerprint(selection) != contract['study_selection_sha256']:
+            raise ValueError('frozen study selection changed since preparation')
+    evaluator.validate_binding(contract, prepared)
+    if contract.get('dependency_preparation') != prepared.get('dependency_preparation'):
+        raise ValueError('dependency preparation differs from the paired contract')
     settings = contract['settings']
     if settings['concurrency'] != 1 or not 0 <= settings['retries'] <= 3:
         raise ValueError('protected SCB is serial with at most three native retries')
@@ -91,8 +103,8 @@ def preflight(contract, prepared, *, execute=subprocess.run, verify_sources=True
     if verify_sources:
         if Path(prepared['source_root']).resolve() != Path(__file__).resolve().parents[1]:
             raise ValueError('runtime must execute from its pinned source checkout')
-        for key, commit in [('source_root', 'source_commit'), ('upstream_root', 'runner_commit'),
-                            ('problems_root', 'dataset_commit')]:
+        evaluator.verify(Path(prepared['upstream_root']))
+        for key, commit in [('source_root', 'source_commit'), ('problems_root', 'dataset_commit')]:
             verify_checkout(Path(prepared[key]), contract[commit])
     for key in ('prompt', 'environment'):
         if not Path(prepared[key]).is_file():
@@ -223,7 +235,8 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
                 kwargs = {k: v for k, v in self.kwargs.items()
                           if k in {'mounts', 'static_assets', 'env_vars', 'is_evaluation'}}
                 mounts = dict(kwargs.get('mounts') or {})
-                kwargs.update(mounts=mounts, disable_setup=True, image=image, ports={}, setup_command=None)
+                evaluation = kwargs.get('is_evaluation', False)
+                kwargs.update(mounts=mounts, disable_setup=not evaluation, image=image, ports={}, setup_command=None)
                 builder = DockerExecRuntime(spec=self.environment, working_dir=self.working_dir,
                                             command=command, **kwargs)
                 builder._network_mode = 'none'
@@ -237,13 +250,16 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
                 if type(limit) is not int or not 1 <= limit <= 3600:
                     raise ValueError('evaluation_timeout_seconds must be 1..3600')
                 timeout = min(timeout or limit, limit)
-                command = 'cp -R /opt/scb-uv-cache /tmp/uv-cache && ' + command
                 merged = self.environment.get_full_env({**(kwargs.get('env_vars') or {}), **clean})
                 for key, value in merged.items():
                     if any(word in key.upper() for word in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')):
                         raise ValueError('credential-bearing environment is forbidden in evaluator runtime')
                 builder._command = command
                 args = builder._build_docker_run_command(clean)
+                # The canonical entry script installs submitted requirements.
+                # Populate its offline cache BEFORE setup, not inside the later
+                # pytest command. Do not disable native evaluator setup.
+                args[-1] = 'cp -R /opt/scb-uv-cache /tmp/uv-cache && ' + args[-1]
                 name = 'carry-scb-' + uuid.uuid4().hex
                 flags = ['--name', name, '--pull=never', '--read-only', '--cap-drop=ALL',
                          '--security-opt=no-new-privileges', '--pids-limit=512', '--memory=4g',
@@ -262,8 +278,12 @@ def protected_runtimes(network, prepared, *, execute=subprocess.run, on_invocati
                     stdout, stderr = text(error.stdout), text(error.stderr)
                 finally:
                     swebench_smoke.force_remove_container(name, exact_name=True)
+                setup_stdout = setup_stderr = ''
+                if evaluation:
+                    from slop_code.execution.shared import split_setup_output
+                    setup_stdout, stdout, setup_stderr, stderr = split_setup_output(stdout or '', stderr or '')
                 return RuntimeResult(exit_code=code, stdout=stdout or '', stderr=stderr or '',
-                                     setup_stdout='', setup_stderr='', elapsed=time.monotonic()-started,
+                                     setup_stdout=setup_stdout, setup_stderr=setup_stderr, elapsed=time.monotonic()-started,
                                      timed_out=timed_out)
 
             def cleanup(self):
@@ -400,6 +420,7 @@ def official_components(prepared, contract, task_id):
 
 
 def activate_upstream(prepared):
+    evaluator.verify(Path(prepared['upstream_root']))
     source = (Path(prepared['upstream_root'])/'src').resolve()
     sys.path.insert(0, str(source))
     import slop_code

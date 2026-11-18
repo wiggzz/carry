@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -18,6 +19,7 @@ import uuid
 
 from scripts import slopcodebench_runtime as runtime
 from scripts.slopcodebench import plan
+from scripts.benchmark_comparison import fingerprint, validate_selection
 
 SOURCE = Path(__file__).resolve().parents[1]
 SELECTION = SOURCE/'benchmarks/slopcodebench/luna-cfgpipe.json'
@@ -43,7 +45,22 @@ def official_definition(upstream, problems, selection):
             'checkpoints': [name for name, _ in problem.iterate_checkpoint_items()]}
 
 
-def prepare(root, upstream, problems, carry, *, execute=subprocess.run):
+def native_requirements_warmup(data, commands):
+    """Warm the native project resolver, then prove a fresh offline setup."""
+    # Use only the trusted manifest, preserving markers/comments verbatim.
+    # Each arm starts empty: installed packages or a warm lock cannot mask gaps.
+    arms = []
+    for offline in ('0', '1'):
+        arms.append('\n'.join([
+            '(', 'set -eu', 'project=$(mktemp -d)',
+            'trap \'rm -rf "$project"\' EXIT', 'cd "$project"',
+            'export UV_OFFLINE='+offline,
+            'printf %s '+shlex.quote(data.decode())+' > requirements.txt',
+            *commands, ')']))
+    return '\n'.join(arms)
+
+
+def prepare(root, upstream, problems, carry, *, selection_path=None, repetitions=1, execute=subprocess.run):
     # Trusted setup must never inherit provider authority, even on a manual run.
     if any(os.environ.get(key) for key in ('OPENAI_API_KEY', 'OPENAI_ADMIN_KEY',
                                          'CARRY_PROXY_UPSTREAM_KEY', 'BENCHMARK_BUDGET_STATE')):
@@ -51,7 +68,13 @@ def prepare(root, upstream, problems, carry, *, execute=subprocess.run):
     if os.environ.get('GITHUB_ACTIONS') != 'true':
         raise ValueError('real image preparation requires a disposable GitHub-hosted runner')
     root, upstream, problems, carry = (Path(p).resolve() for p in (root, upstream, problems, carry))
-    selection = json.loads(SELECTION.read_text())
+    selection = json.loads(Path(selection_path or SELECTION).read_text())
+    tasks = selection.get('problems') if 'problems' in selection else [
+        {'id': selection['problem'], 'checkpoints': selection['checkpoints'],
+         'problem_tree_sha': selection['problem_tree_sha']}]
+    validate_selection(tasks, repetitions, 'slopcodebench')
+    if any(not re.fullmatch('[0-9a-f]{40}', task['problem_tree_sha']) for task in tasks):
+        raise ValueError('problem tree must be an immutable full Git tree')
     lock = json.loads((SOURCE/'benchmarks/slopcodebench/upstream.json').read_text())
 
     def command(args, **kwargs):
@@ -63,18 +86,48 @@ def prepare(root, upstream, problems, carry, *, execute=subprocess.run):
         runtime.verify_checkout(checkout, commit)
     if (selection['runner_commit'], selection['problems_commit']) != (lock['runner_commit'], lock['problems_commit']):
         raise ValueError('study selection and upstream pins differ')
-    problem_tree = command(['git', '-C', str(problems), 'rev-parse', 'HEAD:'+selection['problem']],
-                           capture_output=True).stdout.strip()
-    if problem_tree != selection['problem_tree_sha']:
-        raise ValueError('study problem tree differs from the frozen selection')
-    definition = official_definition(upstream, problems, selection)
-    if definition['checkpoints'] != selection['checkpoints']:
-        raise ValueError('study requires the entire pinned ordered checkpoint sequence')
+    evaluator_identity = runtime.evaluator.install(upstream)
+    definitions = []
+    for task in tasks:
+        problem_tree = command(['git', '-C', str(problems), 'rev-parse', 'HEAD:'+task['id']],
+                               capture_output=True).stdout.strip()
+        if problem_tree != task['problem_tree_sha']:
+            raise ValueError('study problem tree differs from the frozen selection')
+        definition = official_definition(upstream, problems, {'problem': task['id']})
+        if definition['checkpoints'] != task['checkpoints']:
+            raise ValueError('study requires the entire pinned ordered checkpoint sequence')
+        definitions.append(definition)
+    definition = definitions[0]
+    for item in definitions[1:]:
+        if any(item[key] != definition[key] for key in ('prompt', 'environment', 'pass_policy', 'timeout_seconds')):
+            raise ValueError('selected problems require the same official native settings')
     root.mkdir(parents=True, exist_ok=False)
     context = root/'image-context'; context.mkdir()
     shutil.copyfile(carry, context/'carry')
-    warm = ['uvx', *['--with='+dep for dep in definition['test_dependencies']], 'pytest', '--version']
-    (context/'warm-cache.sh').write_text('#!/bin/sh\nset -eu\n'+shlex.join(warm)+'\n')
+    warm = [['uvx', *['--with='+dep for dep in item['test_dependencies']], 'pytest', '--version']
+            for item in definitions]
+    # Pytest's uvx environment is not the submitted application's uv project.
+    # Cache declared reference dependencies, never implementation/test bytes,
+    # while trusted setup still has network. Evaluation installs them offline
+    # through the pinned environment's ordinary eval_commands.
+    requirements, dependency_sets = {}, set()
+    project_warmups = []
+    for task, item in zip(tasks, definitions):
+        for checkpoint in task['checkpoints']:
+            path = problems/task['id']/'solutions'/checkpoint/'requirements.txt'
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            requirements[path.relative_to(problems).as_posix()] = hashlib.sha256(data).hexdigest()
+            commands = item['environment']['setup']['eval_commands']
+            identity = (data, tuple(commands))
+            if identity not in dependency_sets:
+                dependency_sets.add(identity)
+                project_warmups.append(native_requirements_warmup(data, commands))
+    dependency_preparation = {'policy': 'native-offline-requirements-v2',
+                              'requirements_sha256': requirements}
+    (context/'warm-cache.sh').write_text('#!/bin/sh\nset -eu\n'+
+        '\n'.join([*map(shlex.join, warm), *project_warmups])+'\n')
     # Reuse the fixture's proven immutable bases/cache layout, not its fake Codex,
     # provider, TLS, task, or expensive synthetic role overrides.
     (context/'Dockerfile').write_text(f'''FROM {NODE_BASE} AS codex
@@ -108,11 +161,13 @@ RUN chmod 0555 /opt/swebench-harness/bin/carry
     environment_spec = definition['environment']
     environment_spec['docker']['image'] = image
     environment.write_text(json.dumps(environment_spec, indent=2)+'\n')
-    task = selection['problem']
     contract = {'schema_version': 1, 'benchmark': 'slopcodebench', 'evidence_kind': 'measured-benchmark',
                 'source_commit': source_commit, 'runner_commit': lock['runner_commit'],
-                'dataset_commit': lock['problems_commit'], 'repetitions': 1,
-                'selection': [{'id': task, 'checkpoints': selection['checkpoints']}],
+                'dataset_commit': lock['problems_commit'], 'repetitions': repetitions,
+                'study_selection_sha256': fingerprint(selection),
+                'dependency_preparation': dependency_preparation,
+                'evaluator_identity': evaluator_identity,
+                'selection': [{'id': task['id'], 'checkpoints': task['checkpoints']} for task in tasks],
                 'settings': {'codex_version': CODEX_VERSION, 'codex_sha256': native[1].split()[0],
                     'prompt_sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
                     'environment_digest': image, 'harness_digest': image, 'gateway_digest': gateway, 'carry_digest': image,
@@ -126,11 +181,11 @@ RUN chmod 0555 /opt/swebench-harness/bin/carry
     prepared = {'source_root': str(SOURCE), 'upstream_root': str(upstream), 'problems_root': str(problems),
                 'agent_image': image, 'evaluator_image': image, 'gateway_image': gateway, 'carry_image': image,
                 'prompt': str(prompt), 'environment': str(environment),
-                'tasks': {task: {'definition_sha256': runtime.tree_digest(problems/task),
-                                  'readiness': str(root/'readiness'/f'{task}.json')}}}
-    run_plan = plan(contract)
-    if run_plan['expected_records'] != selection['expected_checkpoint_arm_outcomes']:
-        raise ValueError('study denominator mismatch')
+                'selection': str(root/'selection.json'), 'evaluator_identity': evaluator_identity,
+                'dependency_preparation': dependency_preparation,
+                'tasks': {task['id']: {'definition_sha256': runtime.tree_digest(problems/task['id']),
+                                  'readiness': str(root/'readiness'/f'{task["id"]}.json')} for task in tasks}}
+    plan(contract)
     for name, value in [('contract', contract), ('prepared', prepared), ('selection', selection)]:
         (root/f'{name}.json').write_text(json.dumps(value, indent=2, sort_keys=True)+'\n')
     # Actual official grading, with its failure output retained by the workflow.
@@ -145,8 +200,11 @@ def main():
     parser.add_argument('--upstream', type=Path, required=True)
     parser.add_argument('--problems', type=Path, required=True)
     parser.add_argument('--carry', type=Path, required=True)
+    parser.add_argument('--selection', type=Path, default=SELECTION)
+    parser.add_argument('--repetitions', type=int, default=1)
     args = parser.parse_args()
-    prepare(args.output, args.upstream, args.problems, args.carry)
+    prepare(args.output, args.upstream, args.problems, args.carry,
+            selection_path=args.selection, repetitions=args.repetitions)
     return 0
 
 

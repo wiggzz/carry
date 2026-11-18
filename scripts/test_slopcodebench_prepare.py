@@ -13,6 +13,110 @@ from scripts import slopcodebench_runtime as runtime
 
 
 class PreparationTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('SCB_PRODUCER_EVIDENCE'), 'retained exact-source evidence required')
+    def test_exact_collection_inventory_uses_canonical_counts(self):
+        from scripts.scb_evaluator_fixture import replay
+        evidence = Path(os.environ['SCB_PRODUCER_EVIDENCE'])
+        source = evidence/'producer-20261115T225735Z/collection.py'
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)/'collection.py'
+            target.write_bytes(source.read_bytes())
+            target.write_bytes(runtime.evaluator.corrected_bytes(target.read_bytes()))
+            r, c, result, inventory, saved = replay(target)
+            original_tests = [t.model_dump() for t in result.tests]
+            c.apply_collection_inventory(result, inventory)
+            self.assertEqual((sum(result.pass_counts.values()), sum(result.total_counts.values())), (86, 86))
+            expected = dict(saved)
+            expected['total_counts'] = dict(result.to_output_dict()['total_counts'])
+            self.assertEqual(result.to_output_dict(), expected)
+            self.assertEqual(sorted((t.model_dump() for t in result.tests), key=lambda t: (t['file_path'], t['id'])),
+                             sorted(original_tests, key=lambda t: (t['file_path'], t['id'])))
+            self.assertTrue(r.PassPolicy.ALL_CASES.check(result.pass_counts, result.total_counts))
+            self.assertTrue(__import__('scripts.slopcodebench', fromlist=['has_executed_tests']).has_executed_tests(result))
+            snapshot = result.to_output_dict()
+            c.apply_collection_inventory(result, inventory)
+            self.assertEqual(result.to_output_dict(), snapshot)
+            result.save(Path(directory)/'saved')
+            self.assertEqual(r.CorrectnessResults.from_dir(Path(directory)/'saved').to_output_dict(), snapshot)
+            for status in ('passed', 'failed', 'error', 'skipped'):
+                with self.subTest(status=status):
+                    item = result.tests[0].model_copy(update={'status': status}, deep=True)
+                    small = r.CorrectnessResults(**{k:v for k,v in result.model_dump().items()
+                        if k not in {'tests', 'pass_counts', 'total_counts'}})
+                    small.add_test_result(item)
+                    case = next(t for t in inventory.tests if t.test_id == item.id and t.file_path == item.file_path)
+                    from dataclasses import replace
+                    one = replace(inventory, tests=[case], total_collected=1)
+                    c.apply_collection_inventory(small, one)
+                    self.assertEqual(sum(small.total_counts.values()), int(status != 'skipped'))
+                    self.assertEqual(sum(small.pass_counts.values()), int(status == 'passed'))
+                    if status == 'skipped':
+                        from scripts.slopcodebench import has_executed_tests
+                        self.assertFalse(has_executed_tests(small))
+            missing = r.CorrectnessResults(**{k:v for k,v in result.model_dump().items()
+                if k not in {'tests', 'pass_counts', 'total_counts'}})
+            c.apply_collection_inventory(missing, inventory)
+            self.assertTrue(missing.infrastructure_failure)
+            self.assertTrue(all(t.status == 'failed' for t in missing.tests))
+            self.assertEqual(missing.test_collection_hash, saved['test_collection_hash'])
+            from dataclasses import replace
+            # A collector infrastructure failure stays fatal even with all passes.
+            c.apply_collection_inventory(result, replace(inventory, infrastructure_failure=True))
+            self.assertTrue(result.infrastructure_failure)
+            self.assertEqual(sum(result.total_counts.values()), 86)
+
+    @unittest.skipUnless(os.environ.get('SCB_PRODUCER_EVIDENCE'), 'retained exact-source evidence required')
+    def test_source_correction_install_activation_and_fail_closed_validation(self):
+        import copy
+        from scripts import slopcodebench_evaluator as evaluator
+        evidence = Path(os.environ['SCB_PRODUCER_EVIDENCE'])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root/evaluator.identity()['module']
+            module.parent.mkdir(parents=True)
+            original = (evidence/'producer-20261115T225735Z/collection.py').read_bytes()
+            module.write_bytes(original)
+            report = root/evaluator.lock()['report_module']
+            report.write_bytes((evidence/'eligibility-20261115T2250/pinned-runner/src/slop_code/evaluation/report.py').read_bytes())
+            package = root/'src/slop_code/__init__.py'; package.write_text('')
+            sentinel = root/'other.py'; sentinel.write_text('untouched = True\n')
+            def git(*args):
+                return subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.STDOUT)
+            git('init', '-q'); git('add', '.')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture')
+            value = evaluator.lock(); value['runner_commit'] = git('rev-parse', 'HEAD').decode().strip()
+            with patch.object(evaluator, 'lock', return_value=value):
+                evaluator.verify(root, corrected=False)
+                with self.assertRaises(ValueError): evaluator.verify(root)
+                effective = evaluator.install(root)
+                self.assertEqual(module.read_bytes(), evaluator.corrected_bytes(original))
+                self.assertEqual(evaluator.verify(root), effective)
+                import sys
+                from types import ModuleType
+                # The activation path validates before importing from this source.
+                package_module = ModuleType('slop_code'); package_module.__file__ = str(package)
+                with patch.dict(sys.modules, {'slop_code': package_module}), patch.object(sys, 'path', list(sys.path)):
+                    runtime.activate_upstream({'upstream_root': str(root)})
+                    self.assertEqual(Path(sys.path[0]), root/'src')
+                # Generic clean-checkout verification remains strict.
+                with self.assertRaises(ValueError): runtime.verify_checkout(root, value['runner_commit'])
+                with self.assertRaises(ValueError): evaluator.install(root)
+                sentinel.write_text('unexpected tracked edit\n')
+                with self.assertRaises(ValueError): evaluator.verify(root)
+                sentinel.write_text('untouched = True\n')
+                fixed = module.read_bytes(); module.write_bytes(fixed+b'\n')
+                with self.assertRaises(ValueError): evaluator.verify(root)
+                with self.assertRaises(ValueError): runtime.activate_upstream({'upstream_root': str(root)})
+                module.write_bytes(fixed)
+                report.write_bytes(report.read_bytes()+b'\n')
+                with self.assertRaises(ValueError): evaluator.verify(root)
+                config = {'runner_commit': value['runner_commit'], 'evaluator_identity': effective}
+                prepared = {'evaluator_identity': effective}
+                evaluator.validate_binding(config, prepared)
+                bad = copy.deepcopy(prepared); bad['evaluator_identity']['after_sha256'] = '0'*64
+                with self.assertRaises(ValueError): evaluator.validate_binding(config, bad)
+                with self.assertRaises(ValueError): evaluator.corrected_bytes(original+b'\n')
+
     def test_prepares_real_contract_then_runs_only_gold_cli(self):
         self.assertIsNotNone(importlib.util.find_spec('scripts.slopcodebench_prepare'),
                              'missing hosted official SCB preparation helper')
@@ -55,6 +159,7 @@ class PreparationTests(unittest.TestCase):
                           'checkpoints': selection['checkpoints']}
             with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
                     patch.object(prepare, 'official_definition', return_value=definition), \
+                    patch.object(runtime.evaluator, 'install', return_value=runtime.evaluator.identity()), \
                     patch.object(runtime, 'verify_checkout') as verify:
                 contract, prepared = prepare.prepare(root/'prepared', upstream, problems, carry,
                                                      execute=execute)
@@ -70,6 +175,8 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(contract['proxy']['CARRY_PROXY_CLASSIFIER_MODEL'], 'gpt-6-luna')
             self.assertEqual(contract['proxy']['CARRY_PROXY_CLASSIFIER_EFFORT'], 'low')
             self.assertEqual(prepared['agent_image'], image)
+            self.assertIsNotNone(contract.get('evaluator_identity'), 'preparation omitted corrected evaluator provenance')
+            self.assertEqual(prepared.get('evaluator_identity'), contract['evaluator_identity'])
             self.assertEqual(json.loads((root/'prepared/contract.json').read_text()), contract)
             gold = calls[-1][0]
             self.assertIn('--prepare-readiness', gold)
@@ -85,6 +192,7 @@ class PreparationTests(unittest.TestCase):
                 return execute(args, **kwargs)
             with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
                     patch.object(prepare, 'official_definition', return_value=definition), \
+                    patch.object(runtime.evaluator, 'install', return_value=runtime.evaluator.identity()), \
                     patch.object(runtime, 'verify_checkout'):
                 with self.assertRaises(subprocess.CalledProcessError):
                     prepare.prepare(root/'failed-gold', upstream, problems, carry, execute=fail_gold)
@@ -171,13 +279,21 @@ class PreparationTests(unittest.TestCase):
                     pass_counts={'Core': 1}, total_counts={'Core': 1 if passed else 2},
                     pytest_exit_code=0 if passed else 1, pytest_collected=1 if passed else 2,
                     infrastructure_failure=False)))
-                return report_type.from_dir(destination)
+                report = report_type.from_dir(destination)
+                if passed is None:
+                    report.tests = [test.model_copy(update={'status': 'skipped'}) for test in report.tests]
+                    report.pass_counts = {}; report.total_counts = {}
+                return report
             evaluation = types.ModuleType('slop_code.evaluation')
             evaluation.run_checkpoint = run_checkpoint
             evaluation.PassPolicy = policy_type
             with patch.dict(sys.modules, {'slop_code.evaluation': evaluation}), \
                     patch.object(runtime, 'official_components', return_value=(problem, None, policy_type('any'))), \
                     patch.object(runtime, 'protected_runtimes', side_effect=lambda *a: nullcontext()):
+                with self.assertRaisesRegex(ValueError, 'gold readiness failed'):
+                    runtime.prepare_readiness(config, prepared)
+                self.assertFalse(Path(prepared['tasks']['cfgpipe']['readiness']).exists())
+                passed = None
                 with self.assertRaisesRegex(ValueError, 'gold readiness failed'):
                     runtime.prepare_readiness(config, prepared)
                 self.assertFalse(Path(prepared['tasks']['cfgpipe']['readiness']).exists())

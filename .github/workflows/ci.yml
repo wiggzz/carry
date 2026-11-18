@@ -516,6 +516,7 @@ jobs:
           .scb-upstream/.venv/bin/python -B -m unittest -v
           scripts.test_benchmark_comparison scripts.test_slopcodebench
           scripts.test_slopcodebench_prepare scripts.test_slopcodebench_workflow
+          scripts.test_slopcodebench_cohort scripts.test_slopcodebench_cohort_readiness scripts.test_slopcodebench_cohort_runtime
       - name: Actual official runner, native exec/retry, gold evaluator, containment and paired receipts
         if: ${{ !cancelled() }}
         timeout-minutes: 12

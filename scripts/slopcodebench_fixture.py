@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from scripts import slopcodebench_runtime as runtime
 from scripts import swebench_smoke
+from scripts.slopcodebench_prepare import native_requirements_warmup
 from scripts.benchmark_comparison import fingerprint
 
 PYTHON_BASE = 'python@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c'
@@ -41,11 +42,14 @@ def prepare(root, upstream, carry):
              '-CA', str(context/'fixture-cert.pem'), '-CAkey', str(context/'fixture-ca-key.pem'),
              '-CAcreateserial', '-days', '1', '-extfile', str(context/'fixture-server.ext'),
              '-out', str(context/'provider-cert.pem')], capture_output=True)
+    (context/'warm-cache.sh').write_text('#!/bin/sh\nset -eu\n'+
+        native_requirements_warmup(b'deepdiff\n', ['uv init', 'uv add -r requirements.txt'])+'\n')
     dockerfile = context/'Dockerfile'
     dockerfile.write_text(f'''FROM {PYTHON_BASE}
 RUN pip install --no-cache-dir uv==0.9.7
 ENV UV_CACHE_DIR=/opt/scb-uv-cache UV_PYTHON_DOWNLOADS=never SSL_CERT_FILE=/opt/fixture-cert.pem
-RUN uvx --with=pytest --with=pytest-json-ctrf --with=pytest-json-report --with=pytest-timeout --with=jsonschema --with=deepdiff pytest --version && chmod -R a+rX /opt/scb-uv-cache
+COPY warm-cache.sh /opt/warm-cache.sh
+RUN uvx --with=pytest --with=pytest-json-ctrf --with=pytest-json-report --with=pytest-timeout --with=jsonschema --with=deepdiff pytest --version && sh /opt/warm-cache.sh && chmod -R a+rX /opt/scb-uv-cache
 COPY codex.py /usr/local/bin/codex
 COPY carry /opt/swebench-harness/bin/carry
 COPY fixture-cert.pem /opt/fixture-cert.pem
@@ -54,7 +58,7 @@ RUN chmod 755 /usr/local/bin/codex /opt/swebench-harness/bin/carry
     iid = root/'agent.iid'
     # Separate build contexts keep provider TLS private keys/program out of the agent image.
     public_context = root/'agent-context'; public_context.mkdir()
-    for name in ('codex.py', 'carry', 'fixture-cert.pem', 'Dockerfile'):
+    for name in ('codex.py', 'carry', 'fixture-cert.pem', 'Dockerfile', 'warm-cache.sh'):
         shutil.copyfile(context/name, public_context/name)
     parent_tag = 'scb-fixture-parent:'+uuid.uuid4().hex
     command(['docker', 'build', '--tag', parent_tag, '--iidfile', str(iid), str(public_context)])
@@ -141,6 +145,7 @@ docker:
                 'agent_image': agent, 'evaluator_image': agent, 'gateway_image': gateway, 'carry_image': agent,
                 'prompt': str(prompt), 'environment': str(environment), 'tasks': {'synthetic_evolution': {
                     'definition_sha256': runtime.tree_digest(problem), 'readiness': str(root/'readiness'/'synthetic_evolution.json')}}}
+    contract['evaluator_identity'] = prepared['evaluator_identity'] = runtime.evaluator.install(upstream)
     runtime.activate_upstream(prepared)
     (root/'contract.json').write_text(json.dumps(contract, indent=2)+'\n')
     (root/'prepared.json').write_text(json.dumps(prepared, indent=2)+'\n')

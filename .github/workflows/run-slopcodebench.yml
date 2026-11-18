@@ -3,6 +3,16 @@ name: Official SCB paired Codex (manual)
 on:
   workflow_dispatch:
     inputs:
+      selection:
+        description: 'Source-tracked complete-problem selection JSON (not paid authority)'
+        type: string
+        required: true
+        default: 'benchmarks/slopcodebench/luna-cfgpipe.json'
+      repetitions:
+        description: 'Fresh paired whole-problem repetitions; use at least 3 for variability'
+        type: string
+        required: true
+        default: '1'
       execute_paid:
         description: 'Run BOTH frozen Luna arms after official gold readiness (model spend)'
         type: boolean
@@ -85,15 +95,19 @@ jobs:
         env:
           SCB_OFFICIAL_REPORT_MODULE: ${{ github.workspace }}/.scb-upstream/src/slop_code/evaluation/report.py
           SCB_CARRY_BINARY: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/carry
-        run: '"$SCB_PYTHON" -B -m unittest -v scripts.test_slopcodebench_prepare scripts.test_slopcodebench_workflow scripts.test_slopcodebench scripts.test_slopcodebench_runtime_cli'
-      - name: Real native images and ALL six official offline gold evaluations (no secrets)
+        run: '"$SCB_PYTHON" -B -m unittest -v scripts.test_slopcodebench_prepare scripts.test_slopcodebench_cohort scripts.test_slopcodebench_cohort_readiness scripts.test_slopcodebench_cohort_runtime scripts.test_slopcodebench_workflow scripts.test_slopcodebench scripts.test_slopcodebench_runtime_cli'
+      - name: Real native images and ALL selected official offline gold evaluations (no secrets)
         timeout-minutes: 45
+        env:
+          SCB_SELECTION: ${{ inputs.selection }}
+          SCB_REPETITIONS: ${{ inputs.repetitions }}
         run: |
           set -euo pipefail
           mkdir -p "$SCB_OUTPUT"
           "$SCB_PYTHON" -B -m scripts.slopcodebench_prepare \
             --output "$SCB_OUTPUT/prepared" --upstream "$PWD/.scb-upstream" \
             --problems "$PWD/.scb-problems" \
+            --selection "$SCB_SELECTION" --repetitions "$SCB_REPETITIONS" \
             --carry "$PWD/target/x86_64-unknown-linux-musl/release/carry" \
             2>&1 | tee "$SCB_OUTPUT/preparation.log"
       # The Environment key is exposed ONLY after genuine offline gold readiness.
@@ -117,12 +131,23 @@ jobs:
           "$SCB_PYTHON" - <<'PY'
           import json, os
           from pathlib import Path
-          from scripts.benchmark_comparison import summarize
-          root = Path(os.environ['SCB_OUTPUT'])/'paired'
-          plan = json.loads((root/'plan.json').read_text())
+          from scripts.benchmark_comparison import fingerprint, summarize
+          from scripts.slopcodebench import plan as canonical_plan
+          output = Path(os.environ['SCB_OUTPUT'])
+          root = output/'paired'
+          contract = json.loads((output/'prepared/contract.json').read_text())
+          if json.loads((root/'contract.json').read_text()) != contract:
+              raise SystemExit('execution contract differs from frozen preparation')
+          if 'study_selection_sha256' in contract:
+              selection = json.loads((output/'prepared/selection.json').read_text())
+              if fingerprint(selection) != contract['study_selection_sha256']:
+                  raise SystemExit('frozen study selection changed')
+          plan = canonical_plan(contract)
+          if json.loads((root/'plan.json').read_text()) != plan:
+              raise SystemExit('execution plan differs from frozen contract')
           rows = [json.loads(line) for line in (root/'records.jsonl').read_text().splitlines()]
           report = summarize(plan, rows)
-          if plan['expected_records'] != 12 or len(rows) != 12:
+          if len(rows) != plan['expected_records']:
               raise SystemExit('missing frozen checkpoint-arm outcomes')
           if any(row['status'] != 'evaluated' for row in rows):
               raise SystemExit('incomplete official evaluation; retain all slots, do not selectively retry')

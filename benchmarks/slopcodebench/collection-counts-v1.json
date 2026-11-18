@@ -1,0 +1,4 @@
+{
+  "before": "    totals = dict.fromkeys(GroupType, 0)\n    passes = dict.fromkeys(GroupType, 0)\n    for test in merged:\n        totals[test.group_type] += 1\n        if test.status == \"passed\":\n            passes[test.group_type] += 1\n\n    results.tests = merged\n    results.total_counts = totals\n    results.pass_counts = passes\n",
+  "after": "    results.tests = []\n    results.total_counts = dict.fromkeys(GroupType, 0)\n    results.pass_counts = dict.fromkeys(GroupType, 0)\n    for test in merged:\n        results.add_test_result(test)\n"
+}
