@@ -747,13 +747,26 @@ impl ResolvedModel {
     /// API-equivalent USD valuations, not subscription invoices. Frozen receipt
     /// pricing continues to use `rates_for_input` and its reported partitions.
     pub fn forecast_rates_for_input(&self, input: f64) -> Option<Rates> {
-        let mut rates = self
-            .cache_write_billing(ScenarioCacheMode::Implicit)
-            .forecast_rates(self.rates_for_input(input)?);
+        self.forecast_rates_for_cache_lifetime(
+            input,
+            self.cache_write_billing(ScenarioCacheMode::Implicit),
+            self.scenario_cache_policy
+                .as_ref()
+                .filter(|policy| policy.version >= 3)
+                .map(|policy| policy.ttl_seconds),
+        )
+    }
+
+    pub fn forecast_rates_for_cache_lifetime(
+        &self,
+        input: f64,
+        billing: CacheWriteBilling,
+        lifetime_seconds: Option<u64>,
+    ) -> Option<Rates> {
+        let mut rates = billing.forecast_rates(self.rates_for_input(input)?);
         if self.route.class == RouteClass::OfficialApi
-            && self.scenario_cache_policy.as_ref().is_some_and(|policy| {
-                policy.version >= 3 && policy.ttl_seconds == LONG_CACHE_LIFETIME_SECONDS
-            })
+            && billing == CacheWriteBilling::ExplicitlyBilled
+            && lifetime_seconds == Some(LONG_CACHE_LIFETIME_SECONDS)
         {
             rates.write = rates.input * 2.5;
         }

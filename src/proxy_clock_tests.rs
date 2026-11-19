@@ -171,10 +171,25 @@ fn payoff_horizon_exposes_both_spacing_bounds_for_both_wires() {
     compact["input"] = json!(session.render_projection(&HashSet::from([2])));
     let model = &config.model_resolution.as_ref().unwrap().primary;
     let forecast = |at, model| {
-        resolved_input_costs(&keep, &compact, &session.upstream_cache, "gpt-6-luna", 4,
-            Some(model), &config.primary_cache_auth, at,
-            InputEstimate { tokens: 50_000, basis: EstimateBasis::ProviderReceipt },
-            InputEstimate { tokens: 44_000, basis: EstimateBasis::ReceiptAnchoredTextDelta }).unwrap()
+        resolved_input_costs(
+            &keep,
+            &compact,
+            &session.upstream_cache,
+            "gpt-6-luna",
+            4,
+            Some(model),
+            &config.primary_cache_auth,
+            at,
+            InputEstimate {
+                tokens: 50_000,
+                basis: EstimateBasis::ProviderReceipt,
+            },
+            InputEstimate {
+                tokens: 44_000,
+                basis: EstimateBasis::ReceiptAnchoredTextDelta,
+            },
+        )
+        .unwrap()
     };
     let warm = forecast(expiry - 1, model);
     let cold = forecast(expiry, model);
@@ -244,23 +259,82 @@ fn implicit_write_tariff_changes_cold_horizon_cost_order() {
     }
 }
 
+#[test]
+fn implicit_write_tariff_stays_off_without_population_or_route_authority() {
+    use crate::proxy_quantity::{EstimateBasis, InputEstimate};
+    use carry::models::CacheWriteBilling;
+    let (config, _, keep, _) = clock_subject();
+    let official = &config.model_resolution.as_ref().unwrap().primary;
+    let mut gateway = official.clone();
+    gateway.route = Route::new("https://gateway.invalid/v1/responses", false);
+    let mut codex = official.clone();
+    codex.route = Route::new("https://chatgpt.com/backend-api/codex/responses", true);
+    let mut disabled = keep.clone();
+    disabled["prompt_cache_options"] = json!({"mode":"explicit","ttl":"30m"});
+    for (body, resolved, tokens, billing) in [
+        (&keep, official, 900, CacheWriteBilling::ExplicitlyBilled),
+        (&disabled, official, 50_000, CacheWriteBilling::Disabled),
+        (&keep, &gateway, 50_000, CacheWriteBilling::Unknown),
+        (
+            &keep,
+            &codex,
+            50_000,
+            CacheWriteBilling::AutomaticZeroSurcharge,
+        ),
+    ] {
+        let input = InputEstimate {
+            tokens,
+            basis: EstimateBasis::ProviderReceipt,
+        };
+        let forecast = resolved_input_costs(
+            body,
+            body,
+            &[],
+            "gpt-6-luna",
+            4,
+            Some(resolved),
+            &config.primary_cache_auth,
+            101,
+            input,
+            input,
+        )
+        .unwrap();
+        let ordinary = tokens as f64 * 4.0 * 0.10 / 1e6;
+        assert_eq!(forecast.keep_cache.write_billing, billing);
+        assert!((forecast.keep - ordinary).abs() < 1e-12);
+        assert!((forecast.compact - ordinary).abs() < 1e-12);
+        assert!(
+            forecast
+                .keep_cache
+                .current_evidence_future_warm_usd
+                .is_none()
+        );
+    }
+}
+
 #[tokio::test]
 async fn documented_long_retention_changes_http_wire_at_boundary_after_restart() {
     use std::collections::VecDeque;
 
     let (capture, mut wires) = tokio::sync::mpsc::unbounded_channel();
-    let endpoint = Router::new().route("/primary", post(move |axum::Json(body): axum::Json<Value>| {
-        let first = capture.send(body.clone()).is_ok() && body["input"].as_array().is_some_and(|items| items.len() == 3);
-        async move {
-            let mut response = json!({"id":"cache-boundary","status":"completed","output":[],
+    let endpoint = Router::new().route(
+        "/primary",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let first = capture.send(body.clone()).is_ok()
+                && body["input"]
+                    .as_array()
+                    .is_some_and(|items| items.len() == 3);
+            async move {
+                let mut response = json!({"id":"cache-boundary","status":"completed","output":[],
                 "usage":{"input_tokens":50000,"output_tokens":0}});
-            if first {
-                response["usage"] = json!({"input_tokens":50000,"output_tokens":0,
+                if first {
+                    response["usage"] = json!({"input_tokens":50000,"output_tokens":0,
                     "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":50000}});
+                }
+                axum::Json(response)
             }
-            axum::Json(response)
-        }
-    }));
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/primary", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move { axum::serve(listener, endpoint).await.unwrap() });
@@ -286,10 +360,19 @@ async fn documented_long_retention_changes_http_wire_at_boundary_after_restart()
         let mut headers = HeaderMap::new();
         headers.insert("x-carry-session", key.parse().unwrap());
         let id = identity(&headers).unwrap().unwrap();
-        let result = forward_request(service.clone(), headers, Bytes::from(body.to_string()), false, at.to_string()).await;
+        let result = forward_request(
+            service.clone(),
+            headers,
+            Bytes::from(body.to_string()),
+            false,
+            at.to_string(),
+        )
+        .await;
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let plan = load(&service, &id).unwrap().last_plan;
         DECISION_CLOCK.with_borrow_mut(|clock| *clock = None);
         plan
@@ -304,16 +387,30 @@ async fn documented_long_retention_changes_http_wire_at_boundary_after_restart()
         let id = identity(&headers).unwrap().unwrap();
         let mut persisted = load(&service, &id).unwrap();
         if key != "protected" {
-            persisted.apply_advice(&persisted.groups(), &json!({"protected":[],"removable":[2],"memories":[]})).unwrap();
-            at_decision_clock(&[start], || history::publish(&service, &persisted, &persisted)).unwrap();
+            persisted
+                .apply_advice(
+                    &persisted.groups(),
+                    &json!({"protected":[],"removable":[2],"memories":[]}),
+                )
+                .unwrap();
+            at_decision_clock(&[start], || {
+                history::publish(&service, &persisted, &persisted)
+            })
+            .unwrap();
         }
     }
     let mut followup = body.clone();
-    followup["input"].as_array_mut().unwrap().push(json!({"role":"user","content":"next step"}));
+    followup["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"next step"}));
     let expiry = start + 12 * 3600;
     let warm = send(service.clone(), "authorized", expiry - 1, followup.clone()).await;
     assert_eq!(warm["cache_evidence"]["state"], "supported", "{warm}");
-    assert!(wires.recv().await.unwrap()["input"] == followup["input"], "qualified 12h write should preserve the warm wire before expiry: {warm}");
+    assert!(
+        wires.recv().await.unwrap()["input"] == followup["input"],
+        "qualified 12h write should preserve the warm wire before expiry: {warm}"
+    );
     drop(service);
     let service = start_service();
     send(service.clone(), "protected", expiry, followup.clone()).await;
@@ -321,18 +418,30 @@ async fn documented_long_retention_changes_http_wire_at_boundary_after_restart()
     for at in [expiry, expiry + 86_400] {
         let cold = send(service.clone(), "authorized", at, followup.clone()).await;
         let compact = wires.recv().await.unwrap();
-        assert!(compact.to_string().len() < followup.to_string().len(), "{cold}");
+        assert!(
+            compact.to_string().len() < followup.to_string().len(),
+            "{cold}"
+        );
         assert!(!compact.to_string().contains("large evidence"));
         assert_eq!(cold["primary_cached_estimated_tokens"], 0.0);
         if at == expiry {
-            assert_eq!(cold["cache_evidence"]["state"], "expired_credit_not_proof_of_eviction");
+            assert_eq!(
+                cold["cache_evidence"]["state"],
+                "expired_credit_not_proof_of_eviction"
+            );
         }
     }
     let mut uneconomic = start_service();
-    Arc::get_mut(&mut uneconomic).unwrap().config.min_payback_percent = 100;
+    Arc::get_mut(&mut uneconomic)
+        .unwrap()
+        .config
+        .min_payback_percent = 100;
     send(uneconomic, "uneconomic", expiry, followup.clone()).await;
     assert_eq!(wires.recv().await.unwrap()["input"], followup["input"]);
-    assert!(wires.try_recv().is_err(), "no expiry-triggered reviewer call");
+    assert!(
+        wires.try_recv().is_err(),
+        "no expiry-triggered reviewer call"
+    );
     handle.abort();
     CACHE_FIXTURE_ROUTE.with_borrow_mut(|route| *route = None);
 }

@@ -4255,15 +4255,6 @@ fn resolved_input_costs(
     keep_input: crate::proxy_quantity::InputEstimate,
     compact_input: crate::proxy_quantity::InputEstimate,
 ) -> Option<InputForecast> {
-    let kt = keep_input.tokens as f64;
-    let ct = compact_input.tokens as f64;
-    let rates = |tokens| match resolved {
-        Some(r) if r.model == model => r.forecast_rates_for_input(tokens),
-        Some(_) => None,
-        None => Rates::for_model(model, tokens),
-    };
-    let kr = rates(kt)?;
-    let cr = rates(ct)?;
     let minimum = match resolved {
         Some(r) => match r.route.class {
             RouteClass::CodexSubscription | RouteClass::SyntheticSubscription => r
@@ -4274,9 +4265,12 @@ fn resolved_input_costs(
         },
         None => carry::models::ScenarioCachePolicy::for_model(model).minimum_prefix_tokens,
     };
-    let branch = |body: &Value, input: crate::proxy_quantity::InputEstimate, rates: Rates| {
-        use carry::models::{CacheRetention, CacheWriteBilling, ScenarioCachePolicy};
+    let branch = |body: &Value, input: crate::proxy_quantity::InputEstimate| {
+        use carry::models::{
+            CacheRetention, CacheWriteBilling, ScenarioCacheMode, ScenarioCachePolicy,
+        };
         let retention = resolved.map_or(CacheRetention::Unknown, |r| r.cache_retention(body));
+        let lifetime = retention.minimum_seconds();
         let population_mode = ScenarioCachePolicy::for_model(model)
             .with_documented_retention(retention)
             .request_mode(body);
@@ -4302,28 +4296,62 @@ fn resolved_input_costs(
                 .unwrap_or(0) as f64
         }
         .clamp(0.0, tokens);
-        let uncached = if explicit_write && resolved.is_none_or(|r| r.explicit_cache_transport) {
-            rates.write
-        } else {
-            rates.input
+        let implicit = population_mode == ScenarioCacheMode::Implicit && lifetime.is_some();
+        // An explicit breakpoint isn't a whole-prompt population contract.
+        // Preserve the existing dispatch bound for supported explicit writes;
+        // never assign that tariff to an unsupported route or lifetime.
+        let explicit = explicit_write
+            && resolved.is_none_or(|r| r.explicit_cache_transport && lifetime.is_some());
+        let rates = match resolved {
+            Some(r) if r.model == model => r.forecast_rates_for_cache_lifetime(
+                tokens,
+                if explicit {
+                    r.cache_write_billing(ScenarioCacheMode::Implicit)
+                } else {
+                    write_billing
+                },
+                lifetime,
+            ),
+            Some(_) => None,
+            None => Rates::for_model(model, tokens),
+        }?;
+        let uncached = if explicit { rates.write } else { rates.input };
+        let request_cost = |cached: f64| {
+            if implicit {
+                crate::savings::scenario_input_cost_with_mode(
+                    model,
+                    input.tokens,
+                    cached as u64,
+                    minimum,
+                    population_mode,
+                    |_, usage| Some(usage.cost_at_rates(rates)),
+                )
+            } else {
+                Some(input_cost(tokens, cached, uncached, rates.cached))
+            }
         };
-        let first = input_cost(tokens, cached, uncached, rates.cached);
-        BranchCacheCosts {
+        let cold = request_cost(0.0)?;
+        let first = request_cost(cached)?;
+        let later = requests.saturating_sub(1) as f64;
+        Some(BranchCacheCosts {
             retention,
             population_mode,
             write_billing,
             first_supported_cached_tokens: cached,
-            all_cold_usd: horizon_cost(tokens * uncached, tokens, uncached, requests),
-            current_evidence_future_cold_usd: horizon_cost(first, tokens, uncached, requests),
-            current_evidence_future_warm_usd: (retention.minimum_seconds().is_some()
-                && body["prompt_cache_options"]["mode"] != "explicit"
+            all_cold_usd: cold * requests as f64,
+            current_evidence_future_cold_usd: if requests == 0 {
+                0.0
+            } else {
+                first + later * cold
+            },
+            current_evidence_future_warm_usd: (implicit
                 && input.capacity_tokens().is_some()
                 && minimum.is_some_and(|minimum| tokens >= minimum as f64))
             .then(|| horizon_cost(first, tokens, rates.cached, requests)),
-        }
+        })
     };
-    let keep = branch(keep, keep_input, kr);
-    let compact = branch(compact, compact_input, cr);
+    let keep = branch(keep, keep_input)?;
+    let compact = branch(compact, compact_input)?;
     Some(InputForecast {
         keep: keep.current_evidence_future_cold_usd,
         compact: compact.current_evidence_future_cold_usd,
