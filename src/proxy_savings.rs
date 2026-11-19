@@ -789,10 +789,16 @@ impl Replay {
         let restored = self.restored;
         let edited = self.carry_edited;
         let estimated = self.estimated_projection;
+        let primary_history = self.history.shared_primary_history;
         self.reset_epoch();
         self.restored = restored;
         self.estimated_projection = estimated;
         self.carry_edited = edited;
+        // Receipt/settings incompatibility revokes cache and quantity anchors,
+        // not proof that both primary branches have executed the same history.
+        // Actual rewrites, summaries and missing history revoke that proof at
+        // their own transition. A prior divergence remains divergent here.
+        self.history.shared_primary_history = primary_history;
     }
 
     /// Complete current canonical-minus-sent projection, not an additive edit.

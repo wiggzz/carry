@@ -39,7 +39,7 @@ def session_row(n):
 
 
 class BrowserRetention(unittest.TestCase):
-    def test_many_pages_mobile_history_and_browser_working_set(self):
+    def test_load_more_mobile_history_and_browser_working_set(self):
         driver = shutil.which('chromedriver')
         if not driver:
             driver = str(Path(os.environ.get('CHROMEWEBDRIVER', '/nonexistent')) / 'chromedriver')
@@ -52,7 +52,7 @@ class BrowserRetention(unittest.TestCase):
 
     def exercise_browser(self, directory, driver):
         html = (ROOT / 'src/proxy_dashboard.html').read_bytes()
-        pages = 120
+        pages = 12
         report = dict(scope='real Chrome delivered HTML; synthetic loopback HTTP data; not native lifecycle',
                       html_sha256=hashlib.sha256(html).hexdigest(), pages=pages,
                       rows_per_page=2, transcript_source_bytes=98304,
@@ -174,16 +174,18 @@ class BrowserRetention(unittest.TestCase):
                 cdp('Performance.enable')
                 command(session + '/url', {'url': f'http://127.0.0.1:{server.server_port}/carry/dashboard'})
                 wait("document.querySelectorAll('.session').length===2 && !busy")
+                evaluate("window.firstInspection=document.querySelector('.session-details')")
                 for page in range(pages):
-                    self.assertEqual(evaluate("document.querySelectorAll('.session').length"), 2)
-                    evaluate("document.querySelectorAll('.session-details,.transcript-view').forEach(x=>x.open=true)")
+                    self.assertEqual(evaluate("document.querySelectorAll('.session').length"), 2 * (page + 1))
+                    evaluate("document.querySelectorAll('.transcript-view').forEach(x=>x.open=false)")
+                    wait("transcriptText.size===0")
+                    evaluate("[...document.querySelectorAll('.session')].slice(-2).forEach(row=>row.querySelectorAll('.session-details,.transcript-view').forEach(x=>x.open=true))")
                     wait("transcriptText.size===2 && [...transcriptText.values()].every(x=>x.length>98000)")
                     self.assertTrue(evaluate("document.getElementById('cards').textContent.includes('$12.999999')"))
-                    if page in [4, 39, 79, 119]:
-                        # A completed fetch does not drain queued details toggle
-                        # events. They temporarily root the detached previous
-                        # page even through GC; sample the retained working set
-                        # after that event turn, with every original bound intact.
+                    if page in [1, 4, 8, 11]:
+                        # Sample after queued disclosure events release closed
+                        # transcript payloads. Session rows intentionally grow
+                        # only when the user asks to load more.
                         cdp('HeapProfiler.collectGarbage')
                         pre_turn_dom = cdp('Memory.getDOMCounters')
                         evaluate("new Promise(resolve=>setTimeout(resolve,0))")
@@ -202,15 +204,16 @@ class BrowserRetention(unittest.TestCase):
                         sample['post_turn_connected_nodes'] = evaluate("(()=>{const w=document.createTreeWalker(document,NodeFilter.SHOW_ALL);let n=1;while(w.nextNode())n++;return n})()")
                         report['samples'].append(sample)
                     if page < pages - 1:
-                        previous = evaluate("document.querySelector('.session').id")
+                        previous_count = 2 * (page + 1)
                         # A periodic refresh can disable navigation between
                         # separate CDP calls. Wait and click in one browser turn;
                         # retain the same deadline and exact next-owner guard.
-                        wait("!busy && !document.getElementById('next-sessions').disabled && (document.getElementById('next-sessions').click(),true)")
-                        wait('!busy && document.querySelector(".session").id!==' + json.dumps(previous))
-                self.assertTrue(evaluate("document.getElementById('next-sessions').disabled"))
-                wait("!busy && !document.getElementById('first-sessions').disabled && (document.getElementById('first-sessions').click(),true)")
-                wait("!busy && document.querySelector('.session').id.endsWith('0001')")
+                        wait("!busy && !document.getElementById('load-more-sessions').disabled && (document.getElementById('load-more-sessions').click(),true)")
+                        wait(f"!busy && document.querySelectorAll('.session').length==={previous_count + 2}")
+                self.assertTrue(evaluate("document.getElementById('load-more-sessions').hidden"))
+                self.assertTrue(evaluate("firstInspection===document.querySelector('.session-details') && firstInspection.open"))
+                evaluate("document.querySelectorAll('.session-details,.transcript-view').forEach(x=>x.open=false)")
+                wait("transcriptText.size===0")
                 self.assertEqual(evaluate("document.querySelectorAll('details.session-details[open],details.transcript-view[open]').length"), 0)
                 self.assertEqual(evaluate('transcriptText.size'), 0)
                 evaluate("document.getElementById('accounting-month').value='2026-10';document.getElementById('accounting-form').requestSubmit()")
@@ -243,14 +246,13 @@ class BrowserRetention(unittest.TestCase):
                 samples = report['samples']
                 report['heap_growth_bytes'] = samples[-1]['heap_bytes'] - samples[0]['heap_bytes']
                 self.assertLessEqual(report['heap_growth_bytes'], 16 * 1024 * 1024)
-                self.assertTrue(all(s['caches'] == dict(text=2, requests=2, rows=2) for s in samples))
-                self.assertLessEqual(samples[-1]['dom']['nodes'], samples[0]['dom']['nodes'] + 100)
-                # In addition to the original terminal/first-GC bound, every
-                # sampled connected tree and post-event-turn GC must be bounded.
-                self.assertTrue(all(s['connected_nodes'] <= samples[0]['connected_nodes'] + 100
-                                    for s in samples))
-                self.assertTrue(all(s['post_turn_dom']['nodes'] <= samples[0]['post_turn_dom']['nodes'] + 100
-                                    for s in samples))
+                self.assertTrue(all(s['caches'] == dict(text=2, requests=2, rows=2 * s['page']) for s in samples))
+                # Loaded metadata rows grow linearly; closed source payloads
+                # must not accumulate with the number of loaded sessions.
+                for sample in samples:
+                    budget = (sample['caches']['rows'] - samples[0]['caches']['rows']) * 500 + 100
+                    self.assertLessEqual(sample['connected_nodes'], samples[0]['connected_nodes'] + budget)
+                    self.assertLessEqual(sample['post_turn_dom']['nodes'], samples[0]['post_turn_dom']['nodes'] + budget)
                 # Calibrate the detector separately from the application being
                 # measured above. Live polling/error rendering can release
                 # unrelated nodes between control samples and hide part of the

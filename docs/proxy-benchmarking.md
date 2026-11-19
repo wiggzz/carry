@@ -418,9 +418,14 @@ enforce its own authentication before exposing these routes remotely.
 On a shared/non-loopback listener, configure a gateway token: dashboard stats
 are gateway-wide, not restricted to a single session.
 The endpoint returns counters, hashes, ledger totals, context sizes, and short
-session titles containing up to 80 characters from the first user message. These
-title excerpts can contain sensitive task text and are persisted in checkpoints.
-It does not return full messages, reviewer memory contents, or credentials.
+session titles. The reviewer sees the stored title and is asked to keep it
+unless the user's task materially changes. This uses the existing review call.
+A null, missing, blank, or invalid title (including one over 80 characters after
+whitespace normalization) leaves the existing label unchanged. Without a stored
+title, the dashboard uses the first-user excerpt or “Untitled session” if no
+excerpt is available. Titles can contain sensitive task text and may be
+persisted in checkpoints. Older checkpoints did not distinguish stored excerpts
+from reviewer-generated titles, so the reviewer receives their existing label.
 Stats cover every saved session in this proxy's state directory, not just the
 authenticated caller's session or tenant; anyone granted stats access can read
 those titles and totals. All responses are `Cache-Control: no-store`.

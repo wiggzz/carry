@@ -86,6 +86,11 @@ async function measurementContract() {
   await vm.runInContext('refresh()',sandbox);
   assert.equal(byClass(elements.get('sessions').children[0],'transcript-view'),transcript,
     'polling retains transcript node and its fetch state');
+  transcript.open=false;
+  for(const fn of transcript.listeners.toggle)await fn();
+  assert.equal(vm.runInContext('transcriptText.has('+JSON.stringify(s.id)+')',sandbox),false,
+    'closing a transcript releases its retained payload while loaded session rows stay visible');
+  assert.doesNotMatch(transcript.children[1].textContent,/<script>literal only<\/script>/);
   // The private dashboard boundary applies equally to stats and transcripts.
   // A transcript failure must not add a separate credential workflow.
   data.auth='codex';

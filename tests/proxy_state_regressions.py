@@ -333,6 +333,55 @@ class FixtureCase(unittest.TestCase):
 
 
 class StateRegressions(FixtureCase):
+    def test_reviewer_titles_survive_http_restart_and_rendering(self):
+        opening = "Opening message used as fallback"
+        first_title = "Repair parser for <nested> inputs"
+        next_title = "Document parser error messages"
+        titles = [{}, {"title": "  Repair\tparser for <nested> inputs  "},
+                  {"title": None}, {"title": 42}, {"title": "\n\t "}, {"title": "é" * 81},
+                  {"title": next_title}, {"title": None}]
+        expected = [opening] + [first_title] * 5 + [next_title] * 2
+
+        def review(_body, n):
+            return 200, advice_response({"protected": [], "removable": [], "memories": [],
+                                         **titles[n - 1]})
+
+        fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+        options = ["--min-payback-percent", "100"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": opening}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(len(fixture.reviews), 0)
+        for n, title in enumerate(expected, 1):
+            with self.subTest(review=n):
+                task = ("The repair is done. Now document the parser error messages."
+                        if n == 7 else f"Continue {n}")
+                history += [{"role": "assistant", "content": f"Reviewable source {n} " + "s" * 8192},
+                            {"role": "user", "content": task}]
+                self.assertEqual(proxy.send(history)[0], 200)
+                self.assertEqual(len(fixture.reviews), n, "one existing review per turn")
+                self.assertEqual(ledger(fixture.reviews[-1]).get("current_title"),
+                                 expected[n - 2] if n > 2 else None,
+                                 "the reviewer gets the stored title, not the opening excerpt")
+                if n in (2, 7):
+                    proxy.close()
+                    proxy = self.proxy(fixture, options)
+                status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                self.assertEqual(status, 200)
+                self.assertEqual(len(stats["sessions"]), 1)
+                session = stats["sessions"][0]
+                self.assertEqual(session["title"], title)
+                self.assertEqual(session["invalid_reviews"], 0)
+                self.assertEqual(session["partial_reviews"], 0)
+                if n <= 2 or n == len(expected):
+                    path = self.state / "title-dashboard-fixture.stats"
+                    path.write_text(json.dumps(stats))
+                    env = dict(os.environ, CARRY_DASHBOARD_STATS_FIXTURE=str(path),
+                               CARRY_DASHBOARD_TITLE_EXPECT=title)
+                    result = subprocess.run(["node", "tests/proxy_dashboard.cjs"], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def continuation(self, failure, restart):
         a = {"role": "user", "content": "A: original goal"}
         o = {"type": "message", "role": "assistant", "content": [
@@ -505,7 +554,7 @@ class StateRegressions(FixtureCase):
                 proxy = Proxy(self.state / change, fixture, options, wait_reviews=False)
                 self.addCleanup(proxy.close)
                 seed = [{"role": "user", "content": "goal"},
-                        {"role": "assistant", "content": "eligible evidence"},
+                        {"role": "assistant", "content": "eligible evidence " * 20},
                         {"role": "user", "content": "current"}]
                 self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
                 self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
@@ -1487,8 +1536,8 @@ class StateRegressions(FixtureCase):
                          "S2: old drop for one assistant member cannot remove newly exposed atomic evidence")
 
     def memory_progress(self, limit):
-        text_a = ("a0b1c2d3e4f5g6h7i8j9" * 205)[:4096]
-        text_b = ("k9l8m7n6o5p4q3r2s1t0" * 205)[:4096]
+        text_a, text_b = (("a0" * 250, "b1" * 250) if limit == "tokens"
+                          else ("x" * 3200, "y" * 3200))
         facts = [{"source_ids": [2], "text": text_a},
                  {"source_ids": [2], "text": text_b}]
 
@@ -1499,18 +1548,20 @@ class StateRegressions(FixtureCase):
             return 200, advice_response(advice)
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-        options = ["--classifier-max-input-bytes", "8388608" if limit == "tokens" else "10000",
-                   "--classifier-max-input-tokens", "4000" if limit == "tokens" else "120000",
+        options = ["--classifier-max-input-bytes", "8388608" if limit == "tokens" else "12000",
+                   "--classifier-max-input-tokens", "5000" if limit == "tokens" else "120000",
+                   "--classifier-max-output-tokens", "1600",
                    "--payoff-requests", "1"]
         proxy = self.proxy(fixture, options)
         seed = [{"role": "user", "content": "goal"},
-                {"role": "assistant", "content": "small eligible source"},
+                {"role": "assistant", "content": " a" * 650},
                 {"role": "user", "content": "current"}]
         self.assertEqual(proxy.send(seed)[0], 200)
         self.assertEqual(proxy.send(seed)[0], 200)
         self.assertEqual(len(fixture.reviews), 1, "initial source must fit the configured review budget")
         saved = proxy.saved()
         accepted = len((proxy.advice() or {}).get("memories", []))
+        self.assertGreater(accepted, 0, "exercise cleanup after admitting a memory")
         feedback = (proxy.advice() or {}).get("feedback", saved["review_feedback"])
         if accepted < 2:
             self.assertIsInstance(feedback, dict,
@@ -1541,7 +1592,7 @@ class StateRegressions(FixtureCase):
         self.assertNotIn(text_b, json.dumps(fixture.reviews[-1]))
 
     def test_small_memory_budget_rejects_large_fact_preserves_small_sibling_and_opinions(self):
-        large = ("a0b1c2d3e4f5g6h7i8j9" * 205)[:4096]
+        large = "x" * 4096
         small = "The useful result is 42."
 
         def review(body, n):
@@ -1554,10 +1605,11 @@ class StateRegressions(FixtureCase):
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
         options = ["--classifier-max-input-bytes", "10000",
-                   "--classifier-max-input-tokens", "4000", "--payoff-requests", "1"]
+                   "--classifier-max-input-tokens", "4000", "--classifier-max-output-tokens", "1600",
+                   "--payoff-requests", "1"]
         proxy = self.proxy(fixture, options)
         seed = [{"role": "user", "content": "goal"},
-                {"role": "assistant", "content": "small eligible source"},
+                {"role": "assistant", "content": " a" * 650},
                 {"role": "user", "content": "current"}]
         self.assertEqual(proxy.send(seed)[0], 200)
         self.assertEqual(proxy.send(seed)[0], 200)

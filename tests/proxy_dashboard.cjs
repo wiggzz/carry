@@ -278,12 +278,9 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.match(text(byClass(stable,'session-costs')),/\$8\.250000/);
   data.sessions.push({...session(0,0),id:'session-c',client:{kind:'background'}});
   await refresh();
-  assert.equal(elements.get('sessions').children.length,2);
-  assert.equal(elements.get('background-sessions').children.length,1);
-  assert.equal(elements.get('background-traffic').hidden,false);
+  assert.equal(elements.get('sessions').children.length,3,'background traffic shares the main list');
   data.sessions=[];
   await refresh();
-  assert.equal(elements.get('background-traffic').hidden,true);
   assert.ok(byClass(elements.get('sessions'),'empty'),'empty dashboard has an explicit state');
   // Recency belongs to the primary request, never a later checkpoint/reviewer write.
   const RealDate=vm.runInContext('Date',sandbox);
@@ -308,7 +305,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
   assert.equal(recency.title,'Primary request started '+exact);
   assert.equal(recency.getAttribute('aria-label'),'Primary request started '+exact);
   assert.ok(!walk(byClass(recentRow,'session-details')).includes(recency));
-  const oldRow=elements.get('background-sessions').children[0];
+  const oldRow=elements.get('sessions').children.find(n=>n.id==='history:'+old.id);
   assert.equal(byClass(oldRow,'request-recency').textContent,'Last request · 3 days ago');
   assert.equal(byClass(oldRow,'activity').textContent,'Idle','maintenance writes cannot make an old primary recent');
   const stableDisclosure=byClass(recentRow,'session-details');
@@ -445,45 +442,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     assert.equal(lanes[1].children[1].textContent,'9');
     assert.equal(lanes[1].children[8].textContent,'1');
   }
-  const previousFetch=sandbox.fetch, pageRequests=[];
-  const cursor='f'.repeat(64), later={...recent,id:'later-page-owner'};
-  sandbox.fetch=async(url,options)=>{
-    pageRequests.push([url,options]);
-    const after=new URL(url,'http://localhost').searchParams.get('after_id');
-    return {ok:true,json:async()=>({...data,sessions:after?[later]:[recent],
-      session_page:{has_more:!after,next_after:after?null:cursor}})};
-  };
-  await refresh();
-  const nextPage=document.getElementById('next-sessions'), firstPage=document.getElementById('first-sessions');
-  assert.ok(nextPage&&firstPage,'session keyset pages have visible navigation controls');
-  assert.equal(nextPage.disabled,false);
-  assert.equal(firstPage.disabled,true);
-  const firstDetail=document.getElementById('disclosure:session:'+recent.id);
-  firstDetail.open=true;
-  for(const handler of firstDetail.listeners.toggle||[])await handler();
-  await refresh();
-  assert.equal(document.getElementById('disclosure:session:'+recent.id),firstDetail);
-  assert.equal(firstDetail.open,true,'same-page polling retains the live disclosure node and state');
-  const click=async button=>{for(const handler of button.listeners.click||[])await handler();};
-  await click(nextPage);
-  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.get('after_id'),cursor);
-  assert.equal(pageRequests.at(-1)[1].cache,'no-store');
-  assert.equal(elements.get('sessions').children[0].id,'history:later-page-owner');
-  assert.equal(nextPage.disabled,true);
-  assert.equal(firstPage.disabled,false);
-  assert.equal(cards().get('Priced subtotal'),'$13.000000','page navigation cannot change population money');
-  await refresh();
-  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.get('after_id'),cursor,
-    'automatic refresh stays on the selected bounded page');
-  await click(firstPage);
-  assert.equal(new URL(pageRequests.at(-1)[0],'http://localhost').searchParams.has('after_id'),false);
-  assert.equal(elements.get('sessions').children[0].id,'history:'+recent.id);
-  const revisitedDetail=document.getElementById('disclosure:session:'+recent.id);
-  assert.notEqual(revisitedDetail,firstDetail,'navigation releases off-page detail nodes');
-  assert.equal(revisitedDetail.open,false,
-    'off-page disclosure state must not accumulate in a population-sized cache');
-  assert.equal(firstPage.disabled,true);
-  sandbox.fetch=previousFetch;
+  const previousFetch=sandbox.fetch;
   delete data.usage;
   const monthInput=document.getElementById('accounting-month');
   assert.ok(monthInput,'historical accounting must have a visible month selector');
@@ -552,8 +511,7 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     const cost=native.some(l=>l.cost_usd!=null)?native.reduce((n,l)=>n+(l.cost_usd||0),0):null;
     const missing=native.some(l=>l.unavailable_cost_calls)||(data.usage?data.usage.unavailable_owners:data.unavailable_sessions);
     assert.equal(cards().get(missing?'Priced subtotal':'Observed cost'),amount(cost));
-    assert.equal(walk(elements.get('sessions')).filter(n=>n.className==='session').length+
-      walk(elements.get('background-sessions')).filter(n=>n.className==='session').length,data.sessions.length);
+    assert.equal(walk(elements.get('sessions')).filter(n=>n.className==='session').length,data.sessions.length);
     const checkVisibleScope=(root,e,total)=>{
       const shown=visibleText(root);
       if(Object.prototype.hasOwnProperty.call(e,'whole_window')){
@@ -573,9 +531,16 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     for(const s of data.sessions){
       const row=document.getElementById('history:'+s.id);
       checkVisibleScope(byClass(row,'session-savings'),s.cost_estimate,s.cost_estimate.coverage.primary_responses);
-      assert.ok(!byClass(row,'session-details').open,'HTTP fixture disclosures remain closed');
+      const details=byClass(row,'session-details');
+      assert.ok(!details.open,'HTTP fixture disclosures remain closed');
+      if(process.env.CARRY_DASHBOARD_TITLE_EXPECT){
+        const title=process.env.CARRY_DASHBOARD_TITLE_EXPECT;
+        assert.equal(walk(row).find(node=>node.tagName==='h3').textContent,title);
+        details.open=true;
+        assert.ok(visibleText(row).includes(title),'title remains visible in the expanded session');
+      }
     }
     console.log('private frozen producer smoke: ok (contents not logged)');
   }
   console.log('proxy dashboard scenarios: ok');
-})().then(() => require('./proxy_dashboard_measurements.cjs')).catch(error => { console.error(error); process.exitCode = 1; });
+})().then(() => { require('./proxy_dashboard_measurements.cjs'); require('./proxy_dashboard_list.cjs'); }).catch(error => { console.error(error); process.exitCode = 1; });

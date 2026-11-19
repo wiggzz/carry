@@ -977,6 +977,21 @@ class NoodleRegressions(unittest.TestCase):
             self.assertEqual(joint["future_shadow_compact"],0)
 
     def bootstrap_retry(self, rejected):
+        def numeric_review(saved):
+            # Ordinary external SQLite reads must agree with canonical SQL,
+            # never just the diagnostic mirror or a finished-review event.
+            import sqlite3
+            from contextlib import closing
+            owner = proxy.checkpoint(h)[0].stem
+            with closing(sqlite3.connect(self.state / "history.index")) as db:
+                rows = db.execute("SELECT key,data,at,owner FROM records WHERE kind='accounting' AND owner=? ORDER BY key",
+                                  (owner,)).fetchall()
+            self.assertTrue(rows, "settlement must retain immutable numeric observations")
+            latest = max((json.loads(row[1]) for row in rows), key=lambda row: row["sequence"])
+            self.assertEqual(latest["reviewer"], saved["shadow"])
+            self.assertFalse(saved["background_review_pending"])
+            return set(rows)
+
         def review(_body,n):
             if n == 1:
                 return (200,advice_response({"protected":[999],"removable":[],"memories":[]})) if rejected else None
@@ -995,6 +1010,7 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(failed["shadow"]["input_tokens"],100 if rejected else 0)
         self.assertTrue(failed["bootstrap_review_pending"])
         self.assertTrue(failed["bootstrap_review_attempted"])
+        failed_numeric = numeric_review(failed)
         # Failed bootstrap must honor normal request cadence on its retries,
         # even though the initial replay acquisition bypassed ordinary floors.
         self.assertEqual(proxy.send(h)[0],200)
@@ -1015,8 +1031,14 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(accepted["shadow"]["unavailable_cost_calls"],int(not rejected))
         self.assertTrue(read_index(self.state / "history.index")["reviews"],
                         "accepted empty advice is a durable semantic completion")
+        accepted_numeric = numeric_review(accepted)
+        self.assertTrue(failed_numeric <= accepted_numeric,
+                        "the first immutable numeric receipt survives later settlement")
         proxy.close()
         proxy = self.proxy(fixture,options)
+        self.assertEqual(proxy.checkpoint(h)[1]["shadow"], accepted["shadow"])
+        self.assertEqual(numeric_review(proxy.checkpoint(h)[1]), accepted_numeric,
+                         "process restart and ordinary external readers preserve exact numeric rows")
         for _ in range(4): self.assertEqual(proxy.send(h)[0],200)
         self.assertEqual(len(fixture.reviews),2,"accepted empty completion closes below-floor retries")
         self.assertEqual(proxy.checkpoint(h)[1]["shadow"],accepted["shadow"])

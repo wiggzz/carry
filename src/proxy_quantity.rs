@@ -256,6 +256,10 @@ impl InputMeasurements {
         self.text_tokens(value, true).unwrap()
     }
 
+    pub(crate) fn comparable_item_tokens(&self, value: &Value) -> Option<u64> {
+        (!crate::savings::prompt_has_opaque(value)).then(|| self.visible_text_tokens(value))
+    }
+
     fn text_tokens(&self, value: &Value, allow_count: bool) -> Option<u64> {
         let key = identity(value);
         if let Some(tokens) = self.text.lock().unwrap().get(&key) {
