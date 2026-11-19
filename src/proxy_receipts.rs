@@ -125,50 +125,7 @@ pub(super) fn receipt(usage: &Value) -> Option<Usage> {
     Usage::from_receipt(usage)
 }
 
-/// Estimate only semantic text that can be retained in the next input. Native
-/// output billing, IDs and encrypted transport envelopes are different units.
-/// Unknown output kinds have no invented retained-context measurement.
-pub(super) fn retained_output_tokens(output: &Value) -> Option<u64> {
-    let mut text = Vec::new();
-    for item in output.as_array()? {
-        match item["type"].as_str()? {
-            "message" => {
-                if let Some(content) = item["content"].as_str() {
-                    text.push(content);
-                } else {
-                    for part in item["content"].as_array()? {
-                        text.push(match part["type"].as_str()? {
-                            "output_text" | "input_text" => part["text"].as_str()?,
-                            "refusal" => part["refusal"].as_str()?,
-                            _ => return None,
-                        });
-                    }
-                }
-            }
-            "reasoning" => {
-                if let Some(summary) = item.get("summary") {
-                    for part in summary.as_array()? {
-                        text.push(part["text"].as_str()?);
-                    }
-                }
-            }
-            "function_call" => {
-                text.push(item["name"].as_str()?);
-                text.push(item["arguments"].as_str()?);
-            }
-            "custom_tool_call" => {
-                text.push(item["name"].as_str()?);
-                text.push(item["input"].as_str()?);
-            }
-            _ => return None,
-        }
-    }
-    Some(if text.is_empty() {
-        0
-    } else {
-        token_units(&json!(text))
-    })
-}
+pub(super) use crate::prompt_quantity::retained_output_tokens;
 
 /// Responses image inputs are billed in the request's native input tokens.
 /// Audio/video and generated image output can have independent tariffs, so they
@@ -299,6 +256,7 @@ impl Replay {
                 .history
                 .bridge_canonical(native.input_tokens, self.restored);
             if rebased {
+                self.history.diverge();
                 self.reset_receipt_epoch();
             }
             self.estimated_projection |= restored != self.restored;

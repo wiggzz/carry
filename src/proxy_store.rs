@@ -95,6 +95,61 @@ pub(super) fn error(e: rusqlite::Error) -> std::io::Error {
     std::io::Error::new(kind, e)
 }
 
+/// Read the physical main file, not a WAL/page-cache reconstruction. The new
+/// connection is exclusively borrowed before any pragma, schema or recovery
+/// access. SQLite owns both this file and its close/deferred-close lifecycle:
+/// opening and dropping an unrelated OS descriptor would cancel POSIX locks
+/// held by *other* live SQLite connections in this process.
+fn validate_main_header(connection: &mut Connection) -> std::io::Result<()> {
+    use rusqlite::ffi;
+    let mut header = [0u8; 16];
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: the exclusive connection remains alive throughout this block. The
+    // named file-control writes a borrowed sqlite3_file pointer into `file`.
+    // Neither pointer escapes; no SQLite call/statement runs concurrently on
+    // this connection, and we never close or mutate its VFS file. xRead receives
+    // the live file, an exactly sized writable buffer and offset zero.
+    let result = unsafe {
+        let result = ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast(),
+        );
+        if result != ffi::SQLITE_OK {
+            return Err(error(rusqlite::Error::SqliteFailure(
+                ffi::Error::new(result),
+                None,
+            )));
+        }
+        let read = file
+            .as_ref()
+            .and_then(|file| file.pMethods.as_ref())
+            .and_then(|methods| methods.xRead)
+            .ok_or_else(|| std::io::Error::other("history authority VFS file unavailable"))?;
+        read(file, header.as_mut_ptr().cast(), header.len() as i32, 0)
+    };
+    if result == ffi::SQLITE_IOERR_SHORT_READ {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete history authority header",
+        ));
+    }
+    if result != ffi::SQLITE_OK {
+        return Err(error(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(result),
+            None,
+        )));
+    }
+    if &header != b"SQLite format 3\0" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid history authority header",
+        ));
+    }
+    Ok(())
+}
+
 /// The same capacity policy governs SQL and every external numeric/checkpoint
 /// write. It contains no provider, authentication, or client configuration.
 #[derive(Clone, Debug)]
@@ -126,6 +181,15 @@ impl Policy {
         config.state_dir = directory.to_owned();
         Self::new(&config)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_READS: std::cell::RefCell<BTreeMap<String, u64>> = Default::default();
+}
+#[cfg(test)]
+pub(super) fn test_reads() -> BTreeMap<String, u64> {
+    TEST_READS.with(|reads| reads.borrow().clone())
 }
 
 pub(super) struct Store {
@@ -337,7 +401,7 @@ impl Store {
             )?;
             drop(private_file(path, false)?);
         }
-        let connection = if exists && !write {
+        let mut connection = if exists && !write {
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         } else if exists || write {
             Connection::open(path)
@@ -345,6 +409,9 @@ impl Store {
             Connection::open_in_memory()
         }
         .map_err(error)?;
+        if exists {
+            validate_main_header(&mut connection)?;
+        }
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(error)?;
@@ -426,6 +493,8 @@ impl Store {
         kind: &str,
         key: &str,
     ) -> std::io::Result<Option<T>> {
+        #[cfg(test)]
+        TEST_READS.with(|reads| *reads.borrow_mut().entry(kind.to_owned()).or_default() += 1);
         if let Some(record) = self.pending.borrow().get(&(kind.into(), key.into())) {
             return serde_json::from_slice(&record.bytes)
                 .map(Some)
@@ -1020,6 +1089,252 @@ impl Store {
 #[cfg(test)]
 mod initialization_admission_tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn main_file_lock_probe_child() {
+        use std::os::fd::AsRawFd;
+        let Some(path) = std::env::var_os("CARRY_TEST_MAIN_LOCK_PATH") else {
+            return;
+        };
+        // Only the separate probe process opens a raw descriptor. Doing this in
+        // the owner would itself release the very SQLite locks being graded.
+        let file = File::open(path).unwrap();
+        // SAFETY: zero is valid for every field of the platform's libc flock.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = 0;
+        lock.l_len = 0;
+        // SAFETY: live descriptor and correctly sized/aligned writable flock.
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+            0
+        );
+        let expected: libc::pid_t = std::env::var("CARRY_TEST_MAIN_LOCK_PID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        eprintln!(
+            "main-file-lock: type={} pid={} expected={expected}",
+            lock.l_type, lock.l_pid
+        );
+        assert_ne!(
+            lock.l_type,
+            libc::F_UNLCK as libc::c_short,
+            "live Store lost its main-file lock"
+        );
+        assert_eq!(
+            lock.l_pid, expected,
+            "lock must belong to the live Store owner"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn store_open_and_drop_preserve_another_connections_main_file_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = <ProxyCli as clap::Parser>::parse_from(["carry"]);
+        config.state_dir = directory.path().to_owned();
+        let service = Service {
+            config,
+            catalog: Arc::new(tokio::sync::OnceCell::new()),
+            phase_sink: logging::PhaseSink::new(),
+            _directory_lock: Arc::new(private_file(&directory.path().join(".lock"), true).unwrap()),
+            client: reqwest::Client::new(),
+            upstream_key: None,
+            classifier_key: None,
+            auth_token: None,
+            locks: Arc::new(Mutex::new(HashMap::new())),
+            background_reviews: Arc::new(Mutex::new(HashSet::new())),
+            text_quantities: Default::default(),
+            lock_waits: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let owner = Store::open(&service, HashSet::new(), true).unwrap();
+        owner
+            .connection
+            .execute_batch("BEGIN; SELECT count(*) FROM records;")
+            .unwrap();
+        let probe = |phase| {
+            eprintln!("main-file-lock phase={phase}");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "proxy::history::storage::initialization_admission_tests::main_file_lock_probe_child", "--nocapture"])
+                .env("CARRY_TEST_MAIN_LOCK_PATH", directory.path().join("history.index"))
+                .env("CARRY_TEST_MAIN_LOCK_PID", std::process::id().to_string())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("main-file lock probe deadline: {phase}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                child.wait().unwrap().success(),
+                "main-file lock survival: {phase}"
+            );
+        };
+        probe("before second Store");
+        for write in [false, true] {
+            let other = Store::open(&service, HashSet::new(), write).unwrap();
+            probe("second Store open");
+            drop(other);
+            probe("second Store dropped");
+        }
+        let count: i64 = owner
+            .connection
+            .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        owner.connection.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn physical_header_damage_probe_child() {
+        let Some(root) = std::env::var_os("CARRY_TEST_HEADER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let frozen = root.join("frozen");
+        if let Ok(length) = std::env::var("CARRY_TEST_HEADER_DAMAGE") {
+            let length: usize = length.parse().unwrap();
+            let bytes = if length < 16 {
+                b"SQLite format 3\0"[..length].to_vec()
+            } else {
+                vec![b'x'; length]
+            };
+            std::fs::write(root.join("history.index"), bytes).unwrap();
+            std::fs::create_dir(&frozen).unwrap();
+            for entry in std::fs::read_dir(&root).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    std::fs::copy(entry.path(), frozen.join(entry.file_name())).unwrap();
+                }
+            }
+            assert!(frozen.join("history.index-wal").metadata().unwrap().len() > 0);
+        } else {
+            let files = |path| {
+                std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|e| e.unwrap())
+                    .filter(|e| e.file_type().unwrap().is_file())
+                    .map(|e| (e.file_name(), std::fs::read(e.path()).unwrap()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            assert_eq!(
+                files(&root),
+                files(&frozen),
+                "rejected open changed physical authority or retained WAL/SHM"
+            );
+        }
+    }
+
+    fn run_header_probe(root: &Path, damage: Option<usize>) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "proxy::history::storage::initialization_admission_tests::physical_header_damage_probe_child", "--nocapture"])
+            .env("CARRY_TEST_HEADER_ROOT", root);
+        if let Some(length) = damage {
+            command.env("CARRY_TEST_HEADER_DAMAGE", length.to_string());
+        } else {
+            command.env_remove("CARRY_TEST_HEADER_DAMAGE");
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("physical header probe deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn damaged_physical_main_with_retained_wal_is_rejected_without_any_rewrite() {
+        for length in [0, 1, 15, 16, 4096] {
+            for write in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let policy = Policy::fixture(directory.path());
+                let owner = Store::open_policy(&policy, HashSet::new(), true).unwrap();
+                owner
+                    .connection
+                    .execute_batch("BEGIN; SELECT count(*) FROM records;")
+                    .unwrap();
+                // External damage/snapshot comparison must not raw-open/close
+                // the main inode in this process, where SQLite locks are live.
+                run_header_probe(directory.path(), Some(length));
+                let error = Store::open_policy(&policy, HashSet::new(), write)
+                    .err()
+                    .expect("physical damage cannot be hidden by a retained valid WAL");
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData,
+                    "length={length} write={write}: {error}"
+                );
+                run_header_probe(directory.path(), None);
+                owner.connection.execute_batch("ROLLBACK").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn existing_short_headers_are_invalid_authority_without_rewriting() {
+        for len in 0..16 {
+            for write in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("history.index");
+                let original = &b"SQLite format 3\0"[..len];
+                std::fs::write(&path, original).unwrap();
+                let error =
+                    Store::open_policy(&Policy::fixture(directory.path()), HashSet::new(), write)
+                        .err()
+                        .expect("existing incomplete authority must be rejected");
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData,
+                    "len={len} write={write}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_read_and_initialized_empty_wal_reopen_remain_valid() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = Policy::fixture(directory.path());
+        let path = directory.path().join("history.index");
+        drop(Store::open_policy(&policy, HashSet::new(), false).unwrap());
+        assert!(
+            !path.exists(),
+            "a missing-store read must not create authority"
+        );
+        let writer = Store::open_policy(&policy, HashSet::new(), true).unwrap();
+        let version: i64 = writer
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert!(directory.path().join("history.index-wal").exists());
+        let frozen = std::fs::read(&path).unwrap();
+        let reader = Store::open_policy(&policy, HashSet::new(), false).unwrap();
+        assert!(
+            reader
+                .get::<Value>("snapshots", "absent")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), frozen);
+        drop(reader);
+        drop(writer);
+        let frozen = std::fs::read(&path).unwrap();
+        drop(Store::open_policy(&policy, HashSet::new(), false).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), frozen);
+    }
 
     #[test]
     fn fresh_schema_refuses_before_crossing_physical_capacity() {

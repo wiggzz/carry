@@ -182,6 +182,11 @@ fn cache_observation_coverage_survives_http_restart_and_rendering() {
 }
 
 #[test]
+fn reviewer_titles_survive_http_restart_and_rendering() {
+    state_regression("reviewer_titles_survive_http_restart_and_rendering");
+}
+
+#[test]
 fn direction_changes_reject_held_advice_and_preserve_paid_receipt() {
     state_regression("direction_changes_reject_held_advice_and_preserve_paid_receipt");
 }
@@ -3016,7 +3021,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
         )
         .await;
         let mut request = json!({"model":"gpt-6-luna","input":[
-        {"role":"user","content":"goal"},{"role":"assistant","content":"old evidence"},{"role":"user","content":"current"}]});
+        {"role":"user","content":"goal"},{"role":"assistant","content":"old evidence ".repeat(20)},{"role":"user","content":"current"}]});
         send(&url, &request, "async", "main")
             .await
             .bytes()

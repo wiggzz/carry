@@ -16,6 +16,64 @@ import proxy_state_regressions as support
 
 
 class NoOpParity(unittest.TestCase):
+    def test_native_text_tool_outputs_keep_complete_comparison_after_restart(self):
+        fixtures = json.loads((Path(__file__).resolve().parents[1] / 'fixtures/responses/native-tools.json').read_text())
+        outputs = [fixture['item'] for fixture in fixtures['items'] if fixture['comparable']]
+
+        def primary(body, n):
+            result = support.completed(response_id=f'native-tools-{n}')
+            result['output'] = [copy.deepcopy(outputs[n - 1])]
+            result['usage'] = {'input_tokens': 10000 + n * 100, 'output_tokens': 100,
+                               'input_tokens_details': {'cached_tokens': 0}}
+            if body.get('stream'):
+                return 200, (b'event: response.completed\ndata: ' + support.wire(
+                    {'type': 'response.completed', 'response': result}) + b'\n\ndata: [DONE]\n\n')
+            return 200, result
+
+        def review(*_):
+            raise AssertionError('review suppressed')
+
+        with tempfile.TemporaryDirectory(prefix='carry-native-tools-') as directory:
+            fixture = support.Fixture(primary, review)
+            try:
+                history = [{'role': 'user', 'content': 'native tool accounting fixture'}]
+                for index, item in enumerate(outputs):
+                    proxy = support.Proxy(Path(directory), fixture, mode='off')
+                    try:
+                        if index % 2:
+                            connection = http.client.HTTPConnection(*proxy.address, timeout=30)
+                            try:
+                                connection.request('POST', '/v1/responses', body=support.wire({
+                                    'model': 'gpt-6.1-sol', 'input': history, 'stream': True}),
+                                    headers={'Content-Type': 'application/json',
+                                             'x-carry-session': 'state-regression'})
+                                response = connection.getresponse()
+                                status, raw = response.status, response.read()
+                                events = [json.loads(line[5:]) for line in raw.splitlines()
+                                          if line.startswith(b'data:') and line[5:].strip() != b'[DONE]']
+                                terminal = next(e['response'] for e in events if e.get('type') == 'response.completed')
+                            finally:
+                                connection.close()
+                        else:
+                            status, terminal = proxy.send(history, model='gpt-6.1-sol')
+                        self.assertEqual(status, 200)
+                        self.assertEqual(terminal['output'], [item])
+                        self.assertEqual(fixture.primaries[-1]['input'], history)
+                        row = self.stats(proxy)
+                        estimate = row['cost_estimate']
+                        self.assertEqual(row['rewrites']['dispatched'], 0)
+                        self.assertEqual(estimate['matched_primary_responses'], index + 1,
+                                         f"retained quantity missing for {item['type']}")
+                        self.assertIsNotNone(estimate['whole_window'])
+                        self.assertAlmostEqual(estimate['whole_window']['savings'], 0, places=12)
+                        self.assertAlmostEqual(estimate['whole_window']['traditional_cost'], row['primary']['cost_usd'], places=12)
+                    finally:
+                        proxy.close()
+                    history.extend([copy.deepcopy(item), {'role': 'user', 'content': f'continue {index}'}])
+                self.assertEqual(fixture.errors, [])
+            finally:
+                fixture.close()
+
     def record(self, value):
         if directory := os.environ.get('CARRY_TEST_EVIDENCE_DIR'):
             output = Path(directory)

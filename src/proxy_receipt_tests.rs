@@ -1,6 +1,48 @@
 //! Synthetic receipts: the wire body deliberately does not predict provider units.
 use super::Replay as Trajectory;
 use super::*;
+
+#[test]
+fn native_text_tool_records_have_retained_quantities_without_counting_native_payloads() {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("../fixtures/responses/native-tools.json")).unwrap();
+    for fixture in fixtures["items"].as_array().unwrap() {
+        let output = json!([fixture["item"]]);
+        let quantity = receipts::retained_output_tokens(&output);
+        assert_eq!(
+            quantity.is_some(),
+            fixture["comparable"].as_bool().unwrap(),
+            "native type {}",
+            fixture["item"]["type"]
+        );
+        if fixture["comparable"] == true {
+            assert!(
+                quantity.unwrap() > 0,
+                "native content must not be replaced with zero"
+            );
+            let mut renamed = fixture["item"].clone();
+            renamed["id"] = json!("transport-id".repeat(1000));
+            renamed["call_id"] = json!("transport-call".repeat(1000));
+            assert_eq!(
+                receipts::retained_output_tokens(&json!([renamed])),
+                quantity,
+                "transport identifiers are not retained text quantities"
+            );
+        }
+    }
+    let mut mixed = fixtures["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["comparable"] == true)
+        .map(|f| f["item"].clone())
+        .collect::<Vec<_>>();
+    mixed.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Retained answer."}]}));
+    assert!(receipts::retained_output_tokens(&json!(mixed)).is_some());
+    mixed.push(json!({"type":"future_native_call","payload":"unmeasured"}));
+    assert!(receipts::retained_output_tokens(&json!(mixed)).is_none());
+}
+
 include!("proxy_cache_write_tests.rs");
 include!("primary_parity_tests.rs");
 include!("modeled_refresh_tests.rs");

@@ -506,6 +506,69 @@ fn dashboard_month_window_subtracts_owner_boundaries_after_raw_expiry() {
 }
 
 #[tokio::test]
+async fn dashboard_pages_order_by_primary_request_time_with_stable_ties_and_unknowns_last() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(checkpoint_service(directory.path()));
+    for (n, at) in [
+        (1, Some(50)),
+        (2, None),
+        (3, None),
+        (4, Some(50)),
+        (5, Some(10)),
+    ] {
+        let mut session = Session::default();
+        session
+            .ingest(&[json!({"role":"user","content":"chronological test"})])
+            .unwrap();
+        if let Some(at) = at {
+            let mut dispatch =
+                dispatch_measurement("chronological", "primary", &json!({"model":"test"}));
+            dispatch.at = at;
+            session.last_primary_dispatch = Some(dispatch);
+        }
+        save(&service, &format!("{n:064x}"), &session).unwrap();
+    }
+    let mut after_id = String::new();
+    let mut seen = Vec::new();
+    loop {
+        let response = dashboard_stats(
+            State(service.clone()),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            axum::extract::Query(SessionPage {
+                after_id: after_id.clone(),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let data: Value = serde_json::from_slice(&bytes).unwrap();
+        seen.extend(
+            data["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_str().unwrap().to_owned()),
+        );
+        if data["session_page"]["has_more"] == false {
+            break;
+        }
+        after_id = data["session_page"]["next_after"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    }
+    assert_eq!(
+        seen,
+        [1, 4, 5, 2, 3].map(|n| format!("{n:064x}")),
+        "pagination must sort all owners by primary activity, not owner ID or checkpoint writes"
+    );
+}
+
+#[tokio::test]
 async fn dashboard_session_pages_bound_serialized_bytes_and_keep_cursor_progress() {
     let directory = tempfile::tempdir().unwrap();
     let ids = (0..110).map(|n| format!("{n:064x}")).collect::<Vec<_>>();
@@ -1440,7 +1503,7 @@ async fn dashboard_context_states_partition_sources_not_memories() {
         ..Session::default()
     };
     for n in 0..5 {
-        observe_source(&mut session, &format!("source {n}"));
+        observe_source(&mut session, &format!("source {n}: {}", " detail".repeat(32)));
     }
     session.apply_advice(&session.groups(), &json!({"removable":[1,2],"protected":[3],"memories":[{"source_ids":[1],"text":"Remember source one"}]})).unwrap();
     session.last_submitted_ids = vec![2, 3, 4, 5];

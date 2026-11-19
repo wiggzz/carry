@@ -1,0 +1,7 @@
+# Carry's small indexed lookups repeatedly cross overflow-bearing interior
+# records in the existing WITHOUT ROWID authority. Direct overflow reads bypass
+# SQLite's bounded page cache and reread those unrelated BLOBs on every seek.
+# Keep that reuse at SQLite's existing 2 MiB connection owner; no larger cache,
+# mmap, decoded-history cache or persistent schema change is needed.
+[env]
+LIBSQLITE3_FLAGS = "SQLITE_DIRECT_OVERFLOW_READ=0"
