@@ -68,7 +68,8 @@ struct Anchor {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct MeasuredBlock {
-    items: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<BlockOrigin>,
     input: u64,
     // A joint native increment is measured; its internal allocation is not.
     // Never persist source bodies or use ciphertext length as a weight.
@@ -78,6 +79,36 @@ struct MeasuredBlock {
     // unavailable attribution, not absence of native evidence.
     #[serde(default)]
     opaque: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BlockOrigin {
+    start: usize,
+    end: usize,
+    before: String,
+    after: String,
+    receipt_times: [u64; 2],
+    before_input: u64,
+}
+
+impl MeasuredBlock {
+    fn len(&self) -> usize {
+        self.origin
+            .as_ref()
+            .map_or(0, |origin| origin.end.saturating_sub(origin.start))
+    }
+
+    fn extent(&self, items: &[Item]) -> Option<std::ops::Range<usize>> {
+        let origin = self.origin.as_ref()?;
+        (origin.start < origin.end
+            && origin.end <= items.len()
+            && prefix(&items[..origin.end]) == origin.after)
+            .then_some(origin.start..origin.end)
+    }
+}
+
+fn prefix(items: &[Item]) -> String {
+    identity(&items.iter().map(|item| &item.identity).collect::<Vec<_>>())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -267,7 +298,30 @@ impl InputMeasurements {
         resolved: Option<&ResolvedModel>,
         at: u64,
     ) {
-        let (Some(input), Some(values)) = (usage["input_tokens"].as_u64(), items(body)) else {
+        self.observe_primary(body, usage, route, resolved, at, false);
+    }
+
+    pub(crate) fn observe_primary(
+        &mut self,
+        body: &Value,
+        usage: &Value,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+        at: u64,
+        carry_projection: bool,
+    ) {
+        if self
+            .anchor
+            .as_ref()
+            .is_some_and(|previous| at < previous.at)
+        {
+            return;
+        }
+        let Some(values) = items(body) else {
+            self.anchor = None;
+            if !carry_projection {
+                self.blocks.clear();
+            }
             return;
         };
         let prompt = prompt(&values);
@@ -278,10 +332,44 @@ impl InputMeasurements {
             self.blocks.clear();
             self.reasoning_conflict = false;
         }
-        if let Some(previous) = &self.anchor {
-            if at < previous.at {
-                return;
+        let prior_prefix_matches = self
+            .anchor
+            .as_ref()
+            .and_then(|previous| previous.prompt.items.as_deref())
+            .zip(prompt.items.as_deref())
+            .is_some_and(|(previous, next)| {
+                next.get(..previous.len())
+                    .is_some_and(|prefix| same_items(previous, prefix))
+            });
+        if !carry_projection && !prior_prefix_matches {
+            self.blocks.retain(|block| {
+                prompt
+                    .items
+                    .as_deref()
+                    .is_some_and(|items| block.extent(items).is_some())
+            });
+        }
+        let Some(input) = usage["input_tokens"].as_u64() else {
+            self.anchor = None;
+            return;
+        };
+        if let Some(items) = prompt.items.as_deref() {
+            let observed = prefix(items);
+            if self
+                .blocks
+                .iter()
+                .filter_map(|block| block.origin.as_ref().map(|origin| (block, origin)))
+                .any(|(block, origin)| {
+                    (origin.before == observed && origin.before_input != input)
+                        || (origin.after == observed
+                            && origin.before_input.checked_add(block.input) != Some(input))
+                })
+            {
+                self.blocks.clear();
+                self.reasoning_conflict = true;
             }
+        }
+        if let Some(previous) = &self.anchor {
             if previous.prompt.identity == prompt.identity {
                 if input != previous.input {
                     self.blocks.clear();
@@ -293,17 +381,21 @@ impl InputMeasurements {
                 .as_deref()
                 .zip(prompt.items.as_deref())
             {
-                let appended = items.len() > previous_items.len()
-                    && same_items(previous_items, &items[..previous_items.len()]);
+                let appended = items.len() > previous_items.len() && prior_prefix_matches;
                 if appended && input < previous.input {
                     self.blocks.clear();
                     self.reasoning_conflict = true;
                 } else if appended {
+                    let start = previous_items.len();
                     self.blocks.push_back(MeasuredBlock {
-                        items: items[previous_items.len()..]
-                            .iter()
-                            .map(|item| item.identity.clone())
-                            .collect(),
+                        origin: Some(BlockOrigin {
+                            start,
+                            end: items.len(),
+                            before: prefix(previous_items),
+                            after: prefix(items),
+                            receipt_times: [previous.at, at],
+                            before_input: previous.input,
+                        }),
                         input: input - previous.input,
                         opaque: items[previous_items.len()..].iter().any(|item| item.opaque),
                         allocation: self.residual_allocation(
@@ -312,11 +404,7 @@ impl InputMeasurements {
                         ),
                     });
                     while self.blocks.len() > 128
-                        || self
-                            .blocks
-                            .iter()
-                            .map(|block| block.items.len())
-                            .sum::<usize>()
+                        || self.blocks.iter().map(MeasuredBlock::len).sum::<usize>()
                             > MAX_MEASURED_ITEMS
                     {
                         self.blocks.pop_front();
@@ -327,29 +415,100 @@ impl InputMeasurements {
         self.anchor = Some(Anchor { prompt, input, at });
     }
 
-    /// Claim disjoint occurrences newest-first, consuming each native block at
-    /// most once. Strict quantities and neutral allocations share this boundary.
-    fn measured_changes(&self, changed: &[&Item]) -> (i128, Vec<bool>) {
-        let mut used = vec![false; changed.len()];
-        let mut quantity = 0i128;
+    pub(crate) fn measured_recent_suffix(
+        &self,
+        body: &Value,
+        route: &str,
+        resolved: Option<&ResolvedModel>,
+        input: u64,
+        at: u64,
+        minimum: u64,
+    ) -> Option<u64> {
+        let anchor = self.anchor.as_ref()?;
+        let values = items(body)?;
+        if minimum == 0
+            || self.contract != contract(body, route, resolved)
+            || anchor.input != input
+            || anchor.at != at
+            || anchor.prompt.identity != identity(&values)
+        {
+            return None;
+        }
+        let items = anchor.prompt.items.as_deref()?;
+        let mut end = items.len();
+        let mut total = input;
+        let mut latest_at = at;
+        let mut digest = prefix(items);
         for block in self.blocks.iter().rev() {
-            if block.items.is_empty() || block.items.len() > changed.len() {
+            let Some(origin) = &block.origin else {
+                continue;
+            };
+            if origin.start >= origin.end
+                || origin.end != end
+                || origin.after != digest
+                || origin.before_input.checked_add(block.input) != Some(total)
+                || origin.receipt_times[1] > latest_at
+            {
                 continue;
             }
-            let start =
-                changed
-                    .windows(block.items.len())
-                    .enumerate()
-                    .find_map(|(start, items)| {
-                        (!used[start..start + items.len()].iter().any(|used| *used)
-                            && items
-                                .iter()
-                                .zip(&block.items)
-                                .all(|(item, id)| item.identity == *id))
-                        .then_some(start)
-                    });
+            if values[origin.start..end]
+                .iter()
+                .any(|value| matches!(value["role"].as_str(), Some("system" | "developer")))
+            {
+                return None;
+            }
+            total = origin.before_input;
+            if input - total >= minimum {
+                return Some(input - total);
+            }
+            end = origin.start;
+            digest.clone_from(&origin.before);
+            latest_at = origin.receipt_times[0];
+        }
+        None
+    }
+
+    /// Claim disjoint occurrences newest-first, consuming each native block at
+    /// most once. Strict quantities and neutral allocations share this boundary.
+    fn measured_changes(&self, source: &[Item], changed: &[&Item]) -> (i128, Vec<bool>) {
+        let mut used = vec![false; changed.len()];
+        let mut quantity = 0i128;
+        if changed.is_empty() || self.blocks.is_empty() {
+            return (quantity, used);
+        }
+        let mut retained_counts = BTreeMap::new();
+        for item in source {
+            *retained_counts
+                .entry(item.identity.as_str())
+                .or_insert(0usize) += 1;
+        }
+        for item in changed {
+            *retained_counts.get_mut(item.identity.as_str()).unwrap() -= 1;
+        }
+        for block in self.blocks.iter().rev() {
+            let Some(extent) = block.extent(source) else {
+                continue;
+            };
+            let expected = &source[extent];
+            let ambiguous = expected
+                .iter()
+                .any(|item| retained_counts[item.identity.as_str()] != 0);
+            if ambiguous {
+                continue;
+            }
+            let start = changed
+                .windows(expected.len())
+                .enumerate()
+                .find_map(|(start, items)| {
+                    (!used[start..start + items.len()].iter().any(|used| *used)
+                        && items
+                            .iter()
+                            .zip(expected)
+                            .all(|(item, original)| std::ptr::eq(*item, original)))
+                    .then_some(start)
+                });
             if let Some(start) = start {
-                used[start..start + block.items.len()].fill(true);
+                used[start..start + block.len()].fill(true);
                 quantity += block.input as i128;
             }
         }
@@ -358,13 +517,14 @@ impl InputMeasurements {
 
     fn changed_quantity(
         &self,
+        source: &[Item],
         changed: &[&Item],
         values: &[Value],
         measured: bool,
         allow_count: bool,
     ) -> Option<(i128, bool)> {
         let (mut quantity, used) = if measured {
-            self.measured_changes(changed)
+            self.measured_changes(source, changed)
         } else {
             (0, vec![false; changed.len()])
         };
@@ -406,11 +566,12 @@ impl InputMeasurements {
         if from.identity == to.identity {
             return Some((0, false));
         }
-        let (removed, added) = changes(from.items.as_deref()?, to.items.as_deref()?)?;
+        let (from, to) = (from.items.as_deref()?, to.items.as_deref()?);
+        let (removed, added) = changes(from, to)?;
         let (removed, removed_measured) =
-            self.changed_quantity(&removed, from_values, measured, allow_count)?;
+            self.changed_quantity(from, &removed, from_values, measured, allow_count)?;
         let (added, added_measured) =
-            self.changed_quantity(&added, to_values, measured, allow_count)?;
+            self.changed_quantity(to, &added, to_values, measured, allow_count)?;
         Some((added - removed, removed_measured || added_measured))
     }
 
@@ -439,6 +600,19 @@ impl InputMeasurements {
         if anchor.prompt.identity == target.identity {
             return Some(InputEstimate {
                 tokens: anchor.input,
+                basis: EstimateBasis::ProviderReceipt,
+            });
+        }
+        if let Some((source, target)) = anchor.prompt.items.as_deref().zip(target.items.as_deref())
+            && target.len() < source.len()
+            && same_items(target, &source[..target.len()])
+            && let Some(origin) = self.blocks.iter().rev().find_map(|block| {
+                let origin = block.origin.as_ref()?;
+                (origin.start == target.len() && block.extent(source).is_some()).then_some(origin)
+            })
+        {
+            return Some(InputEstimate {
+                tokens: origin.before_input,
                 basis: EstimateBasis::ProviderReceipt,
             });
         }
@@ -582,24 +756,13 @@ impl InputMeasurements {
             .checked_sub(self.text_tokens(&crate::savings::prompt_overhead(source), true)?)?;
         let mut covered = vec![false; items.len()];
         for block in self.blocks.iter().rev() {
-            if block.items.is_empty() || block.items.len() > items.len() {
-                continue;
-            }
-            let Some(start) = items.windows(block.items.len()).position(|items| {
-                items
-                    .iter()
-                    .zip(&block.items)
-                    .all(|(item, id)| item.identity == *id)
-            }) else {
+            let Some(extent) = block.extent(items) else {
                 continue;
             };
-            if covered[start..start + block.items.len()]
-                .iter()
-                .any(|covered| *covered)
-            {
+            if covered[extent.clone()].iter().any(|covered| *covered) {
                 return None;
             }
-            covered[start..start + block.items.len()].fill(true);
+            covered[extent].fill(true);
             budget = budget.checked_sub(block.input)?;
         }
         let mut pool = Vec::new();
@@ -865,7 +1028,7 @@ mod tests {
             measured.predict(&partial, "route", None).is_none(),
             "partial native batch cannot be attributed"
         );
-        measured.observe(&initial, &usage(1000), "route", None, 102);
+        measured.observe_primary(&initial, &usage(1000), "route", None, 102, true);
         assert_eq!(
             measured.predict(&later, "route", None).unwrap().tokens,
             9000

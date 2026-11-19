@@ -12,6 +12,16 @@ traditional accounting. Exact compatible receipts and complete measured append
 blocks take precedence. A whole measured block keeps its native quantity even
 when individual members cannot be attributed.
 
+An append bundle is a difference between successful **total input** receipts,
+including cached input. Its bounded record identifies the before and after
+prefixes and the original ordered range. Equal-looking items elsewhere do not
+establish the same occurrence. Missing usage breaks the interval; records
+without origin witnesses do not grant whole-bundle authority. Traditional
+retirement can keep a suffix of whole bundles when it fits without weakening
+the recent-content floor. The fixed floor, retained output, partial cuts, and
+new summary quantities still use estimates; receipt quantities do not imply
+cache warmth for either scenario.
+
 For a supported reasoning-containing block, subtract additive visible-item
 quantities, including visible framing, from its native input increment. Divide
 the remaining budget equally among the reasoning members, assigning integer
@@ -56,6 +66,13 @@ and cache behavior; the dashboard does not maintain a competing trajectory.
 Current-format restart preserves evidence and its explicit limitations. Unknown
 restoration or retained-output transitions cannot grant free reinitialization or
 silently reconstruct missing historical summary/cache events.
+
+An active-history reset is distinct from a cache-only failure. A matching
+prompt prefix or a retained native compaction checkpoint can witness continuity
+at a reset. Without such a witness, the whole-window comparison is unavailable:
+Carry keeps the prior comparison subtotal and continues counting paid receipts,
+but neither bridges unrelated history nor grants a second free initialization.
+This rule applies to newly captured evidence, not to previously priced calls.
 
 ## Compare the same successful population
 

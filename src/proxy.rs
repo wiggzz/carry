@@ -1991,6 +1991,7 @@ struct Commit {
     // compaction can clear the latter before this observation is committed.
     observed_input: Vec<Value>,
     outbound: Value,
+    primary_edited: bool,
     native: bool,
     dispatched_at: u64,
     _history_pin: history::Pin,
@@ -2641,6 +2642,7 @@ async fn prepare_primary(
             reviewed,
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
+            primary_edited,
             native,
             dispatched_at: now(),
             _history_pin: history_pin,
@@ -4612,12 +4614,13 @@ async fn relay(
                     ),
                 );
                 if !commit.native {
-                    commit.candidate.primary_input.observe(
+                    commit.candidate.primary_input.observe_primary(
                         &commit.outbound,
                         &value["usage"],
                         &commit.service.config.upstream_url,
                         resolved,
                         commit.dispatched_at,
+                        commit.primary_edited,
                     );
                 }
                 if let Some(trajectory) = &mut commit.candidate.request_evidence {

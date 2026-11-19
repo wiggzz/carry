@@ -385,7 +385,7 @@ class InitializationRegressions(support.FixtureCase):
             self.assertEqual(later["traditional_compactions"], 1,
                              "charged in-window count excludes pre-window initialization")
 
-    def test_cache_only_failure_retains_recognition_but_changed_settings_reinitialize(self):
+    def test_cache_only_failure_and_witnessed_settings_change_do_not_reinitialize(self):
         inputs = [260000, None, 260100, 260200]
 
         def primary(_body, n):
@@ -480,6 +480,34 @@ class InitializationRegressions(support.FixtureCase):
             self.assertEqual(trajectory["initial_compactions"], 1)
             self.assertEqual(trajectory["traditional_compactions"], 0)
             self.assertEqual(trajectory["summary_cost"], 0.0)
+
+    def test_unrelated_same_owner_history_makes_whole_window_unavailable(self):
+        def primary(_body, n):
+            response = support.completed(response_id=f"lost-continuity-{n}")
+            response["usage"] = {"input_tokens": 10000 if n == 1 else 260000,
+                                 "output_tokens": 0, "input_tokens_details": {"cached_tokens": 0}}
+            return 200, response
+
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        proxy = support.Proxy(self.state, fixture, mode="off")
+        self.stack.callback(proxy.close)
+        original = [{"role": "user", "content": "original task"}]
+        unrelated = [{"role": "user", "content": "unrelated task"}]
+        self.assertEqual(proxy.send(original, model="gpt-6.1-sol", max_output_tokens=1)[0], 200)
+        before = support.cost_estimate(proxy)
+        self.assertIsNotNone(before["whole_window"])
+        self.assertEqual(proxy.send(unrelated, model="gpt-6.1-sol", max_output_tokens=1,
+                                    instructions="new settings")[0], 200)
+        proxy.close()
+        proxy = support.Proxy(self.state, fixture, mode="off")
+        self.stack.callback(proxy.close)
+        after = support.cost_estimate(proxy)
+        self.assertTrue(after["quantity_evidence"]["trajectory_continuity_lost"])
+        self.assertIsNone(after["whole_window"])
+        self.assertEqual(after["initial_compactions"], before["initial_compactions"])
+        self.assertEqual(after["traditional_cost"], before["traditional_cost"])
+        self.assertGreater(after["observed_primary_cost"], before["observed_primary_cost"])
+        self.assertEqual(fixture.errors, [])
 
     def initialized_policy_restart_control(self, *, migrate):
         import json
