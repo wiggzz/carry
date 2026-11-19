@@ -335,11 +335,12 @@ class FixtureCase(unittest.TestCase):
 class StateRegressions(FixtureCase):
     def test_reviewer_titles_survive_http_restart_and_rendering(self):
         opening = "Opening message used as fallback"
+        first_title = "Repair parser for <nested> inputs"
+        next_title = "Document parser error messages"
         titles = [{}, {"title": "  Repair\tparser for <nested> inputs  "},
-                  {"title": 42}, {"title": "\n\t "}, {"title": "é" * 81},
-                  {"title": None}, {"title": "Verify parser error messages"}]
-        expected = [opening] + ["Repair parser for <nested> inputs"] * 5 + [
-            "Verify parser error messages"]
+                  {"title": None}, {"title": 42}, {"title": "\n\t "}, {"title": "é" * 81},
+                  {"title": next_title}, {"title": None}]
+        expected = [opening] + [first_title] * 5 + [next_title] * 2
 
         def review(_body, n):
             return 200, advice_response({"protected": [], "removable": [], "memories": [],
@@ -353,11 +354,16 @@ class StateRegressions(FixtureCase):
         self.assertEqual(len(fixture.reviews), 0)
         for n, title in enumerate(expected, 1):
             with self.subTest(review=n):
+                task = ("The repair is done. Now document the parser error messages."
+                        if n == 7 else f"Continue {n}")
                 history += [{"role": "assistant", "content": f"Reviewable source {n} " + "s" * 8192},
-                            {"role": "user", "content": f"Continue {n}"}]
+                            {"role": "user", "content": task}]
                 self.assertEqual(proxy.send(history)[0], 200)
                 self.assertEqual(len(fixture.reviews), n, "one existing review per turn")
-                if n in (2, len(expected)):
+                self.assertEqual(ledger(fixture.reviews[-1]).get("current_title"),
+                                 expected[n - 2] if n > 2 else None,
+                                 "the reviewer gets the stored title, not the opening excerpt")
+                if n in (2, 7):
                     proxy.close()
                     proxy = self.proxy(fixture, options)
                 status, stats = proxy.request("GET", "/carry/dashboard/stats")
