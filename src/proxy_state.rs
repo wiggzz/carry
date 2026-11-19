@@ -239,6 +239,8 @@ pub(super) struct Session {
     pub version: u32,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) fallback_title: Option<String>,
     #[serde(default)]
     pub client: Option<ClientProvenance>,
     pub next_id: u64,
@@ -363,7 +365,11 @@ fn identity(value: &Value) -> Value {
 impl Session {
     /// Dashboard label: stored title or a bounded first-user excerpt.
     pub fn title(&self) -> Option<String> {
-        if let Some(title) = &self.title {
+        self.title.clone().or_else(|| self.fallback_title())
+    }
+
+    fn fallback_title(&self) -> Option<String> {
+        if let Some(title) = &self.fallback_title {
             return Some(title.clone());
         }
         let user = self
@@ -413,7 +419,7 @@ impl Session {
     }
 
     pub fn ingest_with_rebase(&mut self, input: &[Value], reset_divergence: bool) -> Result<()> {
-        let original_title = self.title();
+        let original_fallback_title = self.fallback_title();
         if self.version != 0 && self.version != 3 {
             bail!("unsupported proxy checkpoint version");
         }
@@ -494,7 +500,7 @@ impl Session {
         if pending_echoed && self.last_response_id.is_none() {
             self.pending_output.clear();
         }
-        self.title = original_title.or_else(|| self.title());
+        self.fallback_title = original_fallback_title.or_else(|| self.fallback_title());
         Ok(())
     }
 
