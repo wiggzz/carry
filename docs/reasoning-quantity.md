@@ -42,6 +42,18 @@ disable heuristic calibration for that contract, including across restart.
 Estimates do not become native cache extents or establish that a candidate fits
 or overflows the provider's context window.
 
+Native response records use the shared prompt-text projection and tokenizer.
+Text and structured records from web/file/tool search, code interpreter logs,
+computer actions, shell and patch tools, MCP and program outputs have local
+retained-context estimates. This is token-context accounting; the upstream and
+client still own tool execution and any separate tool charges.
+
+Image payloads, screenshots, opaque program fingerprints and unknown native
+types remain unmeasured. Encoded byte length is never a token estimate. These
+rules apply when capturing new response facts; previously saved unknown
+quantities are not silently repaired or replaced with zero. Historical recovery
+requires verified retained response items and an explicit replay.
+
 ## Request facts, then stats-time replay
 
 `RequestEvidence` persists bounded request facts: numeric usage and quantities,

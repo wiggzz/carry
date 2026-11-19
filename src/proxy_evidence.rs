@@ -1546,13 +1546,13 @@ mod tests {
     }
 
     #[test]
-    fn native_search_output_without_retained_quantity_keeps_whole_comparison_unknown() {
+    fn unknown_native_output_without_retained_quantity_keeps_whole_comparison_unknown() {
         let mut evidence = RequestEvidence::default();
         let mut request =
             json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"research a topic"}]});
         for index in 0..2 {
             let response = json!({"status":"completed","output":if index == 0 {
-                json!([{"type":"web_search_call","id":"native-search","status":"completed",
+                json!([{"type":"future_native_call","id":"native-search","status":"completed",
                     "action":{"type":"search","query":"synthetic topic"}}])
             } else {json!([])},"usage":{"input_tokens":10000 + index * 100,"output_tokens":10,
                 "input_tokens_details":{"cached_tokens":0}}});

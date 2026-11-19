@@ -1,0 +1,30 @@
+{
+  "source": "https://developers.openai.com/api/reference/resources/responses/methods/create",
+  "items": [
+    {"comparable": true, "item": {"type":"web_search_call","id":"web-open","status":"completed","action":{"type":"open_page","url":"https://example.com/reference"}}},
+    {"comparable": true, "item": {"type":"web_search_call","id":"web-search","status":"completed","action":{"type":"search","query":"synthetic query","queries":["synthetic query"]}}},
+    {"comparable": true, "item": {"type":"web_search_call","id":"web-find","status":"completed","action":{"type":"find","url":"https://example.com/reference","pattern":"example"}}},
+    {"comparable": true, "item": {"type":"file_search_call","id":"file-search","status":"completed","queries":["synthetic"],"results":[{"file_id":"file-example","filename":"example.txt","score":0.9,"text":"Retained search evidence."}]}},
+    {"comparable": true, "item": {"type":"computer_call","id":"computer","call_id":"computer-call","status":"completed","action":{"type":"click","button":"left","x":10,"y":20},"pending_safety_checks":[]}},
+    {"comparable": true, "item": {"type":"code_interpreter_call","id":"python","status":"completed","container_id":"container-example","code":"print(2 + 2)","outputs":[{"type":"logs","logs":"4\n"}]}},
+    {"comparable": true, "item": {"type":"local_shell_call","id":"local-shell","call_id":"local-shell-call","status":"completed","action":{"type":"exec","command":["echo","example"],"env":{}}}},
+    {"comparable": true, "item": {"type":"local_shell_call_output","id":"local-shell-result","call_id":"local-shell-call","status":"completed","output":"example\n"}},
+    {"comparable": true, "item": {"type":"shell_call","id":"shell","call_id":"shell-call","status":"completed","action":{"commands":["echo example"],"timeout_ms":1000,"max_output_length":100}}},
+    {"comparable": true, "item": {"type":"shell_call_output","id":"shell-result","call_id":"shell-call","max_output_length":100,"output":[{"stdout":"example\n","stderr":"","outcome":{"type":"exit","exit_code":0}}]}},
+    {"comparable": true, "item": {"type":"apply_patch_call","id":"patch","call_id":"patch-call","status":"completed","operation":{"type":"update_file","path":"example.txt","diff":"@@\n-old\n+new"}}},
+    {"comparable": true, "item": {"type":"apply_patch_call_output","id":"patch-result","call_id":"patch-call","status":"completed","output":"Updated example.txt"}},
+    {"comparable": true, "item": {"type":"mcp_call","id":"mcp-call","status":"completed","server_label":"example","name":"lookup","arguments":"{\"key\":\"example\"}","output":"Retained MCP evidence.","error":null}},
+    {"comparable": true, "item": {"type":"mcp_list_tools","id":"mcp-tools","server_label":"example","tools":[{"name":"lookup","description":"Look up evidence.","input_schema":{"type":"object","properties":{"key":{"type":"string"}}}}],"error":null}},
+    {"comparable": true, "item": {"type":"mcp_approval_request","id":"approval","server_label":"example","name":"lookup","arguments":"{\"key\":\"example\"}"}},
+    {"comparable": true, "item": {"type":"mcp_approval_response","id":"approval-result","approval_request_id":"approval","approve":true,"reason":"Synthetic approval fixture."}},
+    {"comparable": true, "item": {"type":"tool_search_call","id":"tool-search","call_id":null,"execution":"server","status":"completed","arguments":{"query":"lookup evidence"}}},
+    {"comparable": true, "item": {"type":"tool_search_output","id":"tool-search-result","call_id":null,"execution":"server","status":"completed","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}},"strict":false}]}},
+    {"comparable": true, "item": {"type":"program_output","id":"program-result","call_id":"program-call","status":"completed","result":"{\"answer\":4}"}},
+    {"comparable": false, "item": {"type":"program","id":"program","call_id":"program-call","code":"text(2 + 2)","fingerprint":"opaque-replay-state","status":"completed"}},
+    {"comparable": false, "item": {"type":"image_generation_call","id":"image","status":"completed","result":"encoded-image-payload"}},
+    {"comparable": false, "item": {"type":"code_interpreter_call","id":"python-image","status":"completed","container_id":"container-example","code":"plot()","outputs":[{"type":"image","url":"data:image/png;base64,encoded-image-payload"}]}},
+    {"comparable": false, "item": {"type":"computer_call_output","id":"screen","call_id":"computer-call","output":{"type":"computer_screenshot","image_url":"data:image/png;base64,encoded-screen-payload"}}},
+    {"comparable": false, "item": {"type":"mcp_call","id":"mcp-image-error","server_label":"example","name":"lookup","arguments":"{}","output":null,"error":{"type":"mcp_tool_execution_error","content":[{"type":"image","data":"encoded-error-image","mimeType":"image/png"}]}}},
+    {"comparable": false, "item": {"type":"future_native_call","payload":"unknown-native-payload"}}
+  ]
+}
