@@ -333,6 +333,49 @@ class FixtureCase(unittest.TestCase):
 
 
 class StateRegressions(FixtureCase):
+    def test_reviewer_titles_survive_http_restart_and_rendering(self):
+        opening = "Opening message used as fallback"
+        titles = [{}, {"title": "  Repair\tparser for <nested> inputs  "},
+                  {"title": 42}, {"title": "\n\t "}, {"title": "é" * 81},
+                  {"title": None}, {"title": "Verify parser error messages"}]
+        expected = [opening] + ["Repair parser for <nested> inputs"] * 5 + [
+            "Verify parser error messages"]
+
+        def review(_body, n):
+            return 200, advice_response({"protected": [], "removable": [], "memories": [],
+                                         **titles[n - 1]})
+
+        fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
+        options = ["--min-payback-percent", "100"]
+        proxy = self.proxy(fixture, options)
+        history = [{"role": "user", "content": opening}]
+        self.assertEqual(proxy.send(history)[0], 200)
+        self.assertEqual(len(fixture.reviews), 0)
+        for n, title in enumerate(expected, 1):
+            with self.subTest(review=n):
+                history += [{"role": "assistant", "content": f"Reviewable source {n} " + "s" * 8192},
+                            {"role": "user", "content": f"Continue {n}"}]
+                self.assertEqual(proxy.send(history)[0], 200)
+                self.assertEqual(len(fixture.reviews), n, "one existing review per turn")
+                if n in (2, len(expected)):
+                    proxy.close()
+                    proxy = self.proxy(fixture, options)
+                status, stats = proxy.request("GET", "/carry/dashboard/stats")
+                self.assertEqual(status, 200)
+                self.assertEqual(len(stats["sessions"]), 1)
+                session = stats["sessions"][0]
+                self.assertEqual(session["title"], title)
+                self.assertEqual(session["invalid_reviews"], 0)
+                self.assertEqual(session["partial_reviews"], 0)
+                if n <= 2 or n == len(expected):
+                    path = self.state / "title-dashboard-fixture.stats"
+                    path.write_text(json.dumps(stats))
+                    env = dict(os.environ, CARRY_DASHBOARD_STATS_FIXTURE=str(path),
+                               CARRY_DASHBOARD_TITLE_EXPECT=title)
+                    result = subprocess.run(["node", "tests/proxy_dashboard.cjs"], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def continuation(self, failure, restart):
         a = {"role": "user", "content": "A: original goal"}
         o = {"type": "message", "role": "assistant", "content": [
