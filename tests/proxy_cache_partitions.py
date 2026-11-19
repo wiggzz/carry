@@ -136,17 +136,17 @@ class CachePartitions(support.FixtureCase):
                                  "CACHE_PARTITION_SETTLEMENT: contradictory aliases cannot mint money")
                 self.assertAlmostEqual(states[-1]["primary"]["cost_usd"], .0044, places=12)
         for step in (1, 2):
-            with self.subTest(stage="write_then_read_restart", step=step):
-                windows = [record for record in snapshots[step] if record.get("write_window")]
-                self.assertEqual(len(windows), int(valid),
-                    "CACHE_PARTITION_PRODUCER: only an agreed whole write supplies reusable evidence")
-                if valid:
-                    self.assertEqual(windows[0]["native_input_tokens"], 2000)
-                    self.assertEqual(windows[0]["native_write_tokens"], 2000)
-                    self.assertEqual(windows[0]["native_cached_fraction"], 0)
-                    self.assertEqual(windows[0]["write_window"]["lifetime"], 1800)
-                    if step == 2:
-                        self.assertIn(windows[0], snapshots[1], "a later read must not rewrite the original fact")
+            with self.subTest(stage="gateway_receipt_not_retention", step=step):
+                self.assertTrue(all(not record.get("write_window") and not record.get("read_window")
+                                    for record in snapshots[step]),
+                                "gateway aliases do not establish a provider retention window")
+                if valid or step == 2:
+                    record = snapshots[step][-1]
+                    self.assertEqual(record["native_input_tokens"], 2000)
+                    self.assertEqual(record["native_write_tokens"], 2000 if step == 1 else 0)
+                    self.assertEqual(record["native_read_tokens"], 0 if step == 1 else 2000)
+                    self.assertEqual(record["estimated_tokens"], 0,
+                                     "native quantities survive without dispatcher cache credit")
 
 
 def install_cases():
