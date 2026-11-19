@@ -5663,6 +5663,8 @@ mod tests {
     include!("proxy_timing_repair_tests.rs");
     include!("proxy_admission_tests.rs");
     include!("proxy_dashboard_tests.rs");
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    include!("proxy_detail_read_tests.rs");
     include!("proxy_archive_lifecycle_tests.rs");
     include!("proxy_retention_tests.rs");
     include!("proxy_resource_tests.rs");
