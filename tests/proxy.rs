@@ -3020,7 +3020,7 @@ async fn background_review_does_not_block_primary_or_duplicate_inflight_work() {
         )
         .await;
         let mut request = json!({"model":"gpt-6-luna","input":[
-        {"role":"user","content":"goal"},{"role":"assistant","content":"old evidence"},{"role":"user","content":"current"}]});
+        {"role":"user","content":"goal"},{"role":"assistant","content":"old evidence ".repeat(20)},{"role":"user","content":"current"}]});
         send(&url, &request, "async", "main")
             .await
             .bytes()
