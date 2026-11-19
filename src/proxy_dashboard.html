@@ -91,7 +91,11 @@ th { color:var(--muted); }
 progress { width:100%; height:6px; accent-color:#39856a; }
 pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:400px; overflow:auto; font-size:11px; }
 button,input { font:inherit; padding:10px; border:2px solid; color:inherit; background:var(--paper); }
-button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yellow); }
+button { cursor:pointer; box-shadow:2px 2px 0 var(--ink); background:var(--yellow); min-height:40px; padding:8px 14px; font-size:13px; font-weight:650; }
+button:disabled { cursor:default; opacity:.55; box-shadow:none; }
+#accounting-form { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px; }
+.session-navigation { display:flex; flex-direction:column; align-items:center; gap:12px; margin:28px 0 36px; text-align:center; }
+.session-navigation button { background:var(--paper); min-width:132px; }
 #login { margin-bottom:20px; }
 .empty { padding:24px; border:2px dashed; color:var(--muted); }
 :focus-visible { outline:3px solid #2b79ad; outline-offset:4px; }
@@ -142,9 +146,8 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 <section aria-labelledby="accounting-heading"><div class="section-head"><h2 id="accounting-heading">Monthly accounting</h2><p class="section-note">UTC observation months · independent of raw session details</p></div>
 <form id="accounting-form"><label for="accounting-month">Month (UTC)</label> <input id="accounting-month" type="month" required> <button id="accounting-load" type="submit">Load month</button></form>
 <p id="accounting-status" role="status" class="section-note">Choose a month to read retained numeric accounting. No opening balances are inferred.</p><div id="accounting-cards" class="cards"></div></section>
-<section aria-labelledby="conversations-heading"><div class="section-head"><h2 id="conversations-heading">By Session</h2><p class="section-note">One row per history · stable ID order · primary tokens below</p></div><div id="sessions" class="session-grid"></div></section>
-<details id="background-traffic" class="inspector"><summary id="background-summary">Client background requests</summary><div id="background-sessions" class="session-grid"></div></details>
-<nav aria-label="Session detail pages"><button type="button" id="first-sessions" disabled>First page</button> <button type="button" id="next-sessions" disabled>Next page</button><p id="session-page-note" class="section-note"></p></nav>
+<section aria-labelledby="conversations-heading"><div class="section-head"><h2 id="conversations-heading">By Session</h2><p class="section-note">Most recent request first · all sessions</p></div><div id="sessions" class="session-grid"></div></section>
+<nav class="session-navigation" aria-label="More sessions"><button type="button" id="load-more-sessions" disabled hidden>Load more</button><p id="session-page-note" class="section-note" role="status"></p></nav>
 <details id="estimate-details" class="inspector"><summary>Under the hood · costs, usage &amp; configuration</summary>
 <h3>Comparison window</h3><div id="cost-cards"></div><p id="accounting-detail"></p><p id="assumptions"></p>
 <h3>Provider-reported totals · primary + reviewer</h3><div class="scroll" tabindex="0" role="region" aria-label="Recorded usage by lane"><table><thead><tr><th>Lane</th><th>Calls</th><th>Input</th><th>Cached input</th><th>Cache share / coverage</th><th>Cache writes</th><th>Output</th><th>Observed cost</th><th>Unpriced calls</th></tr></thead><tbody id="usage"></tbody></table></div>
@@ -154,7 +157,8 @@ button { cursor:pointer; box-shadow:3px 3px 0 var(--ink); background:var(--yello
 'use strict';
 let token=new URLSearchParams(location.hash.slice(1)).get('token')||'';
 if(location.hash)history.replaceState(null,'',location.pathname+location.search);
-let busy=false,pageAfter='',nextPageAfter=null;
+let busy=false,nextPageAfter=null,pagesLoaded=1;
+let loadedSessions=new Map();
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?'—':Number(n).toLocaleString();
 const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x?.[key])||0),0);
@@ -163,7 +167,6 @@ const money=n=>n==null?'—':'$'+Number(n).toFixed(6);
 const pricedSubtotal=ledgers=>ledgers.some(l=>l.cost_usd!=null)?sum(ledgers,'cost_usd'):null;
 const headlineEstimate=e=>e&&Object.prototype.hasOwnProperty.call(e,'whole_window')?e.whole_window:e;
 const savingsText=e=>{e=headlineEstimate(e);return e?.savings==null?'—':money(e.savings)+(e.savings_percent!=null?' ('+Number(e.savings_percent).toFixed(1)+'%)':'')};
-const backgroundTypes=new Set(['background']);
 const sourceNames={conversation:'Conversation',agent:'Agent',background:'Client background'};
 function sourceLabel(s){return sourceNames[s.client?.kind]||'Unclassified'}
 function sessionMeta(s){const agent=s.client?.agent_name?.split('/').filter(Boolean).pop();return sourceLabel(s)+(agent&&agent!=='root'?' · '+agent:'')+' · '+s.id.slice(0,8)+(s.last_primary_dispatch?.model?' · '+s.last_primary_dispatch.model:'')}
@@ -228,7 +231,7 @@ function transcriptView(s){
  const body=document.createElement('pre');body.textContent=transcriptText.get(s.id)||'Open to load retained source. Historical wire bodies are not stored.';detail.append(body);
  detail.addEventListener('toggle',async()=>{
   if(!detail.isConnected)return;
-  if(!detail.open){transcriptRequests.delete(s.id);return}
+  if(!detail.open){transcriptRequests.delete(s.id);transcriptText.delete(s.id);body.textContent='Open to load retained source. Historical wire bodies are not stored.';return}
   const requestToken=token;
   const request={};transcriptRequests.set(s.id,request);
   const applicable=()=>requestToken===token&&transcriptRequests.get(s.id)===request&&detail.isConnected&&detail.open;
@@ -320,7 +323,8 @@ function comparisonScopeNote(root,e){
  if(e&&Object.prototype.hasOwnProperty.call(e,'whole_window')){
   const w=e.whole_window;
   const subset=e.whole_window_scope==='available_session_windows_only';
-  note(root,w?(subset?'Complete session windows · '+fmt(e.whole_window_included_sessions)+' histories included · '+fmt(e.whole_window_unavailable_sessions)+' excluded':'Whole accounting window · successful completions only')+' · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · actual money/window incomplete','comparison-scope card-note');
+  const missing=e.quantity_evidence?.numeric_archive_unavailable?'saved comparison history unavailable':e.unavailable_primary_cost_calls||e.unavailable_reviewer_cost_calls?'completed-call costs missing':e.coverage?.prior_untracked_calls?'earlier comparison history incomplete':e.coverage?.unavailable_quantity_calls?'comparison quantities missing for '+count(e.coverage.unavailable_quantity_calls,'completed call'):'traditional-history estimate incomplete';
+  note(root,w?(subset?'Complete session windows · '+fmt(e.whole_window_included_sessions)+' histories included · '+fmt(e.whole_window_unavailable_sessions)+' excluded':'Whole accounting window · successful completions only')+' · '+fmt(w.primary_responses)+' primary responses · '+fmt(w.inferred_primary_responses)+' inferred':'Whole-window estimate unavailable · '+missing,'comparison-scope card-note');
   if(w&&(w.trajectory?.initial_compactions??e.initial_compactions)>0)note(root,'Traditional starts after a free initial compaction','comparison-scope card-note');
   return;
  }
@@ -336,13 +340,13 @@ function renderSession(s){
  const active=s.processing||s.background_review_pending;
  const age=Date.now()/1000-(s.last_primary_dispatch?.at??-Infinity);
  const status=note(identity,s.processing?'Working':s.background_review_pending?'Reviewing':age>=0&&age<300?'Recent':'Idle','activity');status.setAttribute('data-active',String(!!active));
- const heading=document.createElement('h3');heading.textContent=s.title||'Untitled session';heading.title=s.id;identity.append(heading);
+ const heading=document.createElement('h3');heading.textContent=s.title?.startsWith('<turn_aborted>')?'Interrupted turn':s.title||'Untitled session';heading.title=s.id;identity.append(heading);
  note(identity,sessionMeta(s),'session-meta');
  identity.append(requestRecency(s));
  note(identity,count(s.completed_requests||0,'request')+(s.rewrites?' · '+count(s.rewrites.dispatched,s.rewrites.prior_unknown?'recorded rewrite':'rewrite')+(s.rewrites.forced?' · '+fmt(s.rewrites.forced)+' forced':'')+(s.rewrites.prior_unknown?' · earlier history unknown':''):''),'request-counts');el.append(identity);
  const ledgers=[s.primary||{},s.shadow||{}],missing=sum(ledgers,'unavailable_cost_calls'),e=s.cost_estimate,h=headlineEstimate(e);
  const costs=document.createElement('div');costs.className='session-costs';note(costs,missing?'Priced subtotal':'Observed cost','label');note(costs,money(pricedSubtotal(ledgers)),'value');note(costs,'Primary + reviewer · all paid attempts','card-note');el.append(costs);
- const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(h?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,h?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');comparisonScopeNote(saved,e);el.append(saved);
+ const saved=document.createElement('div');saved.className='session-savings';saved.setAttribute('data-loss',String(h?.savings<0));note(saved,'Estimated savings','label');note(saved,savingsText(e),'value');note(saved,h?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');comparisonScopeNote(saved,e);if(s.rewrites?.dispatched===0&&s.shadow?.cost_usd>0)note(saved,'Review cost so far · '+money(s.shadow.cost_usd)+' · no context rewrites yet','card-note');el.append(saved);
  el.append(contextOverview(s.context||{}),tokenMetrics(s));
  const alerts=[];
  if(missing)alerts.push(fmt(missing)+' unpriced calls');
@@ -370,19 +374,26 @@ function renderSession(s){
  }
  details.append(transcriptView(s));el.append(details);return el;
 }
-async function refresh(after=pageAfter){
+async function refresh(after=''){
  if(busy)return;busy=true;
- $('first-sessions').disabled=true;$('next-sessions').disabled=true;
+ const more=$('load-more-sessions');more.disabled=true;more.textContent=after?'Loading…':'Load more';
  try{
-  const res=await fetch('/carry/dashboard/stats'+(after?'?after_id='+encodeURIComponent(after):''),{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
-  if(!res.ok)throw Error(res.status===401?'Scoped proxy token required.':'Stats unavailable (HTTP '+res.status+').');
-  const data=await res.json(),sessions=data.sessions;
+  let cursor=after,data,page,read=0;
+  const rows=new Map(after?loadedSessions:[]);
+  do{
+   const res=await fetch('/carry/dashboard/stats'+(cursor?'?after_id='+encodeURIComponent(cursor):''),{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
+   if(!res.ok)throw Error(res.status===401?'Scoped proxy token required.':'Stats unavailable (HTTP '+res.status+').');
+   page=await res.json();data??=page;
+   for(const session of page.sessions)rows.set(session.id,session);
+   read++;cursor=page.session_page?.has_more?page.session_page.next_after:null;
+  }while(!after&&cursor&&read<pagesLoaded);
+  const sessions=[...rows.values()];
   const live=new Set(sessions.map(s=>s.id));
   for(const cache of [transcriptText,transcriptRequests])for(const id of cache.keys())if(!live.has(id))cache.delete(id);
-  const focusedElement=document.activeElement,roots=[$('sessions'),$('background-sessions')];
+  const focusedElement=document.activeElement,roots=[$('sessions')];
   const histories=new Map(roots.flatMap(descendants).filter(n=>n.className==='session').map(node=>[node.id,{node}]));
   $('status').textContent='Updated '+new Date().toLocaleTimeString()+' · refreshes every 2s';$('status').className=data.unavailable_sessions?'warning':'';$('login').hidden=true;
-  $('activity-summary').textContent=count(sessions.filter(s=>s.processing||s.background_review_pending).length,'active session')+' · '+count(sessions.length,'history','histories')+' on this page';
+  $('activity-summary').textContent=count(sessions.filter(s=>s.processing||s.background_review_pending).length,'active session')+' · '+count(sessions.length,'history','histories')+' shown';
   const primary=[data.usage.primary],shadow=[data.usage.reviewer],all=[...primary,...shadow];
   const unpriced=sum(all,'unavailable_cost_calls'),unreadable=data.usage.unavailable_owners||0,partial=unpriced>0||unreadable>0;
   const estimate=data.cost_estimate||{},headline=headlineEstimate(estimate);
@@ -391,7 +402,7 @@ async function refresh(after=pageAfter){
   note($('cards').children[1],headline?.savings<0?'Higher modeled cost with Carry':'Vs. traditional · comparison window','card-note');
   comparisonScopeNote($('cards').children[1],estimate);
   if(headline?.savings<0)$('cards').children[1].className='card loss';
-  $('estimate-coverage').textContent=estimate.whole_window_scope==='available_session_windows_only'?fmt(estimate.whole_window_included_sessions)+' complete histories · '+fmt(estimate.whole_window_unavailable_sessions)+' excluded':Object.prototype.hasOwnProperty.call(estimate,'whole_window')?(headline?fmt(headline.inferred_primary_responses)+' inferred calls · full cost window':fmt(estimate.whole_window_unavailable_sessions||0)+' windows with incomplete observed money'):fmt(estimate.included_sessions||0)+' comparable · '+fmt(estimate.excluded_sessions||0)+' excluded';
+  $('estimate-coverage').textContent=estimate.whole_window_scope==='available_session_windows_only'?fmt(estimate.whole_window_included_sessions)+' complete histories · '+fmt(estimate.whole_window_unavailable_sessions)+' excluded':Object.prototype.hasOwnProperty.call(estimate,'whole_window')?(headline?fmt(headline.inferred_primary_responses)+' inferred calls · full cost window':fmt(estimate.whole_window_unavailable_sessions||0)+' windows without a complete comparison'):fmt(estimate.included_sessions||0)+' comparable · '+fmt(estimate.excluded_sessions||0)+' excluded';
   const warnings=[];
   if(unpriced)warnings.push(count(unpriced,'unpriced call'));
   if(unreadable)warnings.push(count(unreadable,'unreadable checkpoint'));
@@ -409,17 +420,16 @@ async function refresh(after=pageAfter){
    const complete=observed===calls&&!unreadable;
    return row([name,fmt(calls),fmt(sum(ledgers,'input_tokens')),observed?fmt(cached)+(complete?' (provider-reported)':' (known subtotal; '+fmt(observed)+' of '+fmt(calls)+' calls)'):'Unavailable',input?(100*cached/input).toFixed(1)+'%'+(complete?'':' known subset · '+fmt(observed)+' / '+fmt(calls)+' calls'):'—',fmt(sum(ledgers,'cache_write_tokens')),fmt(sum(ledgers,'output_tokens')),money(pricedSubtotal(ledgers))+(missing?' · subtotal':''),fmt(missing)]);
   }));
-  const sorted=[...sessions].sort((a,b)=>a.id.localeCompare(b.id)),conversations=sorted.filter(s=>!backgroundTypes.has(s.client?.kind)),background=sorted.filter(s=>backgroundTypes.has(s.client?.kind));
-  patchChildren($('sessions'),conversations.map(renderSession),histories);
-  if(!conversations.length)note($('sessions'),'No conversations recorded yet.','empty');
-  patchChildren($('background-sessions'),background.map(renderSession),histories);
-  $('background-summary').textContent='Client background · '+count(background.length,'session');$('background-traffic').hidden=!background.length;
+  const requestTime=s=>typeof s.last_primary_dispatch?.at==='number'&&Number.isFinite(s.last_primary_dispatch.at)&&s.last_primary_dispatch.at>=0?s.last_primary_dispatch.at:-Infinity;
+  const sorted=[...sessions].sort((a,b)=>{const x=requestTime(a),y=requestTime(b);return x===y?a.id.localeCompare(b.id):x>y?-1:1});
+  patchChildren($('sessions'),sorted.map(renderSession),histories);
+  if(!sessions.length)note($('sessions'),'No sessions recorded yet.','empty');
   if(focusedElement&&document.activeElement!==focusedElement&&roots.some(root=>root.contains(focusedElement)))focusedElement.focus({preventScroll:true});
   $('raw').textContent=JSON.stringify(data,null,2);
-  pageAfter=after;nextPageAfter=data.session_page?.has_more?data.session_page.next_after:null;
-  $('session-page-note').textContent=(pageAfter?'Later session page':'First session page')+' · details only; cost and usage totals cover retained accounting across all pages.';
+  loadedSessions=rows;pagesLoaded=after?pagesLoaded+1:read;nextPageAfter=cursor;
+  $('session-page-note').textContent=count(sessions.length,'session')+' shown'+(cursor?' · older sessions available':'')+' · totals include all retained accounting.';
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
- finally{busy=false;$('first-sessions').disabled=!pageAfter;$('next-sessions').disabled=!nextPageAfter}
+ finally{busy=false;more.disabled=!nextPageAfter;more.hidden=!nextPageAfter;more.textContent='Load more'}
 }
 let accountingBusy=false;
 async function loadAccounting(event){
@@ -445,9 +455,8 @@ async function loadAccounting(event){
 }
 $('accounting-month').value=new Date().toISOString().slice(0,7);
 $('accounting-form').addEventListener('submit',loadAccounting);
-$('first-sessions').addEventListener('click',()=>refresh(''));
-$('next-sessions').addEventListener('click',()=>{if(nextPageAfter)return refresh(nextPageAfter)});
-$('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();refresh()});
+$('load-more-sessions').addEventListener('click',()=>{if(nextPageAfter)return refresh(nextPageAfter)});
+$('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();loadedSessions.clear();pagesLoaded=1;refresh()});
 refresh();setInterval(()=>{if(!document.hidden)refresh()},2000);
 </script>
 </body></html>

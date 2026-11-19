@@ -1646,6 +1646,35 @@ struct SessionPage {
     after_id: String,
     limit: Option<usize>,
 }
+type SessionOrder = (std::cmp::Reverse<Option<u64>>, String);
+
+fn session_cursor(order: &SessionOrder) -> String {
+    match order.0.0 {
+        Some(at) => format!("{at}:{}", order.1),
+        None => order.1.clone(),
+    }
+}
+
+impl SessionPage {
+    fn after(&self) -> Result<Option<SessionOrder>, Failure> {
+        if self.after_id.is_empty() {
+            return Ok(None);
+        }
+        let invalid = || failure(StatusCode::BAD_REQUEST, "invalid session cursor");
+        let (at, id) = match self.after_id.split_once(':') {
+            Some((at, id)) if !at.is_empty() && at.bytes().all(|b| b.is_ascii_digit()) => {
+                (Some(at.parse::<u64>().map_err(|_| invalid())?), id)
+            }
+            Some(_) => return Err(invalid()),
+            None => (None, self.after_id.as_str()),
+        };
+        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid());
+        }
+        Ok(Some((std::cmp::Reverse(at), id.to_owned())))
+    }
+}
+
 async fn dashboard_stats(
     State(service): State<Arc<Service>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1653,52 +1682,18 @@ async fn dashboard_stats(
     axum::extract::Query(page): axum::extract::Query<SessionPage>,
 ) -> Result<Response, Failure> {
     authorize_dashboard(&service, &headers, peer)?;
-    if !page.after_id.is_empty()
-        && (page.after_id.len() != 64 || !page.after_id.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return Err(failure(StatusCode::BAD_REQUEST, "invalid session cursor"));
-    }
-    let limit = page.limit.unwrap_or(100).clamp(1, 100);
-    // Select stable owner keys before constructing detailed rows. Keeping only
-    // the smallest limit+1 keys bounds the working set even for an unordered
-    // directory with many retained owners.
-    let mut selected = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(&service.config.state_dir)
-        .map_err(|_| {
-            failure(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "state directory unavailable",
-            )
-        })?
-        .flatten()
-    {
-        let path = entry.path();
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if path.extension().and_then(|s| s.to_str()) == Some("json")
-            && id.len() == 64
-            && id.bytes().all(|b| b.is_ascii_hexdigit())
-            && id > page.after_id.as_str()
-        {
-            selected.insert(id.to_owned());
-            if selected.len() > limit + 1 {
-                selected.pop_last();
-            }
-        }
-    }
-    let mut has_more = selected.len() > limit;
-    if has_more {
-        selected.pop_last();
-    }
-    let mut next_after = has_more.then(|| selected.last().cloned()).flatten();
+    let after = page.after()?;
+    let limit = page.limit.unwrap_or(20).clamp(1, 100);
+    // Select by authoritative primary activity during the existing numeric
+    // accounting scan. Keep only limit+1 keys before restoring raw histories.
+    // Missing dispatch times sort last; IDs break ties deterministically.
+    let mut selected = std::collections::BTreeMap::new();
     let entries = std::fs::read_dir(&service.config.state_dir).map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,
             "state directory unavailable",
         )
     })?;
-    let mut details = Vec::new();
     let mut unavailable_sessions = 0u64;
     let mut unavailable_accounting = 0u64;
     let history = history::ReadView::new(&service);
@@ -1769,10 +1764,28 @@ async fn dashboard_stats(
                     )
                 })?;
         }
-        if selected.contains(id) {
-            details.push(entry);
+        let order = (
+            std::cmp::Reverse(accounting.last_primary_dispatch.as_ref().map(|d| d.at)),
+            id.to_owned(),
+        );
+        if after.as_ref().is_none_or(|after| &order > after) {
+            selected.insert(order, entry);
+            if selected.len() > limit + 1 {
+                selected.pop_last();
+            }
         }
     }
+    let mut has_more = selected.len() > limit;
+    if has_more {
+        selected.pop_last();
+    }
+    let mut next_after = has_more
+        .then(|| {
+            selected
+                .last_key_value()
+                .map(|(key, _)| session_cursor(key))
+        })
+        .flatten();
     cost_estimate.excluded_sessions += unavailable_accounting;
     cost_estimate.unavailable_whole_windows(unavailable_accounting);
     usage.unavailable_owners = unavailable_accounting;
@@ -1799,7 +1812,7 @@ async fn dashboard_stats(
         },
         "sessions": [], "unavailable_sessions": u64::MAX,
         // Reserve the largest final cursor/count encoding before adding rows.
-        "session_page": {"has_more": false, "next_after": "0".repeat(64)},
+        "session_page": {"has_more": false, "next_after": "0".repeat(85)},
         "cost_basis": "standard API rate equivalents, not subscription charges or an invoice",
         "cost_scenario": crate::proxy_savings::Scenario::default(),
         "cost_estimate_basis": crate::proxy_savings::accounting_basis_label(),
@@ -1818,9 +1831,9 @@ async fn dashboard_stats(
             "dashboard page exceeds working-set bound",
         ));
     }
-    details.sort_by_key(|entry| entry.file_name());
     let mut sessions: Vec<Value> = Vec::new();
-    for entry in details {
+    let mut last_order = None;
+    for (order, entry) in selected {
         let path = entry.path();
         let id = path.file_stem().and_then(|s| s.to_str()).unwrap();
         let Ok(mut session) = load_dashboard_session(&service, id, &history) else {
@@ -1923,14 +1936,12 @@ async fn dashboard_stats(
                 ));
             }
             has_more = true;
-            next_after = sessions
-                .last()
-                .and_then(|row| row["id"].as_str())
-                .map(str::to_owned);
+            next_after = last_order.as_ref().map(session_cursor);
             break;
         }
         page_bytes += bytes;
         sessions.push(row);
+        last_order = Some(order);
     }
     data["sessions"] = json!(sessions);
     data["unavailable_sessions"] = json!(unavailable_sessions);

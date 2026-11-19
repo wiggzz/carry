@@ -1,6 +1,35 @@
 // Differential replay through both real coordinators. Quantity adapters remain
 // distinct: only this synthetic fixture deliberately equates their quantities.
 
+#[test]
+fn unchanged_primary_histories_keep_receipt_parity_across_client_settings_changes() {
+    for chronological in [false, true] {
+        let mut trajectory = Trajectory {
+            chronological,
+            ..Trajectory::default()
+        };
+        let mut request = body();
+        for (index, cached) in [0, 8192, 0].into_iter().enumerate() {
+            request["instructions"] = json!(format!("caller settings {index}"));
+            trajectory.projected(100, 100, false);
+            trajectory.primary(
+                &request,
+                &terminal(10000, cached, 0, 0),
+                "parity-route",
+                100 + index as u64,
+                true,
+            );
+            let estimate = trajectory.snapshot();
+            assert_eq!(estimate.initial_compactions, 0);
+            assert_eq!(estimate.traditional_compactions, 0);
+            assert!(
+                (estimate.traditional_cost - estimate.observed_primary_cost.unwrap()).abs() < 1e-12,
+                "no Carry rewrite or traditional summary: settings changes alone cannot invent primary savings (chronological={chronological}, request={index})"
+            );
+        }
+    }
+}
+
 // Review5714176642: changing forecast policy cannot rename summarized history.
 // Tests-first lifetime tracer. No implicit provider read-refresh contract is
 // declared: reading at t=106 must not move the modeled t=100 write deadline.

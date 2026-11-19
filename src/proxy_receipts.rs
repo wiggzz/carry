@@ -295,6 +295,7 @@ impl Replay {
                 .history
                 .bridge_canonical(native.input_tokens, self.restored);
             if rebased {
+                self.history.diverge();
                 self.reset_receipt_epoch();
             }
             self.estimated_projection |= restored != self.restored;

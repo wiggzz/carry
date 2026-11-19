@@ -133,7 +133,7 @@ pub(super) struct TraditionalHistoryState {
     // Proof for the entire comparison history, not a last-plan/no-op flag.
     // Missing proof never opts into sharing a provider observation.
     #[serde(default)]
-    shared_primary_history: crate::savings::PrimaryHistory,
+    pub(super) shared_primary_history: crate::savings::PrimaryHistory,
     pub(super) retired: u64,
     pub(super) summary: u64,
     pub(super) last_traditional_input: u64,
