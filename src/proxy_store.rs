@@ -362,9 +362,15 @@ impl Store {
             // Bound schema creation itself, not just its preflight estimate.
             // One transaction limits WAL frames to the new sixteen-page store;
             // normal publication receives the configured page limit below.
-            connection.execute_batch("PRAGMA page_size=4096; PRAGMA max_page_count=16; PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; BEGIN IMMEDIATE; CREATE TABLE records(kind TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind,key)) WITHOUT ROWID;
-                CREATE INDEX records_age ON records(kind,at);
-                CREATE INDEX records_owner ON records(kind,owner);
+            // Keep payloads out of the key B-tree: a WITHOUT ROWID seek can
+            // fetch whole overflow records just to compare unrelated keys.
+            // V1 queries work on both layouts; do not rebuild existing stores
+            // on open or charge an implicit migration to request admission.
+            // Include key explicitly to retain the ordering and coverage that
+            // WITHOUT ROWID secondary indexes got from the primary key suffix.
+            connection.execute_batch("PRAGMA page_size=4096; PRAGMA max_page_count=16; PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; BEGIN IMMEDIATE; CREATE TABLE records(kind TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL, at INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind,key));
+                CREATE INDEX records_age ON records(kind,at,key);
+                CREATE INDEX records_owner ON records(kind,owner,key);
                 PRAGMA user_version=1; COMMIT;").map_err(error)?;
         }
         if write {

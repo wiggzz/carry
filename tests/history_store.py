@@ -10,6 +10,31 @@ from contextlib import closing
 KINDS = ('nodes', 'tips', 'reviews', 'transcripts', 'snapshots', 'dispatches')
 
 
+def assert_streaming_index_plans(case, db):
+    # Check the ordering and covering contracts on the actual SQLite authority.
+    queries = (
+        ('records_owner', True,
+         "SELECT key FROM records INDEXED BY records_owner WHERE kind='accounting' AND owner=? ORDER BY key DESC LIMIT 1", ('owner-0',)),
+        ('records_owner', True,
+         "SELECT max(key) FROM records INDEXED BY records_owner WHERE kind='accounting' GROUP BY owner", ()),
+        ('records_owner', False,
+         "SELECT owner,key,at,length(data),CASE WHEN length(data)<=? THEN data ELSE NULL END "
+         "FROM records INDEXED BY records_owner WHERE kind='accounting' AND at>=? ORDER BY owner,key", (16384, 0)),
+        ('records_age', False,
+         "SELECT key,at,length(data),CASE WHEN length(data)<=?1 THEN data ELSE NULL END FROM records "
+         "WHERE kind='accounting' AND at>=?2 AND (at>?3 OR (at=?3 AND key>?4)) ORDER BY at,key LIMIT ?5",
+         (16384, 0, 0, '', 8)),
+        ('records_age', False,
+         "SELECT key,length(data) FROM records WHERE kind=? AND at<=? ORDER BY at,key LIMIT 8", ('nodes', 30)),
+    )
+    for index, covering, query, params in queries:
+        with case.subTest(query=query):
+            plan = [step[3].upper() for step in db.execute('EXPLAIN QUERY PLAN ' + query, params)]
+            lookup = ('COVERING INDEX ' if covering else 'INDEX ') + index.upper()
+            case.assertTrue(any(lookup in step for step in plan), plan)
+            case.assertFalse(any('TEMP B-TREE' in step for step in plan), plan)
+
+
 def read_index(path):
     if not path.read_bytes()[:16].startswith(b'SQLite format 3'):
         return json.loads(path.read_text())

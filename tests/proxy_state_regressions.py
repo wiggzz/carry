@@ -333,6 +333,40 @@ class FixtureCase(unittest.TestCase):
 
 
 class StateRegressions(FixtureCase):
+    def test_fresh_history_store_separates_keys_from_payloads(self):
+        import sqlite3
+        from contextlib import closing
+
+        from history_store import assert_streaming_index_plans
+        from proxy_transparent_history import TransparentProxy
+
+        def unexpected_review(*_):
+            raise AssertionError("fixture must not dispatch a reviewer")
+
+        fixture = self.fixture(lambda *_: (200, completed()), unexpected_review)
+        request = [{"role": "user", "content": "Synthetic retained history"}]
+        for first in (True, False):
+            with contextlib.closing(TransparentProxy(
+                    self.state, fixture, mode="audit",
+                    environment={"CARRY_PROXY_REVIEW_MIN_PRIMARY_TOKENS": "2000000"})) as proxy:
+                if first:
+                    status, _ = proxy.send(request)
+                    self.assertEqual(status, 200)
+                status, data = proxy.request("GET", "/carry/dashboard/stats")
+                self.assertEqual(status, 200)
+                self.assertEqual(len(data["sessions"]), 1)
+                self.assertEqual(data["sessions"][0]["primary"]["calls"], 1)
+                uri = (self.state / "history.index").as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True)) as db:
+                    self.assertGreater(db.execute("SELECT count(*) FROM records").fetchone()[0], 0)
+                    # Exercise SQLite on real authority, not the text of the DDL.
+                    self.assertGreater(db.execute("SELECT count(rowid) FROM records").fetchone()[0], 0)
+                    self.assertEqual(db.execute("PRAGMA user_version").fetchone(), (1,))
+                    self.assertEqual(db.execute("PRAGMA journal_mode").fetchone(), ("wal",))
+                    assert_streaming_index_plans(self, db)
+        self.assertEqual(len(fixture.primaries), 1)
+        self.assertEqual(fixture.reviews, [])
+
     def continuation(self, failure, restart):
         a = {"role": "user", "content": "A: original goal"}
         o = {"type": "message", "role": "assistant", "content": [
