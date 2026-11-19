@@ -44,8 +44,10 @@ async function listContract() {
   first=[newest,newer];
   const beforePoll=requests.length;
   await refresh();
-  assert.equal(new URL(requests[beforePoll],'http://localhost').searchParams.has('after_id'),false,
-    'polling continues to discover new activity');
+  assert.deepEqual(requests.slice(beforePoll), ['/carry/dashboard/stats'],
+    'polling discovers recent activity with one accounting scan even after loading older pages');
+  assert.equal(requests.filter(url=>url.includes('after_id=')).length,2,
+    'only explicit Load more clicks fetch older pages, including retries');
   assert.deepEqual(rows().map(n=>n.id),['history:newest','history:newer','history:older']);
   assert.strictEqual(rows()[1],firstRow);
   assert.equal(detail.open,true);
@@ -57,9 +59,11 @@ async function listContract() {
   sandbox.fetch=async()=>({ok:true,json:async()=>({...data,sessions:[missing]})});
   await refresh();
   const text=node=>[node.textContent,...node.children.map(text)].join('\n');
-  assert.match(text(rows()[0]),/comparison quantities.*76|76.*comparison quantities/,
+  const missingRow = rows().find(n=>n.id==='history:missing-comparison');
+  assert.ok(missingRow, 'newly reported sessions are displayed alongside the browsed snapshot');
+  assert.match(text(missingRow),/comparison quantities.*76|76.*comparison quantities/,
     'missing comparison quantities are explained beside the unavailable savings');
-  assert.doesNotMatch(text(rows()[0]),/actual money\/window incomplete/,
+  assert.doesNotMatch(text(missingRow),/actual money\/window incomplete/,
     'unknown comparison quantities must not imply missing paid receipts');
   console.log('dashboard chronological list contract passed');
 }

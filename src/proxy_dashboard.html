@@ -157,8 +157,8 @@ button:disabled { cursor:default; opacity:.55; box-shadow:none; }
 'use strict';
 let token=new URLSearchParams(location.hash.slice(1)).get('token')||'';
 if(location.hash)history.replaceState(null,'',location.pathname+location.search);
-let busy=false,nextPageAfter=null,pagesLoaded=1;
-let loadedSessions=new Map();
+let busy=false,nextPageAfter=null;
+let recentSessions=[],browsedSessions=null;
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?'—':Number(n).toLocaleString();
 const sum=(xs,key)=>xs.reduce((a,x)=>a+(Number(x?.[key])||0),0);
@@ -378,15 +378,20 @@ async function refresh(after=''){
  if(busy)return;busy=true;
  const more=$('load-more-sessions');more.disabled=true;more.textContent=after?'Loading…':'Load more';
  try{
-  let cursor=after,data,page,read=0;
-  const rows=new Map(after?loadedSessions:[]);
-  do{
-   const res=await fetch('/carry/dashboard/stats'+(cursor?'?after_id='+encodeURIComponent(cursor):''),{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
-   if(!res.ok)throw Error(res.status===401?'Scoped proxy token required.':'Stats unavailable (HTTP '+res.status+').');
-   page=await res.json();data??=page;
-   for(const session of page.sessions)rows.set(session.id,session);
-   read++;cursor=page.session_page?.has_more?page.session_page.next_after:null;
-  }while(!after&&cursor&&read<pagesLoaded);
+  const res=await fetch('/carry/dashboard/stats'+(after?'?after_id='+encodeURIComponent(after):''),{headers:token?{Authorization:'Bearer '+token}:{},cache:'no-store'});
+  if(!res.ok)throw Error(res.status===401?'Scoped proxy token required.':'Stats unavailable (HTTP '+res.status+').');
+  const data=await res.json();
+  const recent=after?recentSessions:data.sessions;
+  let browsed=browsedSessions,cursor=nextPageAfter;
+  // Poll only the recent page. Older rows and their continuation are snapshots
+  // from explicit browsing, not another accounting scan on each timer tick.
+  if(after){
+   browsed=new Map(browsed??recent.map(s=>[s.id,s]));
+   for(const session of data.sessions)browsed.set(session.id,session);
+  }
+  if(after||!browsed)cursor=data.session_page?.has_more?data.session_page.next_after:null;
+  const rows=new Map(browsed);
+  for(const session of recent)rows.set(session.id,session);
   const sessions=[...rows.values()];
   const live=new Set(sessions.map(s=>s.id));
   for(const cache of [transcriptText,transcriptRequests])for(const id of cache.keys())if(!live.has(id))cache.delete(id);
@@ -426,8 +431,8 @@ async function refresh(after=''){
   if(!sessions.length)note($('sessions'),'No sessions recorded yet.','empty');
   if(focusedElement&&document.activeElement!==focusedElement&&roots.some(root=>root.contains(focusedElement)))focusedElement.focus({preventScroll:true});
   $('raw').textContent=JSON.stringify(data,null,2);
-  loadedSessions=rows;pagesLoaded=after?pagesLoaded+1:read;nextPageAfter=cursor;
-  $('session-page-note').textContent=count(sessions.length,'session')+' shown'+(cursor?' · older sessions available':'')+' · totals include all retained accounting.';
+  recentSessions=recent;browsedSessions=browsed;nextPageAfter=cursor;
+  $('session-page-note').textContent=count(sessions.length,'session')+' shown'+(cursor?' · older sessions available':'')+(browsed?' · only the recent page refreshes automatically':'')+' · totals include all retained accounting.';
  }catch(err){$('status').textContent=err.message+' Previous stats may be stale.';$('status').className='error';$('login').hidden=false}
  finally{busy=false;more.disabled=!nextPageAfter;more.hidden=!nextPageAfter;more.textContent='Load more'}
 }
@@ -456,7 +461,7 @@ async function loadAccounting(event){
 $('accounting-month').value=new Date().toISOString().slice(0,7);
 $('accounting-form').addEventListener('submit',loadAccounting);
 $('load-more-sessions').addEventListener('click',()=>{if(nextPageAfter)return refresh(nextPageAfter)});
-$('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();loadedSessions.clear();pagesLoaded=1;refresh()});
+$('login').addEventListener('submit',event=>{event.preventDefault();token=$('token').value.trim();$('token').value='';transcriptText.clear();transcriptRequests.clear();recentSessions=[];browsedSessions=null;nextPageAfter=null;refresh()});
 refresh();setInterval(()=>{if(!document.hidden)refresh()},2000);
 </script>
 </body></html>
