@@ -1546,6 +1546,34 @@ mod tests {
     }
 
     #[test]
+    fn unknown_native_output_without_retained_quantity_keeps_whole_comparison_unknown() {
+        let mut evidence = RequestEvidence::default();
+        let mut request =
+            json!({"model":"gpt-6.1-sol","input":[{"role":"user","content":"research a topic"}]});
+        for index in 0..2 {
+            let response = json!({"status":"completed","output":if index == 0 {
+                json!([{"type":"future_native_call","id":"native-search","status":"completed",
+                    "action":{"type":"search","query":"synthetic topic"}}])
+            } else {json!([])},"usage":{"input_tokens":10000 + index * 100,"output_tokens":10,
+                "input_tokens_details":{"cached_tokens":0}}});
+            evidence.primary(&request, &response, "synthetic-search", 100 + index, true);
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"continue"}));
+        }
+        let estimate = evidence.snapshot();
+        assert_eq!(estimate.coverage.primary_responses, 2);
+        assert!(estimate.observed_primary_cost.unwrap() > 0.0);
+        assert_eq!(estimate.unavailable_primary_cost_calls, 0);
+        assert!(estimate.coverage.unavailable_quantity_calls > 0);
+        assert!(
+            estimate.dashboard(false).whole_window.is_none(),
+            "a missing traditional quantity cannot become zero savings or fabricated whole-window money"
+        );
+    }
+
+    #[test]
     fn bounded_evidence_loss_is_explicit_not_whole_session_parity() {
         let mut evidence = RequestEvidence::default();
         for _ in 0..=RequestEvidence::MAX_OBSERVATIONS {

@@ -26,6 +26,8 @@ pub(super) struct AccountingView {
     shadow: UsageLedger,
     completed_requests: u64,
     #[serde(default)]
+    last_primary_dispatch: Option<DispatchMeasurement>,
+    #[serde(default)]
     request_evidence: Option<crate::proxy_savings::RequestEvidence>,
     #[serde(default)]
     primary_pending: bool,
@@ -42,6 +44,7 @@ impl AccountingView {
             primary: self.primary,
             shadow: self.shadow,
             completed_requests: self.completed_requests,
+            last_primary_dispatch: self.last_primary_dispatch,
             request_evidence: self.request_evidence,
             primary_pending: self.primary_pending,
             background_review_pending: self.background_review_pending,
