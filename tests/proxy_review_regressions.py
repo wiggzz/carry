@@ -13,9 +13,9 @@ from proxy_state_regressions import advice_response, completed, ledger, wire
 
 class ReviewRegressions(support.FixtureCase):
     @staticmethod
-    def seed():
+    def seed(evidence_detail=""):
         return [{"role": "user", "content": "durable goal"},
-                {"role": "assistant", "content": "UNIQUE_LIVE_SOURCE calibration result"},
+                {"role": "assistant", "content": "UNIQUE_LIVE_SOURCE calibration result" + evidence_detail},
                 {"role": "user", "content": "continue task"}]
 
     def fixture(self, review=None, primary=None):
@@ -308,6 +308,7 @@ class ReviewRegressions(support.FixtureCase):
     def test_successive_review_memory_provenance_uses_only_eligible_source_groups(self):
         original = "ACCEPTED_ORIGINAL: calibration is 873 kelvin."
         corrected = "ACCEPTED_CORRECTION: calibration is 874 kelvin."
+        history = self.seed(" detail" * 32)
 
         def review(body, n):
             state = ledger(body)
@@ -334,17 +335,17 @@ class ReviewRegressions(support.FixtureCase):
         options = ["--min-payback-percent", "100"]
         proxy = self.proxy(fixture, options)
         for _ in range(3):
-            self.assertEqual(proxy.send(self.seed())[0], 200)
+            self.assertEqual(proxy.send(history)[0], 200)
         accepted = proxy.advice()
         self.assertEqual(accepted["feedback"]["rejected_count"], 3)
         self.assertEqual(accepted["feedback"]["accepted_memories"], 1)
         self.assertEqual([(m["source_ids"], m["text"]) for m in accepted["memories"]],
                          [([2], corrected)])
         self.assertEqual(accepted["opinions"].get("2"), "keep")
-        self.assertEqual(fixture.primaries[-1]["input"], self.seed())
+        self.assertEqual(fixture.primaries[-1]["input"], history)
         proxy.close()
         proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send(self.seed())[0], 200)
+        self.assertEqual(proxy.send(history)[0], 200)
         self.evidence.update(accepted=accepted, saved=proxy.saved(), final_advice=proxy.advice(),
                              reviews=fixture.reviews, primaries=fixture.primaries, scripted_advice=True)
         self.assertEqual(len(fixture.reviews), 3)
@@ -367,7 +368,7 @@ class ReviewRegressions(support.FixtureCase):
         fixture = self.fixture(review)
         options = ["--min-payback-percent", "100", "--classifier-cache-policy", "disabled"]
         proxy = self.proxy(fixture, options)
-        history = self.seed()
+        history = self.seed(" detail" * 32)
         self.assertNotIn(fact, json.dumps(history))
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertEqual(proxy.send(history)[0], 200)  # Review 1 accepts m1.

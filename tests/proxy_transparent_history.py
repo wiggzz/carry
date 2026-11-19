@@ -1277,7 +1277,7 @@ class TransparentHistory(regressions.FixtureCase):
                    "--classifier-cache-policy", "disabled"]
         proxy = self.proxy(fixture, options)
         history = [{"role": "user", "content": "GOAL"},
-                   {"role": "assistant", "content": "SOURCE"},
+                   {"role": "assistant", "content": "SOURCE " * 32},
                    {"role": "user", "content": "BOUNDARY"}]
         self.assertEqual(proxy.send(history)[0], 200)
         self.assertEqual(proxy.advice()["memories"][0]["text"], "RETIRED_FACT")
