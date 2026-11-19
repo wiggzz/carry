@@ -209,6 +209,44 @@ class StorageForwarding(unittest.TestCase):
             self.assertEqual(self.authority_rows(state), before,
                 "failed reads must not replace valid prior authority with fresh history")
 
+    def test_running_service_truncated_authority_rejects_before_any_dispatch(self):
+        for corrupt in (b"", b"SQLite", b"SQLite format 3"):
+            with self.subTest(header=corrupt), self.directory() as directory, contextlib.ExitStack() as stack:
+                root = Path(directory)
+                seed, _ = self.setup_proxy(root)
+                stack.callback(seed.close)
+                self.assertEqual(self.request(seed, self.body())[0], 200)
+                self.assertEqual(seed.saved()["primary"]["calls"], 1)
+                seed.close()  # Join all legitimate writers before damaging authority.
+                proxy, fixture = self.setup_proxy(root)
+                stack.callback(fixture.close)
+                stack.callback(proxy.close)
+                self.assertIsNone(proxy.process.poll(), "damage must occur in a running service")
+                (root / "history.index").write_bytes(corrupt)
+                def authority_bytes():
+                    return {p.name: p.read_bytes() for p in root.glob("history.index*")}
+                before = authority_bytes()
+                status, headers, raw = self.request(proxy, self.body())
+                observed = {
+                    "status": status,
+                    "durability": headers.get("x-carry-durability"),
+                    "primaries": fixture.primaries,
+                    "reviews": fixture.reviews,
+                    "wires": fixture.wires,
+                    "authority_unchanged": authority_bytes() == before,
+                    "fixture_errors": fixture.errors,
+                }
+                print("truncated-authority:" + json.dumps({
+                    "header_bytes": len(corrupt), "status": status,
+                    "primary_arrivals": len(fixture.primaries),
+                    "reviewer_arrivals": len(fixture.reviews),
+                    "authority_unchanged": observed["authority_unchanged"],
+                }), flush=True)
+                self.assertEqual(observed, {
+                    "status": 409, "durability": None, "primaries": [], "reviews": [],
+                    "wires": [], "authority_unchanged": True, "fixture_errors": [],
+                }, raw)
+
     def test_corrupt_authority_is_not_mistaken_for_storage_pressure(self):
         with self.directory() as directory:
             root = Path(directory)

@@ -454,6 +454,36 @@ impl ReadView {
             policy: semantic::scope(&service.config),
         })
     }
+    #[cfg(test)]
+    pub(super) fn read_profile(&self) -> (i32, std::collections::BTreeMap<String, u64>) {
+        let store = self.store.lock().unwrap();
+        let (mut misses, mut high) = (0, 0);
+        // SAFETY: the locked Store keeps this connection alive and exclusive.
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_db_status(
+                    store.connection.handle(),
+                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                    &mut misses,
+                    &mut high,
+                    0,
+                ),
+                rusqlite::ffi::SQLITE_OK
+            );
+        }
+        (misses, storage::test_reads())
+    }
+    #[cfg(test)]
+    pub(super) fn sqlite_policy(&self) -> Value {
+        let store = self.store.lock().unwrap();
+        let scalar = |sql| {
+            store
+                .connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        json!({"version":rusqlite::version(),"direct_overflow_read":scalar("SELECT sqlite_compileoption_used('DIRECT_OVERFLOW_READ')"),"cache_size":scalar("PRAGMA cache_size"),"mmap_size":scalar("PRAGMA mmap_size"),"temp_store":scalar("PRAGMA temp_store")})
+    }
     pub(super) fn expired_accounting_totals(
         &self,
     ) -> std::io::Result<(crate::proxy_savings::DashboardTotals, DashboardUsage)> {

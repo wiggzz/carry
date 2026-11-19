@@ -67,6 +67,102 @@ fn numeric_review_admission_rejects_memory_authority_and_invalid_refs_but_keeps_
     assert!(s.review_feedback["rejected_count"].as_u64().unwrap() >= 7);
 }
 
+#[test]
+fn replacement_admission_requires_rendered_token_savings_across_all_sources() {
+    use crate::proxy_state::Memory;
+
+    let config = reviewer_config();
+    let omitted = HashSet::new();
+    let text = " fact".repeat(60);
+    let evidence = |words| json!({"role":"assistant","content":" detail".repeat(words)});
+    let mut seed = Session::default();
+    seed.ingest(&[evidence(24)]).unwrap();
+    seed.memories.push(Memory {
+        id: 1,
+        source_ids: vec![1],
+        text: text.clone(),
+    });
+    let rendered_memory = seed.render_projection(&HashSet::from([1])).pop().unwrap();
+    let tokens = |item: &Value| seed.primary_input.visible_text_tokens(item);
+    let replacement_cost = tokens(&rendered_memory);
+    let first = evidence(24);
+    let equal_words = (1..60)
+        .find(|words| tokens(&first) + tokens(&evidence(*words)) == replacement_cost)
+        .expect("fixture can create a source pair with equal rendered cost");
+
+    for (words, accepted) in [(equal_words, false), (equal_words - 1, false), (equal_words + 1, true)] {
+        let second = evidence(words);
+        assert!(tokens(&first).max(tokens(&second)) < replacement_cost);
+        if !accepted {
+            assert!(tokens(&json!(text)) < tokens(&first) + tokens(&second));
+        }
+        let originals = [
+            json!({"role":"user","content":"goal"}),
+            first.clone(),
+            json!({"role":"user","content":"follow up"}),
+            second.clone(),
+            json!({"role":"user","content":"separate work"}),
+            evidence(100),
+            json!({"role":"user","content":"current task"}),
+        ];
+        let mut session = Session::default();
+        session.ingest(&originals).unwrap();
+        for item in &mut session.history {
+            item.exposed = true;
+        }
+        let groups = session.groups();
+        session.apply_advice_with_memory_admission(&groups, &json!({
+            "protected":[], "removable":[2,4,6], "memories":[
+                {"source_ids":[2,4,2],"text":text},
+                {"source_ids":[6],"text":"unrelated valid fact"}
+            ]
+        }), |candidate| memory_admission_fits(&config, candidate, &omitted)).unwrap();
+
+        assert_eq!(session.review_feedback["accepted_memories"], json!(1 + u64::from(accepted)), "source pair: {} tokens, rendered memory: {replacement_cost}", tokens(&first) + tokens(&second));
+        assert_eq!(session.review_feedback["rejected_count"], json!(u64::from(!accepted)));
+        let authorized = groups.iter().filter(|group| session.drop_authorized(group))
+            .flat_map(|group| group.members.iter().copied()).collect::<HashSet<_>>();
+        assert_eq!(authorized, if accepted { HashSet::from([2,4,6]) } else { HashSet::from([6]) });
+        let rendered = session.render_projection(&authorized);
+        assert_eq!(rendered.contains(&rendered_memory), accepted);
+        assert_eq!(rendered.contains(&first), !accepted);
+        assert_eq!(rendered.contains(&second), !accepted);
+        assert!(!rendered.contains(&originals[5]));
+        assert!(rendered.iter().any(|item| item["content"].as_str().is_some_and(|content| content.contains("unrelated valid fact"))));
+    }
+}
+
+#[test]
+fn replacement_admission_does_not_guess_native_source_tokens() {
+    let config = reviewer_config();
+    for payload in ["abcd".to_owned(), "abcd".repeat(400)] {
+        let mut session = Session::default();
+        let originals = [
+            json!({"role":"user","content":"goal"}),
+            json!({"type":"reasoning","summary":[],"encrypted_content":payload}),
+            json!({"type":"function_call","call_id":"f","name":"inspect","arguments":"{}"}),
+            json!({"type":"function_call_output","call_id":"f","output":"evidence"}),
+            json!({"role":"user","content":"current task"}),
+        ];
+        session.ingest(&originals).unwrap();
+        for item in &mut session.history {
+            item.exposed = true;
+        }
+        let groups = session.groups();
+        let text = " fact".repeat(150);
+        session.apply_advice_with_memory_admission(&groups, &json!({
+            "protected":[], "removable":[2], "memories":[{"source_ids":[2],"text":text}]
+        }), |candidate| memory_admission_fits(&config, candidate, &HashSet::new())).unwrap();
+
+        assert_eq!(session.review_feedback["accepted_memories"], 1);
+        let group = groups.iter().find(|group| group.id == 2).unwrap();
+        assert!(session.drop_authorized(group));
+        let rendered = session.render_projection(&group.members.iter().copied().collect());
+        assert!(rendered.iter().any(|item| item["content"].as_str().is_some_and(|content| content.contains(&text))));
+        assert!(!rendered.contains(&originals[1]));
+    }
+}
+
 #[tokio::test]
 async fn numeric_background_review_keeps_captured_projection_after_owner_advances_and_restarts() {
     let (sender, mut captures) = tokio::sync::mpsc::unbounded_channel();
@@ -287,9 +383,9 @@ fn merged_projected_group_authorizes_original_member_union_not_separator() {
     let mut s = Session::default();
     s.ingest(&[
         json!({"role":"user","content":"goal"}),
-        json!({"role":"assistant","content":"first"}),
+        json!({"role":"assistant","content":"first detail ".repeat(12)}),
         json!({"role":"user","content":"separator"}),
-        json!({"role":"assistant","content":"second"}),
+        json!({"role":"assistant","content":"second detail ".repeat(12)}),
         json!({"role":"user","content":"task"}),
     ])
     .unwrap();
@@ -416,9 +512,9 @@ fn reviewer_memory_provenance_resolves_merged_split_and_omitted_original_groups(
     let mut s = Session::default();
     s.ingest(&[
         json!({"role":"user","content":"goal"}),
-        json!({"role":"assistant","content":"first evidence"}),
+        json!({"role":"assistant","content":"first evidence ".repeat(12)}),
         json!({"role":"user","content":"separator"}),
-        json!({"role":"assistant","content":"second evidence"}),
+        json!({"role":"assistant","content":"second evidence ".repeat(12)}),
         json!({"role":"user","content":"current"}),
     ])
     .unwrap();

@@ -1440,7 +1440,7 @@ async fn dashboard_context_states_partition_sources_not_memories() {
         ..Session::default()
     };
     for n in 0..5 {
-        observe_source(&mut session, &format!("source {n}"));
+        observe_source(&mut session, &format!("source {n}: {}", " detail".repeat(32)));
     }
     session.apply_advice(&session.groups(), &json!({"removable":[1,2],"protected":[3],"memories":[{"source_ids":[1],"text":"Remember source one"}]})).unwrap();
     session.last_submitted_ids = vec![2, 3, 4, 5];
