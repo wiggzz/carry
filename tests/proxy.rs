@@ -860,6 +860,7 @@ fn private_numeric_journal(bytes: &[u8], saved: &serde_json::Value, completed: u
                     refs.clone()
                 };
                 let expected_facts = json!({
+                    "recognition_v2":true,
                     "configuration": facts["configuration"],
                     "contract": {"version":1,"quantity":"ProviderRequestInputTotalV1",
                         "projection":"ReceiptBlocksOrVisibleTextV2","model":"fixture-model",

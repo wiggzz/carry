@@ -39,8 +39,8 @@ impl InputMeasurements {
         })
     }
 
-    fn fully_measured(&self, changed: &[&Item]) -> bool {
-        self.measured_changes(changed)
+    fn fully_measured(&self, source: &[Item], changed: &[&Item]) -> bool {
+        self.measured_changes(source, changed)
             .1
             .into_iter()
             .all(|used| used)
@@ -53,7 +53,12 @@ impl InputMeasurements {
             return None;
         }
         let (mut residual, mut count) = (0u64, 0u64);
-        for allocation in self.blocks.iter().filter_map(|b| b.allocation.as_ref()) {
+        for allocation in self
+            .blocks
+            .iter()
+            .filter(|block| block.origin.is_some())
+            .filter_map(|block| block.allocation.as_ref())
+        {
             residual = residual.checked_add(allocation.residual)?;
             count = count.checked_add(allocation.opaque_items)?;
         }
@@ -78,10 +83,9 @@ impl InputMeasurements {
         let submitted_values = items(submitted)?;
         let canonical_prompt = prompt(&canonical_values);
         let submitted_prompt = prompt(&submitted_values);
-        let (removed, added) = changes(
-            submitted_prompt.items.as_deref()?,
-            canonical_prompt.items.as_deref()?,
-        )?;
+        let submitted_items = submitted_prompt.items.as_deref()?;
+        let canonical_items = canonical_prompt.items.as_deref()?;
+        let (removed, added) = changes(submitted_items, canonical_items)?;
         let mut available = BTreeMap::new();
         for value in canonical_values.iter().chain(&submitted_values) {
             available.insert(identity(value), value);
@@ -91,19 +95,21 @@ impl InputMeasurements {
         // never borrow another block's residual. Legacy blocks can recover above
         // only from complete membership; otherwise partial attribution stays
         // unavailable. Whole-block native authority is independent of this.
-        for changed in [&removed, &added] {
+        for (source, changed) in [(submitted_items, &removed), (canonical_items, &added)] {
             for block in &self.blocks {
-                if block.opaque
+                if let Some(extent) = block.extent(source)
+                    && block.opaque
                     && block.allocation.is_none()
-                    && changed
-                        .iter()
-                        .any(|item| block.items.contains(&item.identity))
-                    && !changed.windows(block.items.len().max(1)).any(|window| {
-                        window.len() == block.items.len()
-                            && window
-                                .iter()
-                                .zip(&block.items)
-                                .all(|(item, id)| item.identity == *id)
+                    && changed.iter().any(|item| {
+                        source[extent.clone()]
+                            .iter()
+                            .any(|member| std::ptr::eq(*item, member))
+                    })
+                    && !changed.windows(extent.len()).any(|window| {
+                        window
+                            .iter()
+                            .zip(&source[extent.clone()])
+                            .all(|(item, member)| std::ptr::eq(*item, member))
                     })
                 {
                     return None;
@@ -113,8 +119,8 @@ impl InputMeasurements {
         if let Some(tokens) = self.restoration(canonical, submitted, route, resolved) {
             let measured = (removed.is_empty() && added.is_empty())
                 || (self.contract == expected
-                    && self.fully_measured(&removed)
-                    && self.fully_measured(&added));
+                    && self.fully_measured(submitted_items, &removed)
+                    && self.fully_measured(canonical_items, &added));
             return Some(RestorationEstimate {
                 tokens,
                 measured,
@@ -141,6 +147,9 @@ impl InputMeasurements {
         for allocation in self
             .blocks
             .iter()
+            .filter(|block| {
+                block.extent(canonical_items).is_some() || block.extent(submitted_items).is_some()
+            })
             .filter_map(|block| block.allocation.as_ref())
         {
             pool_residual = pool_residual.checked_add(allocation.residual)?;
@@ -150,9 +159,9 @@ impl InputMeasurements {
             pool_residual = pool_residual.checked_add(allocation.residual)?;
             pool_count = pool_count.checked_add(allocation.opaque_items)?;
         }
-        let changed_quantity = |changed: &[&Item]| -> Option<(i128, u64)> {
+        let changed_quantity = |source: &[Item], changed: &[&Item]| -> Option<(i128, u64)> {
             // Whole measured blocks win over all member allocations.
-            let (mut quantity, used) = self.measured_changes(changed);
+            let (mut quantity, used) = self.measured_changes(source, changed);
             let mut estimated = 0u64;
             for (item, used) in changed.iter().zip(used) {
                 if used {
@@ -168,9 +177,11 @@ impl InputMeasurements {
                 }
                 let mut native_allocated = None;
                 for block in &self.blocks {
-                    if let Some(allocation) = &block.allocation {
-                        for (index, id) in block.items.iter().enumerate() {
-                            if id == &item.identity {
+                    if let (Some(extent), Some(allocation)) =
+                        (block.extent(source), &block.allocation)
+                    {
+                        for (index, member) in source[extent].iter().enumerate() {
+                            if std::ptr::eq(*item, member) {
                                 let n = *allocation.tokens.get(index)?;
                                 if native_allocated.is_some_and(|prior| prior != n) {
                                     return None;
@@ -199,8 +210,8 @@ impl InputMeasurements {
             }
             Some((quantity, estimated))
         };
-        let (removed, removed_estimated) = changed_quantity(&removed)?;
-        let (added, added_estimated) = changed_quantity(&added)?;
+        let (removed, removed_estimated) = changed_quantity(submitted_items, &removed)?;
+        let (added, added_estimated) = changed_quantity(canonical_items, &added)?;
         Some(RestorationEstimate {
             tokens: added.checked_sub(removed)?,
             measured: false,
