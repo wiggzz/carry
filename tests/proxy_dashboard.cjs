@@ -573,7 +573,14 @@ const cards = () => new Map([...elements.get('cards').children,...elements.get('
     for(const s of data.sessions){
       const row=document.getElementById('history:'+s.id);
       checkVisibleScope(byClass(row,'session-savings'),s.cost_estimate,s.cost_estimate.coverage.primary_responses);
-      assert.ok(!byClass(row,'session-details').open,'HTTP fixture disclosures remain closed');
+      const details=byClass(row,'session-details');
+      assert.ok(!details.open,'HTTP fixture disclosures remain closed');
+      if(process.env.CARRY_DASHBOARD_TITLE_EXPECT){
+        const title=process.env.CARRY_DASHBOARD_TITLE_EXPECT;
+        assert.equal(walk(row).find(node=>node.tagName==='h3').textContent,title);
+        details.open=true;
+        assert.ok(visibleText(row).includes(title),'title remains visible in the expanded session');
+      }
     }
     console.log('private frozen producer smoke: ok (contents not logged)');
   }

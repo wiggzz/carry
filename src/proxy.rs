@@ -31,7 +31,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     proxy_savings::numeric_review_usage,
     proxy_sse::{JsonObserver, Observer},
-    proxy_state::{CacheEvidence, Group, Session},
+    proxy_state::{CacheEvidence, Group, MAX_SESSION_TITLE_CHARS, Session},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -2967,7 +2967,7 @@ Prefer exact source protection. Use memories for large sources whose useful fact
 
 As the primary moves past detailed work on a code section or implementation, mark sources removable when the exact details no longer inform the task and can be rediscovered easily. Before marking the only useful record of a conclusion or completed work removable, leave a brief factual outcome memory: what was decided or accomplished, verification and any needed artifact/evidence pointer. Before removing unique evidence of unfinished work, preserve a concise continuity memory with its actual status, next action, relevant branch/artifact/evidence pointers and unresolved blockers. Preserve only useful specifics, not generic task summaries or invented status; do not restate human directives as work outcomes. No new memory is needed when sufficient continuity already remains elsewhere or the information is no longer useful. Keep the original source protected if a sufficient memory cannot be accurately written or accepted; use previous_review_feedback to correct rejected replacements. Accepted items are already applied. Memories remain revisable and retireable as work progresses.
 
-Return only the strict JSON advice object: protected, removable, and memories with source_ids and text. Empty arrays are valid. Do not speculate about token budgets, prices, or savings."#;
+Return only the strict JSON object: protected, removable, memories with source_ids and text, and title. Empty arrays are valid. For the dashboard title, use a few words that describe the user's task without sensitive details, or null if the task is unclear. Do not speculate about token budgets, prices, or savings."#;
 
 fn primary_direction(context: &Value) -> &Value {
     context
@@ -3081,7 +3081,7 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
             "type": "json_schema", "name": "carry_review", "strict": true,
             "schema": {
                 "type": "object", "additionalProperties": false,
-                "required": ["protected", "removable", "memories"],
+                "required": ["protected", "removable", "memories", "title"],
                 "properties": {
                     "protected": {"type": "array", "items": {"type": "integer"}},
                     "removable": {"type": "array", "items": {"type": "integer"}},
@@ -3092,7 +3092,8 @@ fn review_body_with_input(config: &ProxyCli, session: &Session, input: Vec<Value
                             "source_ids": {"type": "array", "items": {"type": "integer"}},
                             "text": {"type": "string"}
                         }
-                    }}
+                    }},
+                    "title": {"type": ["string", "null"]}
                 }
             }
         }}
@@ -3332,6 +3333,9 @@ fn settle_review(current: &mut Session, before: &Session, reviewed: &Session, ru
     {
         current.last_review_request = before.last_review_request;
         current.review_admission = reviewed.review_admission.clone();
+        if current.review_epoch == before.review_epoch && reviewed.title != before.title {
+            current.title.clone_from(&reviewed.title);
+        }
         // Only Record::apply at ingress closes replay intent, after successful
         // durable publication. Paid settlement (even accepted advice) cannot.
         // A paid observation owns its bounded diagnostics even if every item
@@ -3648,7 +3652,10 @@ async fn review_chunk(
                 &diagnostic,
             );
         }
-        if let Some(advice) = reviewer_advice(&value) {
+        if let Some(mut advice) = reviewer_advice(&value) {
+            let title = advice
+                .as_object_mut()
+                .and_then(|object| object.remove("title"));
             let reviewed = view
                 .groups()
                 .flat_map(|g| g.members.iter().copied())
@@ -3679,6 +3686,17 @@ async fn review_chunk(
                 Err(error) => {
                     session.review_feedback = json!({"rejected_count":1,"rejected":[{"field":"batch","reason":error.to_string()}]});
                 }
+            }
+            if valid
+                && let Some(title) = title
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                && !title.is_empty()
+                && title.chars().count() <= MAX_SESSION_TITLE_CHARS
+                && !title.chars().any(char::is_control)
+            {
+                session.title = Some(title);
             }
         }
     } else {
@@ -5292,7 +5310,11 @@ mod tests {
             assert_eq!(schema["additionalProperties"], false);
             assert_eq!(
                 schema["required"],
-                json!(["protected", "removable", "memories"])
+                json!(["protected", "removable", "memories", "title"])
+            );
+            assert_eq!(
+                schema["properties"]["title"]["type"],
+                json!(["string", "null"])
             );
             for field in ["protected", "removable"] {
                 assert_eq!(schema["properties"][field]["items"]["type"], "integer");

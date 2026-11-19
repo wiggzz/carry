@@ -182,6 +182,11 @@ fn cache_observation_coverage_survives_http_restart_and_rendering() {
 }
 
 #[test]
+fn reviewer_titles_survive_http_restart_and_rendering() {
+    state_regression("reviewer_titles_survive_http_restart_and_rendering");
+}
+
+#[test]
 fn direction_changes_reject_held_advice_and_preserve_paid_receipt() {
     state_regression("direction_changes_reject_held_advice_and_preserve_paid_receipt");
 }

@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 use carry::core::{UsageLedger, prefix_compatible};
 
+pub(super) const MAX_SESSION_TITLE_CHARS: usize = 80;
+
 /// Read-only accounting projection of the current checkpoint. It deliberately
 /// has no canonical source, memories or planner state. Only dashboard reads use
 /// the reconstructed numeric Session; it is never saved as checkpoint authority.
@@ -354,7 +356,7 @@ fn identity(value: &Value) -> Value {
 }
 
 impl Session {
-    /// Only a bounded first-user excerpt is exposed by the dashboard.
+    /// Dashboard label: stored title or a bounded first-user excerpt.
     pub fn title(&self) -> Option<String> {
         if let Some(title) = &self.title {
             return Some(title.clone());
@@ -392,8 +394,11 @@ impl Session {
         if normalized.is_empty() {
             return None;
         }
-        let mut title = normalized.chars().take(80).collect::<String>();
-        if normalized.chars().count() > 80 {
+        let mut title = normalized
+            .chars()
+            .take(MAX_SESSION_TITLE_CHARS)
+            .collect::<String>();
+        if normalized.chars().count() > MAX_SESSION_TITLE_CHARS {
             title.push('…');
         }
         Some(title)
