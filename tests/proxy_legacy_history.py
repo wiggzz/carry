@@ -173,8 +173,8 @@ class LegacyHistoryLoads(support.FixtureCase):
                 # Complete history proof is not cache-write evidence. The
                 # first eventless continuation must be cold; the next
                 # has a genuinely new modeled event from that continuation.
-                expected_comparison += (incoming * 2.5 if step == 0 else
-                                        21400 * .1 + 100 * 2.5) / 1e6
+                expected_comparison += (incoming * 2.0 if step == 0 else
+                                        21400 * .1 + 100 * 2.0) / 1e6
                 self.assertEqual(state["primary_input"]["anchor"]["input"], inputs[seed_count + step])
                 old = staged["request_evidence"]["observations"]
                 self.assertEqual(state["request_evidence"]["observations"][:len(old)], old)

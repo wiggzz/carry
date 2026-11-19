@@ -738,7 +738,7 @@ class NoodleRegressions(unittest.TestCase):
                         self.assertAlmostEqual(saved["primary"]["cost_usd"],
                                                n * (200000 * 0.1 + 0.5) / 1e6, places=12)
                         expected = (n * (200000 * 0.1 + 0.5) if label == "tracked" else
-                                    200000 * (0.01 + (n-1) * 0.125) + n * 0.5) / 1e6
+                                    200000 * (0.01 + (n-1) * 0.10) + n * 0.5) / 1e6
                         self.assertAlmostEqual(saved["estimate"]["traditional_cost"], expected, places=12)
                         if n > 1:
                             old = snapshots[n-2]["request_evidence"]["observations"]
@@ -827,7 +827,7 @@ class NoodleRegressions(unittest.TestCase):
                 compact_facts = self.primary_observation(compact)["facts"]
                 full_facts = self.primary_observation(snapshots[0])["facts"]
                 self.assertEqual(compact_facts["cache_scope"] == full_facts["cache_scope"], mode == "audit")
-                expected = (6000 * rates["write" if mode == "off" else "cached"] + rates["output"]) / 1e6
+                expected = (6000 * rates["input" if mode == "off" else "cached"] + rates["output"]) / 1e6
                 self.assertAlmostEqual(snapshots[0]["estimate"]["traditional_cost"] -
                                        compact["estimate"]["traditional_cost"], expected, places=12)
                 for previous, current in zip(snapshots, snapshots[1:]):

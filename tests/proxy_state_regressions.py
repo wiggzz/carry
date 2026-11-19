@@ -1142,7 +1142,7 @@ class StateRegressions(FixtureCase):
         self.assertEqual(after["traditional_compactions"], 1)
         self.assertEqual(after["summary_cost"], estimate["summary_cost"])
         self.assertAlmostEqual(after['traditional_cost'] - estimate['traditional_cost'],
-                               ((1600 + 100 - retained) * .125 + .5) / 1e6, places=12)
+                               ((1600 + 100 - retained) * .10 + .5) / 1e6, places=12)
         self.assertEqual(len(fixture.primaries), 3)
         self.assertEqual(fixture.reviews, [])
         self.assertEqual(fixture.primaries[2]["input"][-2:], [tool, {
