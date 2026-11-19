@@ -64,7 +64,7 @@ def prefix_identity(body, end):
     return hashlib.sha256(wire).hexdigest()
 
 
-def grade_cache_records(records, history):
+def grade_cache_records(records, history, *, unknown_retention=False):
     """Check the shared purpose-neutral evidence against actual outbound bodies."""
     assert len(records) <= 128
     assert len(json.dumps(records, separators=(',', ':')).encode()) <= 65536
@@ -84,7 +84,12 @@ def grade_cache_records(records, history):
         assert all(unsigned(record[key]) for key in ('input_len', 'at', 'ttl_seconds'))
         assert nonnegative(record['estimated_tokens'])
         assert nonnegative(record['native_cached_fraction']) and record['native_cached_fraction'] <= 1
-        assert record['at'] > 0 and record['ttl_seconds'] == 1800
+        assert record['at'] > 0
+        if unknown_retention:
+            assert record['ttl_seconds'] == record['estimated_tokens'] == 0
+            assert {'write_window', 'read_window'}.isdisjoint(record)
+        else:
+            assert record['ttl_seconds'] == 1800
         for key in ('native_input_tokens', 'native_write_tokens', 'native_read_tokens'):
             if key in record:
                 assert unsigned(record[key])
@@ -480,21 +485,15 @@ def run(binary, directory, policy_arg='openai-explicit', enabled=True, model='gp
             assert credit_snapshots[1]['native_cached_tokens'] == credit_snapshots[2]['native_cached_tokens'] == 0
             assert credit_snapshots[3]['native_cached_tokens'] == provider.receipts[2]['synthetic_cached_tokens'] > 0, \
                 'the actual read receipt must retain its observed native quantity'
-            if enabled:
-                assert all(s['forecast_prefix_units'] == 0 for s in credit_snapshots), \
-                    'partial-prefix receipts do not prove full-input future coverage'
-            else:
-                assert credit_snapshots[2]['forecast_prefix_units'] > 0, \
-                    'the implicit full-input write must preserve its independent coverage'
-                assert credit_snapshots[3]['forecast_prefix_units'] == credit_snapshots[2]['forecast_prefix_units'], \
-                    'a partial read must not grow full-write coverage'
+            assert all(s['forecast_prefix_units'] == 0 for s in credit_snapshots), \
+                'loopback read and write receipts do not attest an official billing window'
             assert state['shadow']['unavailable_cost_calls'] >= 1, 'missing usage must remain unknown in metering'
         records = read_index(directory / 'state' / 'history.index')['upstream_cache']
         if policy_arg == 'auto':
             assert not records, 'unknown generic capability cannot confer cache evidence'
         else:
             assert records and any(e['native_cached_fraction'] > 0 for e in records)
-        grade_cache_records(records, provider.reviews + provider.primary)
+        grade_cache_records(records, provider.reviews + provider.primary, unknown_retention=True)
         return {'reviews': len(provider.reviews), 'processes': 2, 'case': case, 'basis': evidence['basis'],
                 'classifier_cache_policy': policy_arg, 'classifier_model': model, 'explicit_enabled': enabled}
 
