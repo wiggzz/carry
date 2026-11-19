@@ -179,9 +179,14 @@ impl PrimaryFacts {
         });
         // Count only the protected/fixed semantic floor, never the full native
         // input. These quantities are shared prompt evidence, not forecasts.
-        let request_resolution = resolved
-            .cloned()
-            .map(|model| model.with_request_cache_lifetime(body));
+        let request_resolution = resolved.cloned().map(|model| {
+            let mut request = model.with_request_cache_lifetime(body);
+            // Replay needs the frozen rates, route, limits and cache policy,
+            // not another copy of the owner-level catalog explanations.
+            request.provenance.clear();
+            request.raw_field_status.clear();
+            request
+        });
         let cache_mode = request_cache_mode(body, &model, request_resolution.as_ref());
         let route_scope = (route, resolved.map(|resolved| &resolved.route));
         let cache_scope = if cache_mode == carry::models::ScenarioCacheMode::Implicit
