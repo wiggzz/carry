@@ -87,6 +87,25 @@ fn gpt62_subscription_tool_restart_continuation() {
 }
 
 #[test]
+fn fresh_history_store_separates_keys_from_payloads() {
+    state_regression("fresh_history_store_separates_keys_from_payloads");
+}
+
+#[test]
+fn history_store_offline_layout_staging_preserves_records() {
+    let output = python_fixture("test_stage_history_rowid.py")
+        .arg("-v")
+        .output()
+        .expect("Python must exercise offline SQLite staging");
+    assert!(
+        output.status.success(),
+        "offline SQLite staging failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn local_storage_failure_preserves_upstream_output() {
     let output = python_fixture("proxy_storage_forwarding.py")
         .arg("-v")
