@@ -193,6 +193,57 @@ fn payoff_horizon_exposes_both_spacing_bounds_for_both_wires() {
     }
 }
 
+#[test]
+fn implicit_write_tariff_changes_cold_horizon_cost_order() {
+    use crate::proxy_quantity::{EstimateBasis, InputEstimate};
+    let (config, session, original, _) = clock_subject();
+    let model = &config.model_resolution.as_ref().unwrap().primary;
+    for (ttl, write_rate) in [("30m", 0.125), ("12h", 0.25)] {
+        let mut keep = original.clone();
+        keep["prompt_cache_options"] = json!({"ttl": ttl});
+        let mut compact = keep.clone();
+        compact["input"] = json!(session.render_projection(&HashSet::from([2])));
+        let mut cache = Vec::new();
+        assert!(crate::proxy_cache::observe(
+            &mut cache,
+            &keep,
+            &json!({"input_tokens":50000,"cached_input_tokens":0,"cache_write_input_tokens":50000}),
+            Some(model),
+            &config.primary_cache_auth,
+            crate::proxy_cache::ObservationTime::during(100, 100),
+        ));
+        let forecast = resolved_input_costs(
+            &keep,
+            &compact,
+            &cache,
+            "gpt-6-luna",
+            4,
+            Some(model),
+            &config.primary_cache_auth,
+            101,
+            InputEstimate {
+                tokens: 50_000,
+                basis: EstimateBasis::ProviderReceipt,
+            },
+            InputEstimate {
+                tokens: 38_600,
+                basis: EstimateBasis::ReceiptAnchoredTextDelta,
+            },
+        )
+        .unwrap();
+        assert_eq!(forecast.keep_cache.first_supported_cached_tokens, 50_000.0);
+        assert_eq!(forecast.compact_cache.first_supported_cached_tokens, 0.0);
+        let expected_keep = (50_000.0 * 0.01 + 3.0 * 50_000.0 * write_rate) / 1e6;
+        let expected_compact = 4.0 * 38_600.0 * write_rate / 1e6;
+        assert!(
+            forecast.keep < forecast.compact,
+            "cache-write tariff changes the selected cost order for {ttl}: {forecast:?}"
+        );
+        assert!((forecast.keep - expected_keep).abs() < 1e-12);
+        assert!((forecast.compact - expected_compact).abs() < 1e-12);
+    }
+}
+
 #[tokio::test]
 async fn documented_long_retention_changes_http_wire_at_boundary_after_restart() {
     use std::collections::VecDeque;
