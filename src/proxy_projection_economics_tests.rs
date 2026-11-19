@@ -364,6 +364,7 @@ fn marginal_capacity_uses_fitting_continuation_before_forcing_another_edit() {
 fn marginal_warm_veto_requires_current_scoped_cache_evidence_not_omission_history() {
     let (mut config, mut session, body) = marginal_projection_fixture();
     let model = &mut config.model_resolution.as_mut().unwrap().primary;
+    model.route = Route::new("https://api.openai.com/v1/responses", false);
     model.cache = resolve_model(
         "gpt-6-sol",
         Route::new("https://api.openai.com/v1/responses", false),

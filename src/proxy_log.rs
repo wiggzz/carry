@@ -605,6 +605,10 @@ pub(super) fn planned(service: &Service, id: &str, request_id: &str, report: &Va
         "estimate_basis",
         "review_completion_basis",
         "cache_basis",
+        "cache_evidence",
+        "selection_reason",
+        "future_cache_basis",
+        "primary_cached_estimated_tokens",
     ] {
         safe[field] = report[field].clone();
     }
@@ -612,7 +616,7 @@ pub(super) fn planned(service: &Service, id: &str, request_id: &str, report: &Va
     safe["candidate_count"] = json!(candidates.map_or(0, Vec::len));
     safe["candidates"] = json!(candidates.into_iter().flatten().take(8).map(|candidate| {
         let mut summary = json!({"removed_group_count":candidate["removed_groups"].as_array().map_or(0,Vec::len)});
-        for field in ["feasible", "joint", "future_reviewer_keep_calls", "future_reviewer_compact_calls",
+        for field in ["feasible", "joint", "selection_joint", "primary_input_cache_sensitivity", "future_reviewer_keep_calls", "future_reviewer_compact_calls",
             "primary_retained_estimated_tokens", "reviewer_retained_estimated_tokens", "reviewer_cached_estimated_tokens"] {
             summary[field] = candidate[field].clone();
         }

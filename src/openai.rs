@@ -288,21 +288,17 @@ impl OpenAiClient {
         self.resolved_model()?.cache_read_refresh_seconds(body)
     }
 
+    pub(crate) fn cache_route(&self) -> carry::models::Route {
+        carry::models::Route::new(
+            &format!("{}/responses", self.api_base),
+            matches!(self.auth, RequestAuth::CodexSubscription { .. }),
+        )
+    }
+
     fn resolved_model(&self) -> Option<carry::models::ResolvedModel> {
         // Native runs use the same exact destination/auth entitlement boundary
         // as proxy dispatch. A familiar slug behind a gateway is not proof.
-        carry::models::resolve_model(
-            &self.model,
-            carry::models::Route::new(
-                &format!("{}/responses", self.api_base),
-                matches!(self.auth, RequestAuth::CodexSubscription { .. }),
-            ),
-            None,
-            None,
-            0,
-            0,
-        )
-        .ok()
+        carry::models::resolve_model(&self.model, self.cache_route(), None, None, 0, 0).ok()
     }
 
     pub fn request_body(&self, system: &str, history: &[Value]) -> Value {

@@ -384,7 +384,7 @@ impl CacheEvidence {
         let Some(input) = body["input"].as_array() else {
             return false;
         };
-        resolved.is_some_and(|model| model.cache.is_some())
+        resolved.is_some_and(|model| model.cache_retention(body).minimum_seconds().is_some())
             && self.at <= at
             && self.route.as_ref() == resolved.map(|r| &r.route)
             && self.credential_sha256 == credential
@@ -449,6 +449,49 @@ pub(super) fn reusable(
         .fold(0.0, f64::max)
 }
 
+pub(super) fn diagnostics(
+    cache: &[CacheEvidence],
+    body: &Value,
+    resolved: Option<&carry::models::ResolvedModel>,
+    credential: &str,
+    at: u64,
+) -> Value {
+    use carry::models::CacheRetention;
+    let retention = resolved.map_or(CacheRetention::Unknown, |model| model.cache_retention(body));
+    let latest = cache
+        .iter()
+        .rev()
+        .find(|entry| entry.matches(body, resolved, credential, at));
+    let deadline = |entry: &CacheEvidence| {
+        [entry.read_window, entry.write_window]
+            .into_iter()
+            .flatten()
+            .map(|window| window.not_before.saturating_add(window.lifetime))
+            .max()
+    };
+    let supported_until = cache
+        .iter()
+        .filter(|entry| entry.reusable_at(body, resolved, credential, at).is_some())
+        .filter_map(deadline)
+        .max();
+    let expires_at = supported_until.or_else(|| latest.and_then(deadline));
+    let state = if retention == CacheRetention::Unknown {
+        "retention_unknown"
+    } else if supported_until.is_some() {
+        "supported"
+    } else if expires_at.is_some_and(|deadline| at >= deadline) {
+        "expired_credit_not_proof_of_eviction"
+    } else if latest.is_some_and(|entry| entry.native_read_tokens == Some(0)) {
+        "observed_miss_without_qualified_write"
+    } else {
+        "no_qualified_coverage"
+    };
+    json!({"retention":retention,"route_class":resolved.map(|model| &model.route.class),
+        "processing_tier":resolved.map(|model| &model.route.processing_tier),
+        "state":state,"latest_observation_age_seconds":latest.map(|entry| at - entry.at),
+        "credit_deadline":expires_at})
+}
+
 pub(super) fn observe(
     cache: &mut Vec<CacheEvidence>,
     body: &Value,
@@ -467,14 +510,9 @@ pub(super) fn observe(
     let Some(capability) = model.cache else {
         return false;
     };
-    let ttl_seconds = model
-        .scenario_cache_policy
-        .as_ref()
-        .map_or(0, |p| p.ttl_seconds);
-    let read_lifetime = model.cache_read_refresh_seconds(body);
-    if ttl_seconds == 0 && read_lifetime.is_none() {
-        return false;
-    }
+    let retention = model.cache_retention(body);
+    let ttl_seconds = retention.minimum_seconds().unwrap_or(0);
+    let read_lifetime = retention.read_refresh_seconds();
     let quantities = carry::core::CacheUsage::from_receipt(usage);
     let Some((total, cached)) = quantities.read() else {
         return false;
@@ -503,8 +541,8 @@ pub(super) fn observe(
         // proof. Unknown/mixed lifetime and explicitly limited write extents do
         // not establish whole-input retention. Never infer population from hits.
         (quantities.whole_written_input() == Some(total)
+            && ttl_seconds > 0
             && end == body["input"].as_array().unwrap().len()
-            && carry::models::cache_write_tariff_known(body)
             && not_before <= at)
             .then_some(WriteWindow {
                 not_before,
@@ -564,8 +602,7 @@ pub(super) fn observe(
 }
 
 pub(super) fn trim(cache: &mut Vec<CacheEvidence>, at: u64) {
-    cache
-        .retain(|e| e.at <= at && (e.covered_prefix_at(at).is_some() || at - e.at < e.ttl_seconds));
+    cache.retain(|e| e.at <= at && (e.covered_prefix_at(at).is_some() || at - e.at < 86_400));
     cache.sort_by_key(|e| e.at);
     while cache.len() > 128 || serde_json::to_vec(cache).unwrap().len() > 65536 {
         cache.remove(0);

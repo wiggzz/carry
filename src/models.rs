@@ -20,6 +20,9 @@ const OPENAI_CACHE: PromptCacheCapabilities = PromptCacheCapabilities {
 };
 
 const SHORT_CACHE_LIFETIME_SECONDS: u64 = 1800;
+const LONG_CACHE_LIFETIME_SECONDS: u64 = 43200;
+const OPENAI_CACHE_LIFETIME_SOURCE: &str =
+    "https://developers.openai.com/api/docs/guides/prompt-caching#cache-lifetime";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Rates {
@@ -400,6 +403,74 @@ pub enum ScenarioCacheMode {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWriteBilling {
+    ExplicitlyBilled,
+    AutomaticZeroSurcharge,
+    Disabled,
+    Unknown,
+}
+
+impl CacheWriteBilling {
+    pub fn forecast_rates(self, mut rates: Rates) -> Rates {
+        if self != Self::ExplicitlyBilled {
+            rates.write = rates.input;
+        }
+        rates
+    }
+}
+
+impl RouteClass {
+    pub fn cache_write_billing(
+        &self,
+        mode: ScenarioCacheMode,
+        documented_model: bool,
+    ) -> CacheWriteBilling {
+        match (mode, self) {
+            (ScenarioCacheMode::Disabled, _) => CacheWriteBilling::Disabled,
+            (ScenarioCacheMode::Unknown, _) => CacheWriteBilling::Unknown,
+            (_, Self::CodexSubscription | Self::SyntheticSubscription) => {
+                CacheWriteBilling::AutomaticZeroSurcharge
+            }
+            (_, Self::OfficialApi) if documented_model => CacheWriteBilling::ExplicitlyBilled,
+            _ => CacheWriteBilling::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "basis", rename_all = "snake_case")]
+pub enum CacheRetention {
+    DocumentedMinimumBillingEligibility {
+        source: &'static str,
+        minimum_seconds: u64,
+        read_refresh_seconds: Option<u64>,
+    },
+    Unknown,
+}
+
+impl CacheRetention {
+    pub fn minimum_seconds(self) -> Option<u64> {
+        match self {
+            Self::DocumentedMinimumBillingEligibility {
+                minimum_seconds, ..
+            } => Some(minimum_seconds),
+            Self::Unknown => None,
+        }
+    }
+
+    pub fn read_refresh_seconds(self) -> Option<u64> {
+        match self {
+            Self::DocumentedMinimumBillingEligibility {
+                read_refresh_seconds,
+                ..
+            } => read_refresh_seconds,
+            Self::Unknown => None,
+        }
+    }
+}
+
 /// Whether this request's write lifetime has a supported tariff. This is not
 /// cache eligibility or transport entitlement: zero-write receipts remain priced
 /// even when the request's population/expiry contract is unknown.
@@ -410,15 +481,19 @@ pub fn cache_write_tariff_known(body: &Value) -> bool {
 // One typed lifetime validator for the currently supported 30-minute contract.
 // Callers still own separate monetary or route/observation prerequisites.
 fn short_cache_lifetimes(body: &Value) -> bool {
-    fn supported_lifetime(options: &Value) -> bool {
+    uniform_cache_lifetime(body, "30m")
+}
+
+fn uniform_cache_lifetime(body: &Value, lifetime: &str) -> bool {
+    let supported_lifetime = |options: &Value| {
         options
             .as_object()
-            .is_some_and(|options| options.get("ttl").is_none_or(|ttl| ttl == "30m"))
-    }
-    fn supported_breakpoint(item: &Value) -> bool {
+            .is_some_and(|options| options.get("ttl").is_none_or(|ttl| ttl == lifetime))
+    };
+    let supported_breakpoint = |item: &Value| {
         item.get("prompt_cache_breakpoint")
             .is_none_or(supported_lifetime)
-    }
+    };
     body.get("prompt_cache_retention").is_none()
         && body
             .get("prompt_cache_options")
@@ -450,12 +525,19 @@ fn short_cache_lifetimes(body: &Value) -> bool {
 }
 
 impl ScenarioCachePolicy {
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
+
+    pub fn with_documented_retention(mut self, retention: CacheRetention) -> Self {
+        if self.version >= 3 && retention.minimum_seconds() == Some(LONG_CACHE_LIFETIME_SECONDS) {
+            self.ttl_seconds = LONG_CACHE_LIFETIME_SECONDS;
+        }
+        self
+    }
 
     /// The comparison is API-equivalent even on a subscription route; this
     /// declares modeled billing, never transport support or observed activity.
     pub fn request_mode(&self, body: &Value) -> ScenarioCacheMode {
-        if self.version < Self::VERSION {
+        if self.version < 2 {
             return ScenarioCacheMode::Implicit;
         }
         fn has_breakpoint(value: &Value) -> bool {
@@ -479,7 +561,12 @@ impl ScenarioCachePolicy {
         let Some(options) = options.as_object() else {
             return ScenarioCacheMode::Unknown;
         };
-        if options.get("ttl").is_some_and(|ttl| ttl != "30m") {
+        let lifetime = if self.version >= 3 && self.ttl_seconds == LONG_CACHE_LIFETIME_SECONDS {
+            "12h"
+        } else {
+            "30m"
+        };
+        if options.get("ttl").is_some_and(|ttl| ttl != lifetime) {
             // Longer-lived writes and explicit-prefix extents need their own
             // frozen tariff/partition model; never price them as free writes.
             return ScenarioCacheMode::Unknown;
@@ -496,7 +583,7 @@ impl ScenarioCachePolicy {
     /// observed native hit. Only the frozen supported short implicit policy can
     /// refresh a hypothetical read; custom/unknown policies keep their clocks.
     pub fn read_refresh_seconds(&self, model: &str, body: &Value) -> Option<u64> {
-        (self.version == Self::VERSION
+        ((2..=Self::VERSION).contains(&self.version)
             && self.ttl_seconds == SHORT_CACHE_LIFETIME_SECONDS
             && self.minimum_prefix_tokens.is_some()
             && model_spec(model).is_some_and(|spec| spec.cache.is_some())
@@ -537,6 +624,48 @@ pub struct ResolvedModel {
     pub raw_field_status: BTreeMap<String, String>,
 }
 impl ResolvedModel {
+    pub fn cache_retention(&self, body: &Value) -> CacheRetention {
+        if self.route.class != RouteClass::OfficialApi
+            || self.cache.is_none()
+            || !model_spec(&self.model).is_some_and(|spec| spec.cache.is_some())
+            || body["model"].as_str() != Some(self.model.as_str())
+            || !body
+                .get("prompt_cache_options")
+                .is_none_or(Value::is_object)
+            || !body["prompt_cache_options"]
+                .get("mode")
+                .is_none_or(|mode| matches!(mode.as_str(), Some("implicit" | "explicit")))
+        {
+            return CacheRetention::Unknown;
+        }
+        let minimum_seconds = match body["prompt_cache_options"].get("ttl").map(Value::as_str) {
+            None | Some(Some("30m")) if short_cache_lifetimes(body) => SHORT_CACHE_LIFETIME_SECONDS,
+            Some(Some("12h")) if uniform_cache_lifetime(body, "12h") => LONG_CACHE_LIFETIME_SECONDS,
+            _ => return CacheRetention::Unknown,
+        };
+        CacheRetention::DocumentedMinimumBillingEligibility {
+            source: OPENAI_CACHE_LIFETIME_SOURCE,
+            minimum_seconds,
+            read_refresh_seconds: (minimum_seconds == SHORT_CACHE_LIFETIME_SECONDS)
+                .then_some(SHORT_CACHE_LIFETIME_SECONDS),
+        }
+    }
+
+    pub fn with_request_cache_lifetime(mut self, body: &Value) -> Self {
+        let retention = self.cache_retention(body);
+        self.scenario_cache_policy = self
+            .scenario_cache_policy
+            .take()
+            .map(|policy| policy.with_documented_retention(retention));
+        self
+    }
+
+    pub fn cache_write_billing(&self, mode: ScenarioCacheMode) -> CacheWriteBilling {
+        self.route
+            .class
+            .cache_write_billing(mode, self.cache.is_some())
+    }
+
     /// Documented billing coverage from a complete read, not another write or
     /// physical KV residency. Scenario policy/capability injection alone cannot
     /// confer this provider contract on an unknown route, auth class or model.
@@ -558,7 +687,7 @@ impl ResolvedModel {
         if self
             .scenario_cache_policy
             .as_ref()
-            .is_none_or(|p| p.version == 1)
+            .is_none_or(|p| p.version < ScenarioCachePolicy::VERSION)
         {
             let mut policy = self
                 .scenario_cache_policy
@@ -579,7 +708,31 @@ impl ResolvedModel {
                 Provenance {
                     source: "https://developers.openai.com/api/docs/guides/prompt-caching".into(),
                     status: status.into(),
-                    revision: "traditional-cache-v2-request-mode-2026-10-28".into(),
+                    revision: "traditional-cache-v3-route-write-billing".into(),
+                    fetched_at: None,
+                    fallback_reason: None,
+                    operator_override: None,
+                },
+            );
+            let billing = self.cache_write_billing(ScenarioCacheMode::Implicit);
+            self.provenance.insert(
+                "scenario_cache_write".into(),
+                Provenance {
+                    source: match billing {
+                        CacheWriteBilling::ExplicitlyBilled => OPENAI_CACHE_LIFETIME_SOURCE,
+                        CacheWriteBilling::AutomaticZeroSurcharge => {
+                            "codex_credits_api_equivalent_valuation"
+                        }
+                        _ => "no_attested_route_tariff",
+                    }
+                    .into(),
+                    status: match billing {
+                        CacheWriteBilling::ExplicitlyBilled => "explicitly_billed",
+                        CacheWriteBilling::AutomaticZeroSurcharge => "automatic_zero_surcharge",
+                        _ => "unknown_premium_withheld",
+                    }
+                    .into(),
+                    revision: "traditional-cache-v3-route-write-billing".into(),
                     fetched_at: None,
                     fallback_reason: None,
                     operator_override: None,
@@ -594,12 +747,15 @@ impl ResolvedModel {
     /// API-equivalent USD valuations, not subscription invoices. Frozen receipt
     /// pricing continues to use `rates_for_input` and its reported partitions.
     pub fn forecast_rates_for_input(&self, input: f64) -> Option<Rates> {
-        let mut rates = self.rates_for_input(input)?;
-        if matches!(
-            self.route.class,
-            RouteClass::CodexSubscription | RouteClass::SyntheticSubscription
-        ) {
-            rates.write = rates.input;
+        let mut rates = self
+            .cache_write_billing(ScenarioCacheMode::Implicit)
+            .forecast_rates(self.rates_for_input(input)?);
+        if self.route.class == RouteClass::OfficialApi
+            && self.scenario_cache_policy.as_ref().is_some_and(|policy| {
+                policy.version >= 3 && policy.ttl_seconds == LONG_CACHE_LIFETIME_SECONDS
+            })
+        {
+            rates.write = rates.input * 2.5;
         }
         Some(rates)
     }

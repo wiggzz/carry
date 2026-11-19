@@ -3,6 +3,15 @@
 // real vendor residency claim. Production still uses the ordinary system clock.
 thread_local! {
     static DECISION_CLOCK: std::cell::RefCell<Option<std::collections::VecDeque<u64>>> = const { std::cell::RefCell::new(None) };
+    static CACHE_FIXTURE_ROUTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn attest_loopback_cache_fixture(url: &str, route: &mut Route) {
+    CACHE_FIXTURE_ROUTE.with_borrow(|fixture| {
+        if fixture.as_deref() == Some(url) {
+            route.class = RouteClass::OfficialApi;
+        }
+    });
 }
 
 pub(super) fn decision_clock_now() -> Option<u64> {
@@ -152,4 +161,127 @@ fn planner_selection_and_cache_report_share_one_original_write_clock() {
         before,
         "eligibility reads cannot change receipts, advice, history or money"
     );
+}
+
+#[test]
+fn payoff_horizon_exposes_both_spacing_bounds_for_both_wires() {
+    use crate::proxy_quantity::{EstimateBasis, InputEstimate};
+    let (config, session, keep, expiry) = clock_subject();
+    let mut compact = keep.clone();
+    compact["input"] = json!(session.render_projection(&HashSet::from([2])));
+    let model = &config.model_resolution.as_ref().unwrap().primary;
+    let forecast = |at, model| {
+        resolved_input_costs(&keep, &compact, &session.upstream_cache, "gpt-6-luna", 4,
+            Some(model), &config.primary_cache_auth, at,
+            InputEstimate { tokens: 50_000, basis: EstimateBasis::ProviderReceipt },
+            InputEstimate { tokens: 44_000, basis: EstimateBasis::ReceiptAnchoredTextDelta }).unwrap()
+    };
+    let warm = forecast(expiry - 1, model);
+    let cold = forecast(expiry, model);
+    assert!(warm.keep < cold.keep);
+    assert_eq!(warm.compact, cold.compact);
+    for branch in [&cold.keep_cache, &cold.compact_cache] {
+        assert_eq!(branch.all_cold_usd, branch.current_evidence_future_cold_usd);
+        assert!(branch.current_evidence_future_warm_usd.unwrap() < branch.all_cold_usd);
+    }
+    let mut gateway = model.clone();
+    gateway.route = Route::new("https://gateway.invalid/v1/responses", false);
+    let unknown = forecast(expiry - 1, &gateway);
+    for branch in [unknown.keep_cache, unknown.compact_cache] {
+        assert_eq!(branch.first_supported_cached_tokens, 0.0);
+        assert!(branch.current_evidence_future_warm_usd.is_none());
+    }
+}
+
+#[tokio::test]
+async fn documented_long_retention_changes_http_wire_at_boundary_after_restart() {
+    use std::collections::VecDeque;
+
+    let (capture, mut wires) = tokio::sync::mpsc::unbounded_channel();
+    let endpoint = Router::new().route("/primary", post(move |axum::Json(body): axum::Json<Value>| {
+        let first = capture.send(body.clone()).is_ok() && body["input"].as_array().is_some_and(|items| items.len() == 3);
+        async move {
+            let mut response = json!({"id":"cache-boundary","status":"completed","output":[],
+                "usage":{"input_tokens":50000,"output_tokens":0}});
+            if first {
+                response["usage"] = json!({"input_tokens":50000,"output_tokens":0,
+                    "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":50000}});
+            }
+            axum::Json(response)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/primary", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move { axum::serve(listener, endpoint).await.unwrap() });
+    CACHE_FIXTURE_ROUTE.with_borrow_mut(|route| *route = Some(url.clone()));
+    let directory = tempfile::tempdir().unwrap();
+    let start_service = || {
+        let mut service = checkpoint_service(directory.path());
+        service.config.upstream_url = url.clone();
+        service.config.classifier_url = Some(url.clone());
+        service.config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
+        service.config.mode = Mode::Compact;
+        service.config.payoff_requests = 1;
+        service.config.min_payback_percent = 0;
+        service.config.review_min_primary_tokens = u32::MAX;
+        service.config.bootstrap_min_input_bytes = usize::MAX;
+        Arc::new(service)
+    };
+    let (_, session, _, _) = clock_subject();
+    let input = session.render_primary();
+    let body = json!({"model":"gpt-6-luna","prompt_cache_options":{"ttl":"12h"}, "input":input});
+    let send = |service: Arc<Service>, key: &'static str, at: u64, body: Value| async move {
+        DECISION_CLOCK.with_borrow_mut(|clock| *clock = Some(VecDeque::from([at])));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-carry-session", key.parse().unwrap());
+        let id = identity(&headers).unwrap().unwrap();
+        let result = forward_request(service.clone(), headers, Bytes::from(body.to_string()), false, at.to_string()).await;
+        let response = result.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let plan = load(&service, &id).unwrap().last_plan;
+        DECISION_CLOCK.with_borrow_mut(|clock| *clock = None);
+        plan
+    };
+    let service = start_service();
+    let start = 5_000_000;
+    for key in ["authorized", "protected", "uneconomic"] {
+        send(service.clone(), key, start, body.clone()).await;
+        assert_eq!(wires.recv().await.unwrap()["input"], body["input"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-carry-session", key.parse().unwrap());
+        let id = identity(&headers).unwrap().unwrap();
+        let mut persisted = load(&service, &id).unwrap();
+        if key != "protected" {
+            persisted.apply_advice(&persisted.groups(), &json!({"protected":[],"removable":[2],"memories":[]})).unwrap();
+            at_decision_clock(&[start], || history::publish(&service, &persisted, &persisted)).unwrap();
+        }
+    }
+    let mut followup = body.clone();
+    followup["input"].as_array_mut().unwrap().push(json!({"role":"user","content":"next step"}));
+    let expiry = start + 12 * 3600;
+    let warm = send(service.clone(), "authorized", expiry - 1, followup.clone()).await;
+    assert_eq!(warm["cache_evidence"]["state"], "supported", "{warm}");
+    assert!(wires.recv().await.unwrap()["input"] == followup["input"], "qualified 12h write should preserve the warm wire before expiry: {warm}");
+    drop(service);
+    let service = start_service();
+    send(service.clone(), "protected", expiry, followup.clone()).await;
+    assert_eq!(wires.recv().await.unwrap()["input"], followup["input"]);
+    for at in [expiry, expiry + 86_400] {
+        let cold = send(service.clone(), "authorized", at, followup.clone()).await;
+        let compact = wires.recv().await.unwrap();
+        assert!(compact.to_string().len() < followup.to_string().len(), "{cold}");
+        assert!(!compact.to_string().contains("large evidence"));
+        assert_eq!(cold["primary_cached_estimated_tokens"], 0.0);
+        if at == expiry {
+            assert_eq!(cold["cache_evidence"]["state"], "expired_credit_not_proof_of_eviction");
+        }
+    }
+    let mut uneconomic = start_service();
+    Arc::get_mut(&mut uneconomic).unwrap().config.min_payback_percent = 100;
+    send(uneconomic, "uneconomic", expiry, followup.clone()).await;
+    assert_eq!(wires.recv().await.unwrap()["input"], followup["input"]);
+    assert!(wires.try_recv().is_err(), "no expiry-triggered reviewer call");
+    handle.abort();
+    CACHE_FIXTURE_ROUTE.with_borrow_mut(|route| *route = None);
 }

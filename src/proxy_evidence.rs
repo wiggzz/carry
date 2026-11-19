@@ -51,6 +51,8 @@ pub(super) struct PrimaryFacts {
     pub protected: Option<u64>,
     pub cache_scope: String,
     pub cache_mode: carry::models::ScenarioCacheMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_write_billing: Option<carry::models::CacheWriteBilling>,
     pub read_refresh: Option<u64>,
     #[serde(default)]
     pub native_summary: bool,
@@ -177,12 +179,28 @@ impl PrimaryFacts {
         });
         // Count only the protected/fixed semantic floor, never the full native
         // input. These quantities are shared prompt evidence, not forecasts.
+        let request_resolution = resolved
+            .cloned()
+            .map(|model| model.with_request_cache_lifetime(body));
+        let cache_mode = request_cache_mode(body, &model, request_resolution.as_ref());
+        let route_scope = (route, resolved.map(|resolved| &resolved.route));
+        let cache_scope = if cache_mode == carry::models::ScenarioCacheMode::Implicit
+            && body["prompt_cache_options"]["ttl"] == "12h"
+        {
+            crate::proxy_cache::modeled_scope(body, &model, (route_scope, "12h"))
+        } else {
+            crate::proxy_cache::modeled_scope(body, &model, route_scope)
+        };
+        let read_refresh = request_resolution
+            .as_ref()
+            .and_then(|model| model.scenario_cache_policy.as_ref())
+            .and_then(|policy| policy.read_refresh_seconds(&model, body));
         Self {
             prompt: None,
             configuration: receipts::configuration(body, route, resolved),
             contract: HistoryContract::extract(body, route, resolved, Scenario::default()),
             model: model.clone(),
-            resolved: resolved.cloned(),
+            resolved: request_resolution,
             at,
             reused_input: 0,
             input: body["input"]
@@ -216,18 +234,13 @@ impl PrimaryFacts {
             protected: needs_floor
                 .then(|| crate::savings::protected_prompt_tokens(body))
                 .flatten(),
-            cache_scope: crate::proxy_cache::modeled_scope(
-                body,
-                &model,
-                (route, resolved.map(|r| &r.route)),
-            ),
-            cache_mode: request_cache_mode(body, &model, resolved),
+            cache_scope,
+            cache_mode,
+            forecast_write_billing: None,
             native_summary: response["output"]
                 .as_array()
                 .is_some_and(|out| out.iter().any(|item| item["type"] == "compaction")),
-            read_refresh: resolved
-                .and_then(|r| r.scenario_cache_policy.as_ref())
-                .and_then(|p| p.read_refresh_seconds(&model, body)),
+            read_refresh,
         }
     }
 }
@@ -962,7 +975,16 @@ impl RequestEvidence {
             measurements: None,
         });
     }
+    #[cfg(test)]
     pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
+        self.primary_settled_on_route(primary, None);
+    }
+
+    pub fn primary_settled_on_route(
+        &mut self,
+        primary: PrimaryObservation<'_>,
+        route: Option<carry::models::RouteClass>,
+    ) {
         if primary.response["status"] != "completed" {
             self.failed_call();
             return;
@@ -987,12 +1009,18 @@ impl RequestEvidence {
                     facts.retained_visible?,
                 ))
             });
-        let facts = PrimaryFacts::extract(
+        let mut facts = PrimaryFacts::extract(
             primary,
             member,
             self.scenario,
             self.restoration.map(|e| e.tokens),
         );
+        facts.forecast_write_billing = route.map(|route| {
+            route.cache_write_billing(
+                facts.cache_mode,
+                carry::models::model_spec(&facts.model).is_some_and(|model| model.cache.is_some()),
+            )
+        });
         self.append(Observation::Primary {
             facts: Box::new(facts),
             restoration: self.restoration,

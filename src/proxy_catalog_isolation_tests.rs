@@ -56,19 +56,8 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
         session.upstream_cache.is_empty(),
         "unknown route capability is not cache evidence"
     );
-    let capability = resolve_model(
-        "gpt-6-sol",
-        Route::new("https://api.openai.com/v1/responses", false),
-        None,
-        None,
-        16384,
-        10,
-    )
-    .unwrap()
-    .cache;
-    session.model_resolution.as_mut().unwrap().primary.cache = capability;
     let id = identity(&headers).unwrap().unwrap();
-    save(&service, &id, &session).unwrap();
+    CACHE_FIXTURE_ROUTE.with_borrow_mut(|route| *route = Some(service.config.upstream_url.clone()));
     let response = forward_request(
         service.clone(),
         headers.clone(),
@@ -100,18 +89,7 @@ async fn catalog_cache_receipt() -> (ProxyCli, Session, Value) {
             &json!({"protected":[1],"removable":[2,4],"memories":[]}),
         )
         .unwrap();
-    // The gateway has no forecast capability. A deliberately enabled synthetic
-    // snapshot lets the positive control exercise receipt namespace, not vendors.
-    session.model_resolution.as_mut().unwrap().primary.cache = resolve_model(
-        "gpt-6-sol",
-        Route::new("https://api.openai.com/v1/responses", false),
-        None,
-        None,
-        16384,
-        10,
-    )
-    .unwrap()
-    .cache;
+    CACHE_FIXTURE_ROUTE.with_borrow_mut(|route| *route = None);
     let record = semantic::Record::capture(&session);
     let mut restored: Session =
         serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();

@@ -56,6 +56,8 @@ pub struct Coverage {
     pub prior_untracked_calls: u64,
     pub unknown_cache_requests: u64,
     #[serde(default)]
+    pub withheld_write_premium_requests: u64,
+    #[serde(default)]
     pub unknown_rate_calls: u64,
     #[serde(default)]
     pub estimated_quantity_calls: u64,
@@ -1028,7 +1030,20 @@ fn modeled_cost(model: &str, usage: &Usage, resolved: Option<&ResolvedModel>) ->
     if resolved.model != model {
         return None;
     }
-    let rates = resolved.forecast_rates_for_input(usage.input_tokens as f64)?;
+    let mut rates = resolved.rates_for_input(usage.input_tokens as f64)?;
+    if resolved
+        .scenario_cache_policy
+        .as_ref()
+        .is_some_and(|policy| policy.version >= carry::models::ScenarioCachePolicy::VERSION)
+    {
+        rates = resolved.forecast_rates_for_input(usage.input_tokens as f64)?;
+    } else if matches!(
+        resolved.route.class,
+        carry::models::RouteClass::CodexSubscription
+            | carry::models::RouteClass::SyntheticSubscription
+    ) {
+        rates.write = rates.input;
+    }
     Some(usage.cost_at_rates(rates))
 }
 

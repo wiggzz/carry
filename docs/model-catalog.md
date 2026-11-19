@@ -35,6 +35,30 @@ contracts, explicit overrides and dispatch-frozen reviewer receipts retain their
 existing semantics. The dashboard describes the last saved plan, so a historical
 plan is not relabeled as though a new request has already happened.
 
+## Cache retention and comparison policy
+
+For supported models on the exact official Responses API route, qualified
+observed writes support billing credit for the documented minimum lifetime
+(30 minutes by default, or 12 hours for uniform long requests). A qualified
+30-minute read can extend the credited window without restarting a longer
+write clock. The [provider contract](https://developers.openai.com/api/docs/guides/prompt-caching#cache-lifetime)
+does not guarantee physical reuse or eviction at that boundary. Unknown routes
+and unsupported retention controls supply no dispatch-time cache credit.
+
+The planner prices its first call with compatible receipt evidence. With no
+arrival schedule, it selects using cold future calls and shows the fixed-history,
+short-gap all-hit sensitivity for each eligible alternative. The traditional
+trajectory is a separate hypothetical prompt and may still show conditional
+model-level reuse, not a gateway retention claim.
+
+Prospective comparison policy v3 uses documented paid write rates where
+supported, zero separate surcharge for recognized Codex routes, and ordinary
+input pricing where a gateway write tariff is unknown. Identical histories
+still share the observed price. Prior sums retain their original policy and
+mixed windows are labeled. Receipt prices are unchanged; unsupported native
+write-lifetime partitions remain unpriced rather than being valued as short
+writes. These are API-equivalent valuations, not subscription invoices.
+
 ## GPT-6.2 (checked 2026-11-17)
 
 The exact OpenAI model pages for [Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol)

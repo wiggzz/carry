@@ -275,9 +275,9 @@ fn adapted_wire_cache_prefix_protects_cached_native_members_not_canonical_positi
     let mut config = reviewer_config();
     config.codex_login = true;
     config.classifier_cache_policy = ClassifierCachePolicy::Disabled;
-    let mut model = resolve_model(
+    let model = resolve_model(
         "gpt-6-luna",
-        Route::new("https://api.openai.com/v1/responses", true),
+        Route::new("https://api.openai.com/v1/responses", false),
         None,
         None,
         2048,
@@ -285,8 +285,6 @@ fn adapted_wire_cache_prefix_protects_cached_native_members_not_canonical_positi
     )
     .unwrap()
     .with_scenario_cache_policy();
-    // Fixture-only capability, not a provider entitlement claim.
-    model.cache = carry::models::model_spec("gpt-6-luna").unwrap().cache;
     config.model_resolution = Some(ResolvedPair {
         schema_version: 1,
         primary: model.clone(),
