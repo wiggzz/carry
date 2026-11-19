@@ -548,7 +548,7 @@ class StateRegressions(FixtureCase):
                 proxy = Proxy(self.state / change, fixture, options, wait_reviews=False)
                 self.addCleanup(proxy.close)
                 seed = [{"role": "user", "content": "goal"},
-                        {"role": "assistant", "content": "eligible evidence"},
+                        {"role": "assistant", "content": "eligible evidence " * 20},
                         {"role": "user", "content": "current"}]
                 self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
                 self.assertEqual(proxy.send(seed, instructions="ORIGINAL_DIRECTION")[0], 200)
@@ -1530,8 +1530,8 @@ class StateRegressions(FixtureCase):
                          "S2: old drop for one assistant member cannot remove newly exposed atomic evidence")
 
     def memory_progress(self, limit):
-        text_a = ("a0b1c2d3e4f5g6h7i8j9" * 205)[:4096]
-        text_b = ("k9l8m7n6o5p4q3r2s1t0" * 205)[:4096]
+        text_a, text_b = (("a0" * 250, "b1" * 250) if limit == "tokens"
+                          else ("x" * 3200, "y" * 3200))
         facts = [{"source_ids": [2], "text": text_a},
                  {"source_ids": [2], "text": text_b}]
 
@@ -1542,18 +1542,20 @@ class StateRegressions(FixtureCase):
             return 200, advice_response(advice)
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
-        options = ["--classifier-max-input-bytes", "8388608" if limit == "tokens" else "10000",
-                   "--classifier-max-input-tokens", "4000" if limit == "tokens" else "120000",
+        options = ["--classifier-max-input-bytes", "8388608" if limit == "tokens" else "12000",
+                   "--classifier-max-input-tokens", "5000" if limit == "tokens" else "120000",
+                   "--classifier-max-output-tokens", "1600",
                    "--payoff-requests", "1"]
         proxy = self.proxy(fixture, options)
         seed = [{"role": "user", "content": "goal"},
-                {"role": "assistant", "content": "small eligible source"},
+                {"role": "assistant", "content": " a" * 650},
                 {"role": "user", "content": "current"}]
         self.assertEqual(proxy.send(seed)[0], 200)
         self.assertEqual(proxy.send(seed)[0], 200)
         self.assertEqual(len(fixture.reviews), 1, "initial source must fit the configured review budget")
         saved = proxy.saved()
         accepted = len((proxy.advice() or {}).get("memories", []))
+        self.assertGreater(accepted, 0, "exercise cleanup after admitting a memory")
         feedback = (proxy.advice() or {}).get("feedback", saved["review_feedback"])
         if accepted < 2:
             self.assertIsInstance(feedback, dict,
@@ -1584,7 +1586,7 @@ class StateRegressions(FixtureCase):
         self.assertNotIn(text_b, json.dumps(fixture.reviews[-1]))
 
     def test_small_memory_budget_rejects_large_fact_preserves_small_sibling_and_opinions(self):
-        large = ("a0b1c2d3e4f5g6h7i8j9" * 205)[:4096]
+        large = "x" * 4096
         small = "The useful result is 42."
 
         def review(body, n):
@@ -1597,10 +1599,11 @@ class StateRegressions(FixtureCase):
 
         fixture = self.fixture(lambda _body, n: (200, completed(response_id=f"resp_{n}")), review)
         options = ["--classifier-max-input-bytes", "10000",
-                   "--classifier-max-input-tokens", "4000", "--payoff-requests", "1"]
+                   "--classifier-max-input-tokens", "4000", "--classifier-max-output-tokens", "1600",
+                   "--payoff-requests", "1"]
         proxy = self.proxy(fixture, options)
         seed = [{"role": "user", "content": "goal"},
-                {"role": "assistant", "content": "small eligible source"},
+                {"role": "assistant", "content": " a" * 650},
                 {"role": "user", "content": "current"}]
         self.assertEqual(proxy.send(seed)[0], 200)
         self.assertEqual(proxy.send(seed)[0], 200)

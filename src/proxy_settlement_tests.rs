@@ -245,7 +245,7 @@ fn cumulative_memory_acceptances_enforce_reserve_and_hard_token_limits_then_reti
     session
         .ingest(&[
             json!({"role":"user","content":"goal"}),
-            json!({"role":"assistant","content":"evidence"}),
+            json!({"role":"assistant","content":" evidence".repeat(600)}),
             json!({"role":"user","content":"task"}),
         ])
         .unwrap();

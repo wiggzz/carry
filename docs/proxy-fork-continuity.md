@@ -39,7 +39,10 @@ and blockers) belong in concise factual memories, not repeated human instruction
 A memory is not required for every drop. Rejected
 replacement memories preserve their identifiable eligible supporting sources,
 including when concurrent growth exhausts admission at background merge; unrelated
-valid drops remain valid. Validation cannot discover an unwritten fact or prove
+valid drops remain valid. A new replacement must be smaller than its combined
+sources in local text tokens, including its rendered wrapper. When a source is
+opaque, this comparison is unknown and the existing admission checks still
+apply. Validation cannot discover an unwritten fact or prove
 that a live reviewer preserved its meaning.
 
 Each projection inserts one neutral absence notice per contiguous omitted run.
