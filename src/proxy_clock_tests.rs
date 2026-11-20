@@ -312,24 +312,83 @@ fn implicit_write_tariff_stays_off_without_population_or_route_authority() {
     }
 }
 
+#[test]
+fn documented_warm_marginal_continuation_beats_a_tiny_rewrite() {
+    let (mut config, original, mut body, expiry) = clock_subject();
+    config.payoff_requests = 5;
+    let mut items = original.render_primary();
+    items.splice(
+        2..2,
+        [
+            json!({"role":"user","content":"continue"}),
+            json!({"role":"assistant","content":"small optional detail ready"}),
+        ],
+    );
+    let mut session = Session::default();
+    session.ingest(&items).unwrap();
+    for item in &mut session.history {
+        item.exposed = true;
+    }
+    session
+        .apply_advice(
+            &session.groups(),
+            &json!({"protected":[],"removable":[2,4],"memories":[]}),
+        )
+        .unwrap();
+    session.last_submitted_ids = vec![1, 3, 4, 5];
+    body["input"] = json!(session.render_primary());
+    let prior = HashSet::from([2]);
+    let mut warm = body.clone();
+    warm["input"] = json!(session.render_projection(&prior));
+    let wire = primary_wire_body(&config, &warm);
+    assert!(crate::proxy_cache::observe(
+        &mut session.upstream_cache,
+        &wire,
+        &json!({"input_tokens":25000,"cached_input_tokens":0,"cache_write_input_tokens":25000}),
+        config.model_resolution.as_ref().map(|p| &p.primary),
+        &config.primary_cache_auth,
+        crate::proxy_cache::ObservationTime::during(100, 100),
+    ));
+    let (selected, report) = at_decision_clock(&[expiry - 1], || plan(&config, &session, &body));
+    let rows = report["candidates"].as_array().unwrap();
+    let rewrite = rows
+        .iter()
+        .find(|r| r["omitted_members"] == json!([2, 4]))
+        .unwrap();
+    let marginal = &rewrite["selection_joint"];
+    assert!(
+        marginal["compact"].as_f64().unwrap() > marginal["keep"].as_f64().unwrap(),
+        "{report}"
+    );
+    assert_eq!(marginal["accepted"], false);
+    assert_eq!(report["baseline_omitted_members"], json!([2]));
+    assert_eq!(selected.unwrap().omitted, prior);
+}
+
 #[tokio::test]
 async fn documented_long_retention_changes_http_wire_at_boundary_after_restart() {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     let (capture, mut wires) = tokio::sync::mpsc::unbounded_channel();
+    // Fixture receipt selector for the next request: ordinary, write, or miss.
+    let next_receipt = Arc::new(AtomicU8::new(0));
+    let provider_receipt = next_receipt.clone();
     let endpoint = Router::new().route(
         "/primary",
         post(move |axum::Json(body): axum::Json<Value>| {
-            let first = capture.send(body.clone()).is_ok()
-                && body["input"]
+            let _ = capture.send(body.clone());
+            let receipt = provider_receipt.swap(0, Ordering::Relaxed);
+            let written = receipt == 1
+                || body["input"]
                     .as_array()
                     .is_some_and(|items| items.len() == 3);
             async move {
                 let mut response = json!({"id":"cache-boundary","status":"completed","output":[],
-                "usage":{"input_tokens":50000,"output_tokens":0}});
-                if first {
-                    response["usage"] = json!({"input_tokens":50000,"output_tokens":0,
-                    "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":50000}});
+                    "usage":{"input_tokens":50000,"output_tokens":0}});
+                if written || receipt == 2 {
+                    response["usage"]["input_tokens_details"] = json!({"cached_tokens":0,
+                        "cache_write_tokens":if written { 50000 } else { 0 }});
                 }
                 axum::Json(response)
             }
@@ -438,6 +497,25 @@ async fn documented_long_retention_changes_http_wire_at_boundary_after_restart()
         .min_payback_percent = 100;
     send(uneconomic, "uneconomic", expiry, followup.clone()).await;
     assert_eq!(wires.recv().await.unwrap()["input"], followup["input"]);
+
+    // The prior compact wire did not discard canonical source. An actual
+    // whole-input write of canonical H can change selection after reopening.
+    let mut audit = start_service();
+    Arc::get_mut(&mut audit).unwrap().config.mode = Mode::Audit;
+    let rewarm = expiry + 86_401;
+    next_receipt.store(1, Ordering::Relaxed);
+    send(audit, "authorized", rewarm, followup.clone()).await;
+    assert_eq!(wires.recv().await.unwrap()["input"], followup["input"]);
+    next_receipt.store(2, Ordering::Relaxed);
+    let restored = send(start_service(), "authorized", rewarm + 1, followup.clone()).await;
+    assert_eq!(
+        restored["cache_evidence"]["state"], "supported",
+        "{restored}"
+    );
+    assert_eq!(wires.recv().await.unwrap()["input"], followup["input"]);
+    let revoked = send(start_service(), "authorized", rewarm + 2, followup.clone()).await;
+    assert_eq!(revoked["primary_cached_estimated_tokens"], 0.0, "{revoked}");
+    assert_ne!(wires.recv().await.unwrap()["input"], followup["input"]);
     assert!(
         wires.try_recv().is_err(),
         "no expiry-triggered reviewer call"

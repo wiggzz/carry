@@ -64,14 +64,19 @@ fn projection182_actual_reviewer_tier_crossing_prices_input_and_output() {
     assert!(kr.input > cr.input && kr.output > cr.output);
     let output = f64::from(config.classifier_max_output_tokens);
     let joint = projection_economics_joint(&report);
-    projection_economics_close(
-        &joint["future_shadow_keep"],
-        kt * kr.input + output * kr.output,
-    );
-    projection_economics_close(
-        &joint["future_shadow_compact"],
-        ct * cr.input + output * cr.output,
-    );
+    // Official implicit population bills the write tariff for a cold eligible
+    // request. The smaller branch uses its own tier and prefix minimum.
+    let cold = |input: f64, rates: Rates| {
+        input
+            * if input >= 1024.0 {
+                rates.write
+            } else {
+                rates.input
+            }
+            + output * rates.output
+    };
+    projection_economics_close(&joint["future_shadow_keep"], cold(kt, kr));
+    projection_economics_close(&joint["future_shadow_compact"], cold(ct, cr));
     assert_eq!(report["selected_action"], "projection");
     assert_eq!(projection.omitted, HashSet::from([2]));
     assert!(projection.input.contains(&canonical[0]) && projection.input.contains(&canonical[2]));
