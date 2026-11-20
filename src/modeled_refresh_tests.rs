@@ -12,7 +12,7 @@ fn modeled_refresh_coordinator(report: bool) {
         0,
         0,
     )
-    .unwrap();
+    .unwrap().with_scenario_cache_policy();
     let policy = ScenarioCachePolicy::for_model("gpt-6.1-sol");
     assert_eq!(policy.ttl_seconds, 1800);
     // This is explicitly a conditional API-equivalent scenario. Native route
@@ -91,7 +91,7 @@ fn modeled_refresh_coordinator(report: bool) {
         if (step == 1 || step == 2) && writes != *original_writes.as_ref().unwrap() {
             changed_original_writes.push(at);
         }
-        let expected = input as f64 * if warm { 0.1 } else { 2.5 } / 1e6;
+        let expected = input as f64 * if warm { 0.1 } else { 2.0 } / 1e6;
         let actual = if report {
             n.pi_cost - prior.pi_cost
         } else {

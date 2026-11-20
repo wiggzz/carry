@@ -311,7 +311,8 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
     assert!((before.observed_primary_cost.unwrap() - 0.004).abs() < 1e-12);
     assert!((before.traditional_cost - 0.0002).abs() < 1e-12);
     let upgraded = old.clone().with_scenario_cache_policy();
-    assert_eq!(upgraded.scenario_cache_policy.as_ref().unwrap().version, 2);
+    let current = carry::models::ScenarioCachePolicy::VERSION;
+    assert_eq!(upgraded.scenario_cache_policy.as_ref().unwrap().version, current);
     assert_eq!(
         upgraded
             .scenario_cache_policy
@@ -354,7 +355,7 @@ fn cache_write188_resolution_upgrade_keeps_old_money_and_disables_future_reads_a
         );
         assert_eq!(after.cache_policy_boundaries.len(), 1);
         assert_eq!(after.cache_policy_boundaries[0].previous_version, Some(1));
-        assert_eq!(after.cache_policy_boundaries[0].next_version, Some(2));
+        assert_eq!(after.cache_policy_boundaries[0].next_version, Some(current));
         assert_eq!(
             serde_json::to_value(&after.cache_policy_boundaries[0].cumulative).unwrap(),
             serde_json::to_value(CachePolicySegment::from(&before)).unwrap()

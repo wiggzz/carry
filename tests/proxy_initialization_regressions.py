@@ -17,6 +17,11 @@ def comparison_snapshot(proxy):
             'request_evidence': copy.deepcopy(proxy.saved()['request_evidence'])}
 
 
+# The loopback gateway has no attested write premium. A modeled miss is
+# priced at ordinary input; actual paid receipt partitions remain unchanged.
+GATEWAY_UNCACHED = 2.0
+
+
 class InitializationRegressions(support.FixtureCase):
     def cache_options_history_control(self, initialized):
         # Review5714176642: equivalent spelling and genuine forecast-policy
@@ -77,9 +82,9 @@ class InitializationRegressions(support.FixtureCase):
                 self.assertEqual(after["result"]["summary_cost"], before["result"]["summary_cost"])
                 prior = snapshots[boundary + index - 1]['result']['traditional_cost']
                 incoming = 21100 + index * 100
-                expected = ((incoming * 2.5) if index == 0 and not initialized else
-                            ((incoming - 100) * .1 + 100 * 2.5) if index < 3 else
-                            incoming * (2 if index == 3 else 2.5)) / 1e6
+                warm = index < 3 and (index > 0 or initialized)
+                expected = (((incoming - 100) * .1 + 100 * GATEWAY_UNCACHED) if warm
+                            else incoming * GATEWAY_UNCACHED) / 1e6
                 self.assertAlmostEqual(after['result']['traditional_cost'] - prior, expected,
                                        places=12, msg='every native append survives cache-policy changes')
 
@@ -195,7 +200,7 @@ class InitializationRegressions(support.FixtureCase):
                                  "fitting output allowance cannot grant another free initialization")
                 prior = snapshots[changed_at + offset - 1]['result']['traditional_cost']
                 self.assertAlmostEqual(after['result']['traditional_cost'] - prior,
-                                       ((21200 + offset * 100) * .1 + 100 * 2.5) / 1e6,
+                                       ((21200 + offset * 100) * .1 + 100 * GATEWAY_UNCACHED) / 1e6,
                                        places=12, msg='all native growth survives allowance changes')
 
     def test_history_contract_unchanged_output_preserves_paid_growth(self):
@@ -220,7 +225,7 @@ class InitializationRegressions(support.FixtureCase):
                              "unrecognized oversized history must initialize outside the billed window")
         with self.subTest(boundary="first primary uses initialized prompt"):
             self.assertAlmostEqual(
-                estimate["traditional_cost"], 21000 * 2.5 / 1e6, places=12,
+                estimate["traditional_cost"], 21000 * GATEWAY_UNCACHED / 1e6, places=12,
                 msg="first primary must use retained recent content plus replacement summary, cold",
             )
 
@@ -371,14 +376,14 @@ class InitializationRegressions(support.FixtureCase):
         self.assertEqual(failed["traditional_cost"], continued["traditional_cost"])
         with self.subTest(boundary="free first initialization"):
             self.assertEqual(first["summary_cost"], 0.0)
-            self.assertAlmostEqual(first["traditional_cost"], 21000 * 2.5 / 1e6, places=12)
+            self.assertAlmostEqual(first["traditional_cost"], 21000 * GATEWAY_UNCACHED / 1e6, places=12)
         with self.subTest(boundary="initialized continuation warm after restart"):
             self.assertAlmostEqual(continued["traditional_cost"] - first["traditional_cost"],
-                                   (21000 * 0.1 + 100 * 2.5) / 1e6, places=12)
+                                   (21000 * 0.1 + 100 * GATEWAY_UNCACHED) / 1e6, places=12)
         with self.subTest(boundary="failed attempt never duplicates initialization or money"):
             self.assertEqual(retried["summary_cost"], 0.0)
             self.assertAlmostEqual(retried["traditional_cost"] - continued["traditional_cost"],
-                                   (21100 * 0.1 + 100 * 2.5) / 1e6, places=12,
+                                   (21100 * 0.1 + 100 * GATEWAY_UNCACHED) / 1e6, places=12,
                                    msg="failed request preserves the preceding valid cached prefix")
         with self.subTest(boundary="later in-window summary is still charged"):
             self.assertGreater(later["summary_cost"], 0.0)
@@ -431,7 +436,7 @@ class InitializationRegressions(support.FixtureCase):
         self.assertEqual(fixture.primaries[3]["instructions"], "changed fixed settings")
         self.assertAlmostEqual(changed["result"]["observed_primary_cost"], 1.5606, places=12)
         self.assertEqual(failed["result"]["traditional_cost"], first["result"]["traditional_cost"])
-        self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
+        self.assertAlmostEqual(first["result"]["traditional_cost"], 21000 * GATEWAY_UNCACHED / 1e6, places=12)
         self.assertEqual(first["result"]["initial_compactions"], 1)
         original = first['request_evidence']['observations']
         observations = failed['request_evidence']['observations']
@@ -452,7 +457,7 @@ class InitializationRegressions(support.FixtureCase):
         self.assertEqual(retry["result"]["initial_compactions"], 1,
                          "a failed request cannot repeat free initialization")
         self.assertAlmostEqual(retry["result"]["traditional_cost"] - first["result"]["traditional_cost"],
-                               (21000 * 0.1 + 100 * 2.5) / 1e6, places=12)
+                               (21000 * 0.1 + 100 * GATEWAY_UNCACHED) / 1e6, places=12)
         # Only the first tracked oversized success may initialize for free.
         # A settings fence makes the matched branch cold/unrecognized, so its
         # full input is charged and the later summary is paid, not a new start.
@@ -461,7 +466,7 @@ class InitializationRegressions(support.FixtureCase):
         changed_input = inputs[-1]
         paid_summary = ((changed_input - keep_recent) * 2 + summary * 10) / 1e6
         self.assertAlmostEqual(changed["result"]["traditional_cost"] - retry["result"]["traditional_cost"],
-                               changed_input * 2.5 / 1e6 + paid_summary, places=12)
+                               changed_input * GATEWAY_UNCACHED / 1e6 + paid_summary, places=12)
         self.assertAlmostEqual(changed["result"]["summary_cost"], paid_summary, places=12)
         self.assertEqual(changed["result"]["traditional_compactions"], 1)
 
@@ -471,9 +476,9 @@ class InitializationRegressions(support.FixtureCase):
         retained = keep_recent + summary
         retry_growth = inputs[2] - inputs[0]
         changed_growth = inputs[3] - inputs[2]
-        expected = [retained * 2.5 / 1e6] * 3
-        expected.append(expected[-1] + (retained * 0.1 + retry_growth * 2.5) / 1e6)
-        expected.append(expected[-1] + (retained + retry_growth + changed_growth) * 2.5 / 1e6)
+        expected = [retained * GATEWAY_UNCACHED / 1e6] * 3
+        expected.append(expected[-1] + (retained * 0.1 + retry_growth * GATEWAY_UNCACHED) / 1e6)
+        expected.append(expected[-1] + (retained + retry_growth + changed_growth) * GATEWAY_UNCACHED / 1e6)
         for snapshot, cost in zip((first, failed, restarted, retry, changed), expected):
             trajectory = snapshot["result"]["whole_window"]["trajectory"]
             self.assertAlmostEqual(trajectory["traditional_cost"], cost, places=12)
@@ -505,8 +510,8 @@ class InitializationRegressions(support.FixtureCase):
                     # Synthetic future policy identity only, not a new tariff.
                     # The recorded ledger and complete old digest stay intact.
                     resolution = saved["model_resolution"]["primary"]
-                    self.assertEqual(resolution["scenario_cache_policy"]["version"], 2)
-                    resolution["scenario_cache_policy"]["version"] = 3
+                    self.assertEqual(resolution["scenario_cache_policy"]["version"], 3)
+                    resolution["scenario_cache_policy"]["version"] = 4
                     checkpoint.write_text(json.dumps(saved))
                 history.append({"role": "user", "content": f"append {index}"})
             proxy = support.Proxy(self.state, fixture, mode="audit",
@@ -527,7 +532,7 @@ class InitializationRegressions(support.FixtureCase):
         first = snapshots[0]
         self.assertEqual(first['result']['matched_primary_responses'], 1)
         self.assertEqual(first["result"]["initial_compactions"], 1)
-        self.assertAlmostEqual(first["result"]["traditional_cost"], 0.0525, places=12)
+        self.assertAlmostEqual(first["result"]["traditional_cost"], 21000 * GATEWAY_UNCACHED / 1e6, places=12)
         for index, snapshot in enumerate(snapshots):
             result = snapshot["result"]
             self.assertEqual(fixture.primaries[index]["input"], wires[index])
@@ -546,8 +551,8 @@ class InitializationRegressions(support.FixtureCase):
         # but retains every appended token rather than freely compacting again.
         for index in range(1, 5):
             previous_input = 21000 + (index - 1) * 100
-            expected = ((21000 + index * 100) * 2.5 if migrate and index == 3
-                        else previous_input * 0.1 + 100 * 2.5) / 1e6
+            expected = ((21000 + index * 100) * GATEWAY_UNCACHED if migrate and index == 3
+                        else previous_input * 0.1 + 100 * GATEWAY_UNCACHED) / 1e6
             with self.subTest(boundary="cold transition or warm append", request=index + 1):
                 self.assertAlmostEqual(snapshots[index]["result"]["traditional_cost"]
                                        - snapshots[index - 1]["result"]["traditional_cost"],
@@ -555,8 +560,8 @@ class InitializationRegressions(support.FixtureCase):
         boundaries = snapshots[3]["result"].get("cache_policy_boundaries", [])
         self.assertEqual(len(boundaries), int(migrate))
         if migrate:
-            self.assertEqual(boundaries[0]["previous_version"], 2)
-            self.assertEqual(boundaries[0]["next_version"], 3)
+            self.assertEqual(boundaries[0]["previous_version"], 3)
+            self.assertEqual(boundaries[0]["next_version"], 4)
             for key in ["carry_cost", "traditional_cost", "summary_cost", "traditional_compactions"]:
                 self.assertEqual(boundaries[0]["cumulative"][key], snapshots[2]["result"][key])
             self.assertEqual(next(o['Primary']['facts']['contract'] for o in snapshots[2]['request_evidence']['observations'] if isinstance(o, dict) and 'Primary' in o),
@@ -784,7 +789,7 @@ class InitializationRegressions(support.FixtureCase):
 
     def test_hard_capacity_triggers_initialization_below_economic_budget(self):
         estimate = self.hard_capacity_comparison(1)
-        self.assertAlmostEqual(estimate["traditional_cost"], 0.0525, places=12,
+        self.assertAlmostEqual(estimate["traditional_cost"], 21000 * GATEWAY_UNCACHED / 1e6, places=12,
                                msg="first compared primary must fit resolved hard capacity")
         self.assertEqual(estimate["initial_compactions"], 1)
         self.assertEqual(estimate["matched_primary_responses"], 1)
@@ -851,7 +856,7 @@ class InitializationRegressions(support.FixtureCase):
 
     def test_omitted_output_reserves_default_frozen_allowance(self):
         estimate = self.omitted_output_comparison()
-        self.assertAlmostEqual(estimate["traditional_cost"], 0.0525, places=12,
+        self.assertAlmostEqual(estimate["traditional_cost"], 21000 * GATEWAY_UNCACHED / 1e6, places=12,
                                msg="40000 input plus default output reserve cannot fit 50000")
         self.assertEqual(estimate["initial_compactions"], 1)
         self.assertEqual(estimate["matched_primary_responses"], 1)
@@ -946,7 +951,7 @@ class InitializationRegressions(support.FixtureCase):
         self.assertEqual(fixture.primaries[0]["max_output_tokens"], 100000)
         self.assertEqual(fixture.reviews, [])
         self.assertAlmostEqual(estimate["observed_primary_cost"], 0.402, places=12)
-        self.assertAlmostEqual(estimate["traditional_cost"], 0.0525, places=12)
+        self.assertAlmostEqual(estimate["traditional_cost"], 21000 * GATEWAY_UNCACHED / 1e6, places=12)
         self.assertEqual(estimate["initial_compactions"], 1)
         self.assertEqual(estimate["traditional_compactions"], 0)
         self.assertEqual(estimate["summary_cost"], 0.0)

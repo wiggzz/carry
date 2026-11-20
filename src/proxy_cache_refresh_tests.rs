@@ -256,6 +256,20 @@ fn read_coverage_rejects_unknown_time_partial_conflicting_and_overlong_intervals
 }
 
 #[test]
+fn documented_long_mode_read_does_not_restart_the_write_deadline() {
+    let (model, mut body, read) = refresh_fixture();
+    body["prompt_cache_options"] = json!({"ttl":"12h"});
+    let write = json!({"input_tokens":5000,"cached_input_tokens":0,"cache_write_input_tokens":5000});
+    let mut cache = Vec::new();
+    let start = 100;
+    let expiry = start + 12 * 3600;
+    assert!(observe(&mut cache, &body, &write, Some(&model), "auth", ObservationTime::during(start, start + 3)));
+    assert!(observe(&mut cache, &body, &read, Some(&model), "auth", ObservationTime::during(expiry - 3, expiry - 2)));
+    assert!(reusable(&cache, &body, Some(&model), "auth", expiry - 1) > 0.0);
+    assert_eq!(reusable(&cache, &body, Some(&model), "auth", expiry), 0.0);
+}
+
+#[test]
 fn shorter_read_preserves_later_existing_coverage_without_restarting_its_long_clock() {
     let (model, body, read) = refresh_fixture();
     let mut cache = Vec::new();

@@ -194,7 +194,9 @@ class NativeTracker(unittest.TestCase):
             rows = report_policy_rows(self, binary, directory, case['events'])
             # The trace has a real native Carry rewrite and no native cache
             # entitlement. Its API-equivalent forecast is a separate contract.
-            self.assertEqual(rows[1][4:7], ['$0.0301', '$0.0218', '$-0.0083'])
+            # The diagnostic minimum does not authorize a gateway write
+            # premium. The signed difference uses unrounded subtotals.
+            self.assertEqual(rows[1][4:7], ['$0.0301', '$0.0218', '$-0.0084'])
             report_captures.append((case['streaming'], rows))
         self.assertEqual(len(report_captures), 2)
         for streaming, rows in report_captures:

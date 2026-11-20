@@ -1,7 +1,8 @@
 """Actual planner: compare an authorized warm projection with a tiny new edit.
 
-Synthetic loopback receipts and a deliberately attested fixture-only cache
-capability; not evidence of provider residency. No live state or paid calls.
+Synthetic loopback receipts with a staged legacy capability. The binary must
+not infer warmth from either on an unknown route. The positive warm case uses
+the test-only documented route in proxy_clock_tests.rs.
 """
 import contextlib
 import copy
@@ -237,7 +238,7 @@ class PlannerMarginalBaseline(unittest.TestCase):
                             fixture_errors=copy.deepcopy(fixture.errors))
             proxy.close()
 
-    def test_tiny_edit_cannot_beat_a_cheaper_valid_warm_continuation(self):
+    def test_tiny_edit_competes_with_valid_cold_continuation(self):
         control = self.run_arm("keep_warm_control", False)
         change = self.run_arm("tiny_change", True)
         self.assertEqual(control["primaries"][:4], change["primaries"][:4],
@@ -263,12 +264,14 @@ class PlannerMarginalBaseline(unittest.TestCase):
         self.assertEqual(plan["baseline_omitted_members"], [2])
         self.assertTrue(baseline["baseline"])
         self.assertEqual(rewrite["selection_joint"]["keep"], baseline["selection_joint"]["compact"])
-        self.assertGreater(rewrite["selection_joint"]["compact"], baseline["selection_joint"]["compact"])
-        self.assertFalse(rewrite["selection_joint"]["accepted"])
-        self.assertEqual(plan["selected_candidate_id"], baseline["candidate_id"])
-        self.assertEqual(change["primaries"][4]["input"], change["primaries"][3]["input"])
+        self.assertEqual(plan["cache_evidence"]["state"], "retention_unknown")
+        self.assertEqual(plan["primary_cached_estimated_tokens"], 0)
+        self.assertLess(rewrite["selection_joint"]["compact"], baseline["selection_joint"]["compact"])
+        self.assertTrue(rewrite["selection_joint"]["accepted"])
+        self.assertEqual(plan["selected_candidate_id"], rewrite["candidate_id"])
+        self.assertNotIn(HISTORY[3], change["primaries"][4]["input"])
 
-    def test_warm_continuation_survives_restart_repeat_append_and_response_id(self):
+    def test_cold_projection_survives_restart_repeat_append_and_response_id(self):
         change = self.run_arm("restarted_tiny_change", True, restart=True, followups=True)
         self.assert_marginal_decision(change)
 

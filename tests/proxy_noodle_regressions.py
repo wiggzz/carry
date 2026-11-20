@@ -546,7 +546,8 @@ class NoodleRegressions(unittest.TestCase):
                 for line in p.read_text().splitlines(keepends=True) if line.endswith("\n")]
 
     def attest_cache(self):
-        # Only synthetic route capability; never manufacture a native receipt.
+        # Seed the legacy capability shape to prove it cannot authorize an
+        # unknown route. Native receipts still arrive only over HTTP.
         path = self.state / "history.index"
         index = read_index(path)
         for snapshot in index["snapshots"].values():
@@ -738,7 +739,7 @@ class NoodleRegressions(unittest.TestCase):
                         self.assertAlmostEqual(saved["primary"]["cost_usd"],
                                                n * (200000 * 0.1 + 0.5) / 1e6, places=12)
                         expected = (n * (200000 * 0.1 + 0.5) if label == "tracked" else
-                                    200000 * (0.01 + (n-1) * 0.125) + n * 0.5) / 1e6
+                                    200000 * (0.01 + (n-1) * 0.10) + n * 0.5) / 1e6
                         self.assertAlmostEqual(saved["estimate"]["traditional_cost"], expected, places=12)
                         if n > 1:
                             old = snapshots[n-2]["request_evidence"]["observations"]
@@ -827,7 +828,7 @@ class NoodleRegressions(unittest.TestCase):
                 compact_facts = self.primary_observation(compact)["facts"]
                 full_facts = self.primary_observation(snapshots[0])["facts"]
                 self.assertEqual(compact_facts["cache_scope"] == full_facts["cache_scope"], mode == "audit")
-                expected = (6000 * rates["write" if mode == "off" else "cached"] + rates["output"]) / 1e6
+                expected = (6000 * rates["input" if mode == "off" else "cached"] + rates["output"]) / 1e6
                 self.assertAlmostEqual(snapshots[0]["estimate"]["traditional_cost"] -
                                        compact["estimate"]["traditional_cost"], expected, places=12)
                 for previous, current in zip(snapshots, snapshots[1:]):
@@ -846,14 +847,13 @@ class NoodleRegressions(unittest.TestCase):
                 proxy.close()
         self.state = root
 
-    def test_cold_extension_revokes_old_warm_prefix_through_repeat_restart_and_rewarm(self):
+    def test_unknown_gateway_never_credits_prefix_through_repeat_restart_and_new_write(self):
         def primary(_body, n):
             response = completed(response_id=f"extension_{n}")
             response["usage"]["input_tokens"] = 4000
             response["usage"]["input_tokens_details"]["cached_tokens"] = 3900 if n in (2,7) else 0
             if n in (3,8):
-                # A raw partial hit is not write-time/extent proof. Establish
-                # warmth with a real whole-input write after capability attestation.
+                # Even a complete write does not establish retention here.
                 response["usage"]["input_tokens_details"]["cache_write_tokens"] = 4000
             return 200, response
         fixture = self.fixture(primary)
@@ -876,8 +876,8 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(written["primary"]["cache_write_tokens"],4000)
         self.assertEqual(proxy.send(extended)[0],200)  # actual cold H+suffix terminal
         _, cold = proxy.checkpoint(extended)
-        self.assertGreater(cold["last_plan"]["primary_cached_estimated_tokens"],0,
-                           "first extension legitimately forecasts the prior warm H")
+        self.assertEqual(cold["last_plan"]["primary_cached_estimated_tokens"],0,
+                         "first extension cannot borrow a deadline from an unknown route")
         self.assertEqual(proxy.send(extended)[0],200)
         _, repeated = proxy.checkpoint(extended)
         proxy.close()
@@ -902,13 +902,13 @@ class NoodleRegressions(unittest.TestCase):
         self.assertEqual(repeated["last_plan"]["primary_cached_estimated_tokens"],0,
                          "newer cold extension supersedes old covered warmth")
         self.assertEqual(restarted["last_plan"]["primary_cached_estimated_tokens"],0)
-        self.assertGreater(rewarmed["last_plan"]["primary_cached_estimated_tokens"],0)
+        self.assertEqual(rewarmed["last_plan"]["primary_cached_estimated_tokens"],0)
         self.assertEqual(rewarmed["primary"]["calls"],9)
         self.assertEqual(rewarmed["primary"]["input_tokens"],36000)
         self.assertEqual(rewarmed["primary"]["cached_tokens"],7800)
         self.assertFalse(fixture.reviews)
 
-    def test_cold_extension_changes_actual_disposable_selection_after_restart(self):
+    def test_unknown_gateway_whole_write_cannot_veto_actual_projection_after_restart(self):
         def primary(_body,n):
             value = completed(response_id=f"selection_{n}")
             value["usage"]["input_tokens"] = 40000
@@ -935,15 +935,15 @@ class NoodleRegressions(unittest.TestCase):
         proxy.close()
         proxy = self.proxy(fixture,options)
         self.assertEqual(proxy.send(extended)[0],200)
-        self.assertIn(h[1],fixture.primaries[-1]["input"],"confirmed warm H makes retaining original cheaper on first append")
-        _, warm = proxy.checkpoint(extended)
+        self.assertNotIn(h[1],fixture.primaries[-1]["input"],"unknown route cannot veto the first projection")
+        _, first = proxy.checkpoint(extended)
         proxy.close()
         proxy = self.proxy(fixture,options)
         self.assertEqual(proxy.send(extended)[0],200)
         _, cold = proxy.checkpoint(extended)
-        self.evidence.update(warm=warm,cold=cold,primaries=fixture.primaries,reviews=fixture.reviews)
-        self.assertNotIn(h[1],fixture.primaries[-1]["input"],"new cold extension must change real selection, not only a diagnostic")
-        self.assertFalse(warm["last_plan"]["selected"])
+        self.evidence.update(first=first,cold=cold,primaries=fixture.primaries,reviews=fixture.reviews)
+        self.assertNotIn(h[1],fixture.primaries[-1]["input"],"restart cannot mint cache credit")
+        self.assertTrue(first["last_plan"]["selected"])
         self.assertTrue(cold["last_plan"]["selected"])
         self.assertEqual(len(fixture.reviews),1)
         self.assertEqual(cold["primary"]["calls"],5)

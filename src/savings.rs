@@ -1,7 +1,9 @@
 //! Observed primary money with a conditional local-quantity alternative.
 //! Local o200k_base estimates never reprice a paid provider receipt.
 use crate::openai::{Usage, estimated_cost_usd, prompt_cache_capabilities};
-use carry::models::{ScenarioCacheMode, ScenarioCachePolicy};
+use carry::models::{
+    CacheWriteBilling, Rates, Route, RouteClass, ScenarioCacheMode, ScenarioCachePolicy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -171,6 +173,7 @@ struct Prompt {
     cache_read_refresh_ms: Option<u64>,
     cache_mode: ScenarioCacheMode,
     write_tariff_known: bool,
+    forecast_write_billing: Option<CacheWriteBilling>,
 }
 
 pub struct Trajectory {
@@ -201,6 +204,7 @@ pub struct Trajectory {
     cache_minimum: Option<u64>,
     cache_metadata: bool,
     scenario_cache_policy: Option<ScenarioCachePolicy>,
+    mixed_cache_policy: bool,
 }
 impl Default for Trajectory {
     fn default() -> Self {
@@ -243,13 +247,22 @@ impl Trajectory {
             cache_minimum: None,
             cache_metadata: false,
             scenario_cache_policy: None,
+            mixed_cache_policy: false,
         }
     }
     pub fn snapshot(&self) -> Estimate {
         let mut e = self.result.clone();
         e.initialization_policy = "unrecognized_history_free_pre_window_v1";
-        e.counterfactual_cache_policy =
-            format!("conditional_model_cache_v{}", ScenarioCachePolicy::VERSION);
+        e.counterfactual_cache_policy = if self.mixed_cache_policy {
+            "mixed_versioned_cache_policies".into()
+        } else {
+            format!(
+                "conditional_model_cache_v{}",
+                self.scenario_cache_policy
+                    .as_ref()
+                    .map_or(2, |policy| policy.version)
+            )
+        };
         e.coverage.unmatched_requests += usize::from(self.pending_request);
         e.observed_priced = e.coverage.responses > 0
             && e.coverage.unpriced_responses == 0
@@ -288,6 +301,10 @@ impl Trajectory {
         match value["event"].as_str()? {
             "run_started" | "session_resumed" => {
                 let previous_minimum = self.cache_minimum_for(&self.last_model);
+                let previous_policy = self
+                    .scenario_cache_policy
+                    .as_ref()
+                    .map_or(2, |policy| policy.version);
                 if let Some(model) = data["model"].as_str() {
                     self.model = model.to_owned();
                 }
@@ -296,7 +313,9 @@ impl Trajectory {
                     // malformed. Native entitlement cannot fill its omissions.
                     let policy = serde_json::from_value::<ScenarioCachePolicy>(policy.clone())
                         .ok()
-                        .filter(|policy| policy.version == ScenarioCachePolicy::VERSION);
+                        .filter(|policy| {
+                            (2..=ScenarioCachePolicy::VERSION).contains(&policy.version)
+                        });
                     self.cache_metadata = true;
                     self.cache_minimum = policy
                         .as_ref()
@@ -316,7 +335,13 @@ impl Trajectory {
                         data.get("implicit_cache_minimum_prefix_tokens").is_some();
                     self.cache_minimum = data["implicit_cache_minimum_prefix_tokens"].as_u64();
                 }
-                if previous_minimum != self.cache_minimum_for(&self.last_model) {
+                let changed = previous_policy
+                    != self
+                        .scenario_cache_policy
+                        .as_ref()
+                        .map_or(2, |policy| policy.version);
+                self.mixed_cache_policy |= changed && self.result.coverage.responses > 0;
+                if changed || previous_minimum != self.cache_minimum_for(&self.last_model) {
                     // A prior prompt was not necessarily written under the new policy.
                     self.modeled_cache.clear();
                 }
@@ -347,6 +372,18 @@ impl Trajectory {
                 self.result.coverage.requests += 1;
                 self.pending = projection(data, &self.model);
                 if let Some(p) = self.pending.as_mut() {
+                    if self
+                        .scenario_cache_policy
+                        .as_ref()
+                        .is_some_and(|policy| policy.version >= 3)
+                    {
+                        let route = recorded_cache_route(data)
+                            .map_or(RouteClass::UnknownGateway, |route| route.class);
+                        p.forecast_write_billing = Some(route.cache_write_billing(
+                            p.cache_mode,
+                            prompt_cache_capabilities(&p.model).is_some(),
+                        ));
+                    }
                     p.request_at_ms = value["timestamp_ms"].as_u64();
                     p.cache_lifetime_ms = self.cache_ttl_ms;
                     p.cache_read_refresh_ms = self
@@ -358,7 +395,10 @@ impl Trajectory {
                 if self.cache_ttl_ms.is_none() || value["timestamp_ms"].as_u64().is_none() {
                     self.result.coverage.unknown_expiry_requests += 1;
                 }
-                if data["transport"].get("api_base").is_none() && data.get("route").is_none() {
+                if data["transport"].get("cache_route").is_none()
+                    && data["transport"].get("api_base").is_none()
+                    && data.get("route").is_none()
+                {
                     self.result.coverage.unknown_route_requests += 1;
                 }
             }
@@ -519,7 +559,14 @@ impl Trajectory {
                                 pi_cached?,
                                 minimum,
                                 prompt.cache_mode,
-                                estimated_cost_usd,
+                                |model, usage| match prompt.forecast_write_billing {
+                                    Some(billing) => {
+                                        Some(usage.cost_at_rates(billing.forecast_rates(
+                                            Rates::for_model(model, usage.input_tokens as f64)?,
+                                        )))
+                                    }
+                                    None => estimated_cost_usd(model, usage),
+                                },
                             )? + pi_output?,
                         )
                     });
@@ -750,6 +797,10 @@ pub(crate) fn fixed_prompt_tokens(body: &Value) -> Option<u64> {
     fixed_prompt_projection(body).map(|value| token_units(&value))
 }
 
+fn recorded_cache_route(data: &Value) -> Option<Route> {
+    serde_json::from_value(data["transport"]["cache_route"].clone()).ok()
+}
+
 fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let request = &data["request"];
     let (prefix, _, input) = prompt_projection(request)?;
@@ -758,7 +809,11 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
     let cache_scope = crate::proxy_cache::modeled_scope(
         request,
         model,
-        (data["transport"].get("api_base"), data.get("route")),
+        (
+            data["transport"].get("api_base"),
+            data.get("route"),
+            data["transport"].get("cache_route"),
+        ),
     );
     Some(Prompt {
         model: model.to_owned(),
@@ -772,6 +827,7 @@ fn projection(data: &Value, fallback: &str) -> Option<Prompt> {
         cache_lifetime_ms: None,
         cache_read_refresh_ms: None,
         write_tariff_known: carry::models::cache_write_tariff_known(request),
+        forecast_write_billing: None,
         cache_mode: ScenarioCachePolicy::for_model(request["model"].as_str().unwrap_or(fallback))
             .request_mode(request),
     })

@@ -29,7 +29,7 @@ class CachePolicyRegressions(support.FixtureCase):
         fixture = self.fixture(primary, review)
         self.addCleanup(lambda: self.assertEqual(fixture.errors, []))
         history = [{"role": "user", "content": "immutable policy boundary"}]
-        versions = [2, 3, 3, 4]
+        versions = [3, 4, 4, 5]
         snapshots = []
         checkpoints = []
         paid = 0.0
@@ -72,8 +72,8 @@ class CachePolicyRegressions(support.FixtureCase):
         boundaries = changed.get("cache_policy_boundaries", [])
         self.assertEqual(len(boundaries), 1,
                          "CACHE_POLICY_188: present version change must freeze the old ledger")
-        self.assertEqual(boundaries[0]["previous_version"], 2)
-        self.assertEqual(boundaries[0]["next_version"], 3)
+        self.assertEqual(boundaries[0]["previous_version"], 3)
+        self.assertEqual(boundaries[0]["next_version"], 4)
         cumulative = boundaries[0]["cumulative"]
         for field in ("carry_cost", "traditional_cost", "reviewer_cost", "summary_cost",
                       "traditional_compactions", "coverage", "matched_primary_responses"):
@@ -84,7 +84,7 @@ class CachePolicyRegressions(support.FixtureCase):
         later = changed_again["cache_policy_boundaries"]
         self.assertEqual(len(later), 2)
         self.assertEqual(later[0], boundaries[0], "never overwrite an earlier boundary")
-        self.assertEqual((later[1]["previous_version"], later[1]["next_version"]), (3, 4))
+        self.assertEqual((later[1]["previous_version"], later[1]["next_version"]), (4, 5))
         for field in cumulative:
             self.assertEqual(later[1]["cumulative"][field], same[field], field)
         # Monetary snapshots are cumulative, never additive disjoint segments.

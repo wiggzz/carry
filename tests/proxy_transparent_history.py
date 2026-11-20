@@ -326,8 +326,8 @@ class TransparentHistory(regressions.FixtureCase):
         self.assertEqual(identities[1], identities[2], "blank override uses the actual default")
         self.assertNotEqual(identities[2], identities[3])
 
-    def test_request_projection_can_restore_genuinely_rewarmed_original_source(self):
-        """A past cold omission is an audit event, never semantic removal authority."""
+    def test_unknown_gateway_writes_do_not_restore_a_cold_projection(self):
+        """A cold omission doesn't delete canonical history or certify gateway warmth."""
         def primary(body, n):
             value = completed(response_id=f"reversible_{n}")
             value["usage"]["input_tokens"] = max(100, len(wire(body["input"])) // 4)
@@ -335,8 +335,7 @@ class TransparentHistory(regressions.FixtureCase):
                 value["usage"]["input_tokens"] * 99 // 100 if n in (1, 2) else
                 0 if n in (3, 5, 6) else value["usage"]["input_tokens"])
             if n in (3, 5, 6):
-                # Only these actual whole-input writes establish original timing.
-                # Later full reads preserve that event, never refresh its deadline.
+                # Raw whole-input writes don't prove retention on this route.
                 value["usage"]["input_tokens_details"]["cache_write_tokens"] = value["usage"]["input_tokens"]
             return 200, value
 
@@ -352,9 +351,7 @@ class TransparentHistory(regressions.FixtureCase):
         self.evidence.update(upstream=fixture.primaries,reviews=fixture.reviews)
         self.assertEqual(proxy.send(history)[0], 200)
         proxy.close()
-        # The loopback destination cannot advertise official provider semantics.
-        # Attest only this synthetic fixture's cache capability on the frozen
-        # pair; native cache activity still comes solely from actual HTTP usage.
+        # A legacy capability flag alone can't establish route authority.
         path = self.state / "history.index"
         index = read_index(path)
         for snapshot in index["snapshots"].values():
@@ -363,8 +360,6 @@ class TransparentHistory(regressions.FixtureCase):
                 "max_write_breakpoints": 4, "implicit_breakpoint_uses_write_slot": True}
         write_index(path, index)
         options += ["--review-every-requests", "100"]
-        # Advertised fixture capability precedes a real canonical dispatch.
-        # No saved cache receipt is manufactured by the attestation above.
         warm = TransparentProxy(self.state, fixture, options, mode="audit")
         self.stack.callback(warm.close)
         self.assertEqual(warm.send(history)[0], 200)
@@ -374,35 +369,10 @@ class TransparentHistory(regressions.FixtureCase):
         warm.close()
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
-        self.assertIn(history[1], fixture.primaries[-1]["input"], "warm prefix favors original source")
-        proxy.close()
-        # Stage elapsed provider TTL only, not semantic advice, a receipt or a
-        # planner result. Every outgoing body is still rendered by the real CLI.
-        path = self.state / "history.index"
-        index = read_index(path)
-        for entry in index.get("upstream_cache", []):
-            if entry.get("write_window"):
-                entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
-        for snapshot in index["snapshots"].values():
-            for field in ("primary_cache", "reviewer_cache", "upstream_cache"):
-                for entry in snapshot.get(field, []):
-                    if entry.get("write_window"):
-                        entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
-        write_index(path, index)
-        proxy = self.proxy(fixture, options)
-        self.assertEqual(proxy.send(history)[0], 200)
-        self.assertNotIn(history[1], fixture.primaries[-1]["input"], "expired prefix permits cold omission")
+        self.assertNotIn(history[1], fixture.primaries[-1]["input"], "unknown prefix cannot veto cold omission")
         cold = fixture.primaries[-1]
         proxy.close()
-        # If both shapes are warm the smaller compact view can remain cheaper.
-        # Expire its new receipt before genuinely re-warming canonical H alone.
-        index = read_index(path)
-        for entry in index["upstream_cache"]:
-            if entry.get("write_window"):
-                entry["write_window"]["not_before"] = entry["write_window"]["not_after"] = 1
-        write_index(path, index)
-        # Audit mode genuinely dispatches canonical H. Only its terminal provider
-        # receipt may re-warm that exact shape; no invented saved cache entries.
+        # Audit still genuinely dispatches canonical H after the omission.
         proxy = TransparentProxy(self.state, fixture, options, mode="audit")
         self.stack.callback(proxy.close)
         self.assertEqual(proxy.send(history)[0], 200)
@@ -412,14 +382,14 @@ class TransparentHistory(regressions.FixtureCase):
         proxy.close()
         proxy = self.proxy(fixture, options)
         self.assertEqual(proxy.send(history)[0], 200)
-        self.evidence["restored"] = fixture.primaries[-1]
-        self.assertIn(history[1], fixture.primaries[-1]["input"],
-                      "genuine compatible cache evidence must make the same original H retainable again")
+        self.evidence["projected"] = fixture.primaries[-1]
+        self.assertNotIn(history[1], fixture.primaries[-1]["input"],
+                         "the gateway's actual canonical write did not prove retention")
         self.assertIn(history[0], fixture.primaries[-1]["input"])
         observations = proxy.checkpoint(history)[1]["request_evidence"]["observations"]
         latest = next(o["Primary"] for o in reversed(observations) if "Primary" in o)
-        self.assertEqual(latest["restoration"]["tokens"], 0,
-                         "retaining canonical source replaces the old omission quantity with zero")
+        self.assertGreater(latest["restoration"]["tokens"], 0,
+                           "accounting must still restore the omitted source in the counterfactual")
         self.assertEqual(len(fixture.reviews), 1, "reversibility needs no paid semantic recovery")
 
 

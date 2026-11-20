@@ -1075,6 +1075,8 @@ async fn resolved_catalog(
 ) -> Result<(ResolvedModel, ResolvedModel), Failure> {
     let config = &service.config;
     let mut primary_route = Route::new(&config.upstream_url, config.codex_login);
+    #[cfg(test)]
+    tests::attest_loopback_cache_fixture(&config.upstream_url, &mut primary_route);
     primary_route.processing_tier = processing_tier.into();
     let reviewer_route = Route::new(
         config
@@ -4233,7 +4235,7 @@ fn resolved_view_costs(
     at: u64,
 ) -> Option<ViewCosts> {
     let input = crate::proxy_quantity::InputMeasurements::default();
-    resolved_input_costs(
+    let forecast = resolved_input_costs(
         keep,
         compact,
         cache,
@@ -4244,7 +4246,30 @@ fn resolved_view_costs(
         at,
         input.estimate(keep, "", resolved)?,
         input.estimate(compact, "", resolved)?,
-    )
+    )?;
+    Some(ViewCosts {
+        keep: forecast.keep,
+        compact: forecast.compact,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BranchCacheCosts {
+    retention: carry::models::CacheRetention,
+    population_mode: carry::models::ScenarioCacheMode,
+    write_billing: carry::models::CacheWriteBilling,
+    first_supported_cached_tokens: f64,
+    all_cold_usd: f64,
+    current_evidence_future_cold_usd: f64,
+    current_evidence_future_warm_usd: Option<f64>,
+}
+
+#[derive(Debug)]
+struct InputForecast {
+    keep: f64,
+    compact: f64,
+    keep_cache: BranchCacheCosts,
+    compact_cache: BranchCacheCosts,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4259,16 +4284,7 @@ fn resolved_input_costs(
     at: u64,
     keep_input: crate::proxy_quantity::InputEstimate,
     compact_input: crate::proxy_quantity::InputEstimate,
-) -> Option<ViewCosts> {
-    let kt = keep_input.tokens as f64;
-    let ct = compact_input.tokens as f64;
-    let rates = |tokens| match resolved {
-        Some(r) if r.model == model => r.forecast_rates_for_input(tokens),
-        Some(_) => None,
-        None => Rates::for_model(model, tokens),
-    };
-    let kr = rates(kt)?;
-    let cr = rates(ct)?;
+) -> Option<InputForecast> {
     let minimum = match resolved {
         Some(r) => match r.route.class {
             RouteClass::CodexSubscription | RouteClass::SyntheticSubscription => r
@@ -4279,7 +4295,19 @@ fn resolved_input_costs(
         },
         None => carry::models::ScenarioCachePolicy::for_model(model).minimum_prefix_tokens,
     };
-    let first = |body: &Value, input: crate::proxy_quantity::InputEstimate, rates: Rates| {
+    let branch = |body: &Value, input: crate::proxy_quantity::InputEstimate| {
+        use carry::models::{
+            CacheRetention, CacheWriteBilling, ScenarioCacheMode, ScenarioCachePolicy,
+        };
+        let retention = resolved.map_or(CacheRetention::Unknown, |r| r.cache_retention(body));
+        let lifetime = retention.minimum_seconds();
+        let population_mode = ScenarioCachePolicy::for_model(model)
+            .with_documented_retention(retention)
+            .request_mode(body);
+        let write_billing = resolved.map_or(CacheWriteBilling::Unknown, |r| {
+            r.cache_write_billing(population_mode)
+        });
+        let tokens = input.tokens as f64;
         let explicit_write = body["input"].as_array().into_iter().flatten().any(|item| {
             item["content"]
                 .as_array()
@@ -4287,55 +4315,78 @@ fn resolved_input_costs(
                 .flatten()
                 .any(|block| block["prompt_cache_breakpoint"]["mode"] == "explicit")
         });
-        input_cost(
-            input.tokens as f64,
-            if input.basis == crate::proxy_quantity::EstimateBasis::LocalVisibleText {
-                crate::proxy_cache::reusable(cache, body, resolved, credential, at)
+        let cached = if input.basis == crate::proxy_quantity::EstimateBasis::LocalVisibleText {
+            crate::proxy_cache::reusable(cache, body, resolved, credential, at)
+        } else {
+            cache
+                .iter()
+                .filter(|entry| entry.reusable_at(body, resolved, credential, at).is_some())
+                .filter_map(|entry| entry.native_input_tokens)
+                .max()
+                .unwrap_or(0) as f64
+        }
+        .clamp(0.0, tokens);
+        let implicit = population_mode == ScenarioCacheMode::Implicit && lifetime.is_some();
+        // An explicit breakpoint isn't a whole-prompt population contract.
+        // Preserve the existing dispatch bound for supported explicit writes;
+        // never assign that tariff to an unsupported route or lifetime.
+        let explicit = explicit_write
+            && resolved.is_none_or(|r| r.explicit_cache_transport && lifetime.is_some());
+        let rates = match resolved {
+            Some(r) if r.model == model => r.forecast_rates_for_cache_lifetime(
+                tokens,
+                if explicit {
+                    r.cache_write_billing(ScenarioCacheMode::Implicit)
+                } else {
+                    write_billing
+                },
+                lifetime,
+            ),
+            Some(_) => None,
+            None => Rates::for_model(model, tokens),
+        }?;
+        let uncached = if explicit { rates.write } else { rates.input };
+        let request_cost = |cached: f64| {
+            if implicit {
+                crate::savings::scenario_input_cost_with_mode(
+                    model,
+                    input.tokens,
+                    cached as u64,
+                    minimum,
+                    population_mode,
+                    |_, usage| Some(usage.cost_at_rates(rates)),
+                )
             } else {
-                cache
-                    .iter()
-                    .filter(|entry| entry.reusable_at(body, resolved, credential, at).is_some())
-                    .filter_map(|entry| entry.native_input_tokens)
-                    .max()
-                    .unwrap_or(0) as f64
-            },
-            if explicit_write && resolved.is_none_or(|r| r.explicit_cache_transport) {
-                rates.write
+                Some(input_cost(tokens, cached, uncached, rates.cached))
+            }
+        };
+        let cold = request_cost(0.0)?;
+        let first = request_cost(cached)?;
+        let later = requests.saturating_sub(1) as f64;
+        Some(BranchCacheCosts {
+            retention,
+            population_mode,
+            write_billing,
+            first_supported_cached_tokens: cached,
+            all_cold_usd: cold * requests as f64,
+            current_evidence_future_cold_usd: if requests == 0 {
+                0.0
             } else {
-                rates.input
+                first + later * cold
             },
-            rates.cached,
-        )
+            current_evidence_future_warm_usd: (implicit
+                && input.capacity_tokens().is_some()
+                && minimum.is_some_and(|minimum| tokens >= minimum as f64))
+            .then(|| horizon_cost(first, tokens, rates.cached, requests)),
+        })
     };
-    let keep_first = first(keep, keep_input, kr);
-    let compact_first = first(compact, compact_input, cr);
-    // Future hits use the scenario policy, not explicit transport capability.
-    let minimum = minimum.map(|tokens| tokens as f64);
-    // Future hits are a fixed-history sensitivity assumption, not guaranteed.
-    Some(ViewCosts {
-        keep: horizon_cost(
-            keep_first,
-            kt,
-            if keep_input.capacity_tokens().is_some() && minimum.is_some_and(|min| kt >= min) {
-                kr.cached
-            } else {
-                kr.input
-            },
-            requests,
-        ),
-        compact: horizon_cost(
-            compact_first,
-            ct,
-            // A forecasted quantity is not evidence of a complete future
-            // native write. Charge the upper candidate at the uncached rate;
-            // existing scoped native receipts still price the first request.
-            if compact_input.capacity_tokens().is_some() && minimum.is_some_and(|min| ct >= min) {
-                cr.cached
-            } else {
-                cr.input
-            },
-            requests,
-        ),
+    let keep = branch(keep, keep_input)?;
+    let compact = branch(compact, compact_input)?;
+    Some(InputForecast {
+        keep: keep.current_evidence_future_cold_usd,
+        compact: compact.current_evidence_future_cold_usd,
+        keep_cache: keep,
+        compact_cache: compact,
     })
 }
 
@@ -4661,17 +4712,26 @@ async fn relay(
                     } else {
                         value
                     };
-                    trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
-                        body: &commit.outbound,
-                        response,
-                        measurements: Some(&commit.candidate.primary_input),
-                        route: &commit.service.config.upstream_url,
-                        at: commit.dispatched_at,
-                        standard: standard(&commit.outbound)
-                            && value.get("service_tier").is_none_or(|v| v == "default"),
-                        resolved,
-                        cost: settled,
-                    });
+                    trajectory.primary_settled_on_route(
+                        crate::proxy_savings::PrimaryObservation {
+                            body: &commit.outbound,
+                            response,
+                            measurements: Some(&commit.candidate.primary_input),
+                            route: &commit.service.config.upstream_url,
+                            at: commit.dispatched_at,
+                            standard: standard(&commit.outbound)
+                                && value.get("service_tier").is_none_or(|v| v == "default"),
+                            resolved,
+                            cost: settled,
+                        },
+                        resolved.is_none().then(|| {
+                            Route::new(
+                                &commit.service.config.upstream_url,
+                                commit.service.config.codex_login,
+                            )
+                            .class
+                        }),
+                    );
                 }
                 if commit.native {
                     commit.candidate.reset_active();

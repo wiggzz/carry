@@ -111,10 +111,10 @@ class DispatchClock(support.FixtureCase):
             self.assertEqual(result['initial_compactions'], 1)
             self.assertEqual(result['summary_cost'], 0)
         self.assertAlmostEqual(estimates[2]['traditional_cost'] - estimates[1]['traditional_cost'],
-                               (21100 * .1 + 100 * 2.5) / 1e6, places=12,
+                               (21100 * .1 + 100 * 2) / 1e6, places=12,
                                msg='warm dispatch cannot become cold at delayed settlement')
         self.assertAlmostEqual(estimates[3]['traditional_cost'] - estimates[2]['traditional_cost'],
-                               21300 * 2.5 / 1e6, places=12,
+                               21300 * 2 / 1e6, places=12,
                                msg='terminal cannot mint a fresh whole-prefix write')
 
 

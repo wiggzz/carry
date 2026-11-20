@@ -733,6 +733,7 @@ impl Backend {
             Self::OpenAi(client) => json!({
                 "request_timeout_ms": client.request_timeout().as_millis(),
                 "connect_timeout_ms": client.connect_timeout().as_millis(),
+                "cache_route": client.cache_route(),
             }),
             Self::Scripted { .. } => json!({"scripted": true}),
         }

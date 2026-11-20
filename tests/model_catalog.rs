@@ -226,10 +226,10 @@ fn forecast_cache_population_rates_follow_route_without_mutating_frozen_tariffs(
             assert_eq!(forecast.output, native.output);
             assert_eq!(
                 forecast.write,
-                if subscription {
-                    native.input
-                } else {
+                if endpoint == "https://api.openai.com/v1/responses" {
                     native.write
+                } else {
+                    native.input
                 }
             );
         }

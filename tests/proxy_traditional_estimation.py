@@ -308,7 +308,7 @@ class TraditionalEstimation(support.FixtureCase):
         self.assertEqual(t['summary_cost'], 0, 'no excluded historical fee backfill')
         self.assertEqual(t['matched_primary_responses'], 1)
         rates = after['model_resolution']['primary']['rates']
-        expected = (3528*rates['write'] + rates['output'])/1000000
+        expected = (3528*rates['input'] + rates['output'])/1000000
         self.assertIsNone(frozen['traditional_cost'])
         self.assertAlmostEqual(t['traditional_cost'], expected, places=12)
         self.assertAlmostEqual(t['observed_primary_cost'], after['primary']['cost_usd'], places=12)
@@ -486,7 +486,7 @@ class TraditionalEstimation(support.FixtureCase):
         self.assertGreater(t['summary_cost'],0)
         rates = after['model_resolution']['primary']['rates']
         self.assertAlmostEqual(t['traditional_cost'] - before['estimate']['traditional_cost'],
-                               (21100*rates['write'] + rates['output'])/1e6, places=12)
+                               (21100*rates['input'] + rates['output'])/1e6, places=12)
         self.assertAlmostEqual(stats['sessions'][0]['cost_estimate']['observed_primary_cost'],after['primary']['cost_usd'],places=12)
         self.assertEqual(fixture.reviews,[])
 
@@ -538,7 +538,7 @@ class TraditionalEstimation(support.FixtureCase):
         self.assertEqual(t['matched_primary_responses'],prior['matched_primary_responses']+1)
         rates=after['model_resolution']['primary']['rates']
         self.assertEqual(after['primary']['output_tokens']-before['primary']['output_tokens'],1)
-        expected=(21100*rates['cached']+100*rates['write']+rates['output'])/1000000
+        expected=(21100*rates['cached']+100*rates['input']+rates['output'])/1000000
         self.assertAlmostEqual(t['traditional_cost']-prior['traditional_cost'],expected,places=12)
         self.assertAlmostEqual(t['observed_primary_cost'],after['primary']['cost_usd'],places=12)
 
@@ -631,7 +631,7 @@ class TraditionalEstimation(support.FixtureCase):
         self.assertEqual(last['estimate']['summary_cost'],0)
         rates = last['model_resolution']['primary']['rates']
         self.assertAlmostEqual(last['estimate']['traditional_cost'],
-                               (21000*rates['cached'] + 100*rates['write'] + rates['output'])/1e6, places=12)
+                               (21000*rates['cached'] + 100*rates['input'] + rates['output'])/1e6, places=12)
 
 
 if __name__ == '__main__':
