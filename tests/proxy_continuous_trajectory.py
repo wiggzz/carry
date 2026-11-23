@@ -28,11 +28,13 @@ class ContinuousTrajectory(support.FixtureCase):
         expected_wires, snapshots, oracle = [], [], []
         retired, summary, primaries, summaries, cycles = 0, 0, 0., 0., 0
         canonical, prior_native = inputs[0], inputs[0]
+        rebased = False
         for i, native in enumerate(inputs):
-            # A declared same-owner canonical rebase cannot restore retired
-            # source or erase its retained summary. Unknown new growth at that
-            # boundary is explicitly estimated as zero, not negative growth.
+            # A witnessed downward receipt rebase cannot restore retired
+            # source. Keep the exact semantic prefix: changing an old item
+            # would be an unrelated history, tested separately.
             if i:
+                rebased |= native < prior_native
                 canonical += max(0, native - prior_native)
             prior_native = native
             if i:
@@ -47,8 +49,6 @@ class ContinuousTrajectory(support.FixtureCase):
                       'prompt_cache_options':{'mode':'explicit', **({'ttl':'30m'} if i < 30 else {})}}
             if boundary:
                 fields['instructions'] = 'new settings' if i >= 15 else 'old settings'
-                if i == 35:
-                    history[0] = {'role':'assistant','content':'reserialized old context'}
             response = proxy.send(history, **fields)
             self.assertEqual(response[0], 200, response)
             expected_wires.append(copy.deepcopy(history))
@@ -67,15 +67,25 @@ class ContinuousTrajectory(support.FixtureCase):
             total = incoming + retained
             if total > 272000 - 16384:
                 # Summary tariff uses its own summarized-input tier.
-                summary_input = total - 20000
+                # Known-output append receipts measure a complete 30k recent
+                # bundle; keep that whole bundle rather than assigning a fake
+                # measured quantity to a 20k slice through it. The fixed
+                # empty/short-instructions framing is 19/20 local units.
+                # Settings changes break the append receipt, and after a
+                # downward rebase we're in estimated canonical coordinates.
+                kept = 20000
+                if i and not opaque and not rebased and not (boundary and i == 15):
+                    kept = step + (20 if boundary else 19)
+                summary_input = total - kept
                 summary_charge = (summary_input * (4 if summary_input > 272000 else 2) + 1000 * (15 if summary_input > 272000 else 10)) / 1e6
                 summaries += summary_charge
                 cycles += 1
-                retired += total - 20000 - summary
+                retired += total - kept - summary
                 summary = 1000
             oracle.append({'request':i+1, 'native':native, 'traditional_input':incoming,
                            'primary_charge':primary_charge, 'summary_charge':summary_charge,
-                           'paid_cycles':cycles, 'total':primaries+summaries})
+                           'paid_cycles':cycles, 'summary_total':summaries,
+                           'total':primaries+summaries})
             snapshots.append(support.cost_estimate(proxy))
         saved = proxy.saved()
         stats = proxy.request('GET','/carry/dashboard/stats')[1]
@@ -96,6 +106,8 @@ class ContinuousTrajectory(support.FixtureCase):
                 self.assertEqual(whole['primary_responses'], i+1)
                 self.assertAlmostEqual(whole['traditional_cost'], expected['total'], places=10,
                     msg='CONTINUOUS_TRAJECTORY: every retained primary advances the same summary history, not a matched-expense ratio')
+                self.assertEqual(whole['trajectory']['traditional_compactions'], expected['paid_cycles'])
+                self.assertAlmostEqual(whole['trajectory']['summary_cost'], expected['summary_total'], places=10)
         whole = snapshots[-1]['whole_window']
         self.assertAlmostEqual(whole['carry_cost'], actual, places=10)
         trajectory = whole['trajectory']

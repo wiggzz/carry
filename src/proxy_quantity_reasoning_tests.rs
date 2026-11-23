@@ -417,7 +417,14 @@ fn repeated_visible_partial_additions_share_native_residual_attribution() {
         .as_array_mut()
         .unwrap()
         .push(json!({"type":"reasoning","encrypted_content":"synthetic-new".repeat(1000)}));
-    measured.observe(&source, &json!({"input_tokens":20000}), "route", None, 103);
+    measured.observe_primary(
+        &source,
+        &json!({"input_tokens":20000}),
+        "route",
+        None,
+        103,
+        true,
+    );
     let removed = measured
         .projected_estimate(&retained, &source, "route", None)
         .unwrap();

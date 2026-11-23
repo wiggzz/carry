@@ -96,6 +96,7 @@ async fn synthetic_qualified_terminal_restart(sse: bool) {
             observed_input: body["input"].as_array().unwrap().clone(),
             candidate,
             outbound: body.clone(),
+            primary_edited: false,
             native: false,
             dispatched_at: now(),
             _history_pin: pin,

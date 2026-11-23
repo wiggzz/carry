@@ -26,6 +26,12 @@ struct PromptWitness {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct PrimaryFacts {
+    #[serde(default)]
+    pub(super) recognition_v2: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    follows_native_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_checkpoint_digest: Option<String>,
     pub configuration: String,
     pub contract: HistoryContract,
     pub model: String,
@@ -44,6 +50,8 @@ pub(super) struct PrimaryFacts {
     pub retained_visible: Option<u64>,
     pub retained_opaque: Option<u64>,
     pub retained_member: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_recent_kept: Option<u64>,
     pub estimated_retained: bool,
     pub unsupported_opaque: bool,
     pub allowance: Option<u64>,
@@ -175,9 +183,32 @@ impl PrimaryFacts {
                     .checked_sub(input_visible)?,
             )
         });
+        let fixed = crate::savings::fixed_prompt_projection(body).map(|value| {
+            measurements.map_or_else(
+                || token_units(&value),
+                |owner| owner.visible_text_tokens(&value),
+            )
+        });
+        let measured_recent_kept = needs_floor
+            .then(|| {
+                let estimated_floor = fixed?.checked_add(retained?)?;
+                let recent = measurements?.measured_recent_suffix(
+                    body,
+                    route,
+                    resolved,
+                    native.as_ref()?.input_tokens,
+                    at,
+                    scenario.keep_recent.saturating_sub(estimated_floor),
+                )?;
+                estimated_floor.checked_add(recent)
+            })
+            .flatten();
         // Count only the protected/fixed semantic floor, never the full native
         // input. These quantities are shared prompt evidence, not forecasts.
         Self {
+            recognition_v2: true,
+            follows_native_checkpoint: false,
+            native_checkpoint_digest: None,
             prompt: None,
             configuration: receipts::configuration(body, route, resolved),
             contract: HistoryContract::extract(body, route, resolved, Scenario::default()),
@@ -206,13 +237,12 @@ impl PrimaryFacts {
             retained_visible: visible,
             retained_opaque: crate::proxy_quantity::retained_reasoning_count(&response["output"]),
             retained_member,
+            measured_recent_kept,
             estimated_retained: extra.is_some_and(|(_, n)| n > 0),
             unsupported_opaque: crate::savings::prompt_has_opaque(body)
                 && !crate::proxy_quantity::accounting_retirement_supported(body),
             allowance: body["max_output_tokens"].as_u64(),
-            fixed: crate::savings::fixed_prompt_projection(body).map(|value| {
-                measurements.map_or_else(|| token_units(&value), |m| m.visible_text_tokens(&value))
-            }),
+            fixed,
             protected: needs_floor
                 .then(|| crate::savings::protected_prompt_tokens(body))
                 .flatten(),
@@ -642,6 +672,8 @@ impl RequestEvidence {
             strict.excluded_failed_calls = numeric.excluded_failed_calls;
         }
         strict.chronological = numeric.chronological;
+        strict.trajectory_continuity_lost |= numeric.trajectory_continuity_lost;
+        strict.witnessed_prompt_policy |= numeric.witnessed_prompt_policy;
         strict.rewrites = numeric.rewrites;
         if numeric.archive_unavailable || self.numeric_lost {
             strict.chronological = None;
@@ -683,6 +715,8 @@ impl RequestEvidence {
         };
         let mut dispatched = false;
         let (mut wire, mut semantic) = (Vec::new(), Vec::new());
+        let mut awaiting_recognition = false;
+        let mut previous_prompt: Option<(usize, String)> = None;
         let mut observe = |observation: Option<&Observation>, context_complete: bool| {
             let Some(observation) = observation else {
                 if self.comparison_context.is_some() {
@@ -694,6 +728,7 @@ impl RequestEvidence {
                     dispatched = false;
                     inferred_calls = 0;
                     inferred_cost = 0.0;
+                    awaiting_recognition = false;
                 }
                 replay.prior_untracked(if prefix.is_some() { 0 } else { prior_untracked });
                 return;
@@ -725,6 +760,18 @@ impl RequestEvidence {
                         expanded.input = None;
                         expanded.semantic_input = None;
                     }
+                    if facts.recognition_v2 && awaiting_recognition {
+                        let witnessed = facts.follows_native_checkpoint
+                            || previous_prompt.as_ref().is_some_and(|(count, digest)| {
+                                *count > 0
+                                    && expanded.prompt_digest(true, *count).as_ref() == Some(digest)
+                            });
+                        replay.result.trajectory_continuity_lost |= !witnessed;
+                    }
+                    awaiting_recognition = false;
+                    previous_prompt = expanded
+                        .input_len()
+                        .and_then(|count| Some((count, expanded.prompt_digest(true, count)?)));
                     let mut projection = *restoration;
                     if infer {
                         if expanded.retained.is_none()
@@ -778,7 +825,10 @@ impl RequestEvidence {
                     rewrites.prior_unknown |= *calls > 0;
                     replay.prior_untracked(*calls);
                 }
-                Observation::Boundary => replay.reset_epoch(),
+                Observation::Boundary => {
+                    awaiting_recognition |= replay.result.coverage.primary_responses > 0;
+                    replay.reset_epoch();
+                }
             }
         };
         let context_complete = self
@@ -818,7 +868,7 @@ impl RequestEvidence {
                 initial_compactions: estimate.initial_compactions,
                 traditional_compactions: estimate.traditional_compactions,
                 summary_cost: estimate.summary_cost,
-                quantity_assumptions: "native_total_input;known_retention_else_max_visible_and_billed_output_proxy_for_reasoning_or_native_summary;missing_restoration_uses_last_known_or_zero_at_tracking_start;downward_canonical_rebase_holds_prior_quantity_with_zero_unknown_append;recognition_and_settings_changes_cool_cache_not_retired_history;same_outputs_and_tool_sequence;not_native_quantity_or_removal_authority".into(),
+                quantity_assumptions: "native_total_input;known_retention_else_max_visible_and_billed_output_proxy_for_reasoning_or_native_summary;missing_restoration_uses_last_known_or_zero_at_tracking_start;downward_canonical_rebase_holds_prior_quantity_with_zero_unknown_append;witnessed_owner_rebases_cool_cache_not_retired_history;same_outputs_and_tool_sequence;not_native_quantity_or_removal_authority".into(),
             });
         }
         if let Some(prefix) = prefix {
@@ -962,7 +1012,16 @@ impl RequestEvidence {
             measurements: None,
         });
     }
+    #[cfg(test)]
     pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
+        self.primary_settled_with_checkpoint(primary, None);
+    }
+
+    pub fn primary_settled_with_checkpoint(
+        &mut self,
+        primary: PrimaryObservation<'_>,
+        checkpoint: Option<&Value>,
+    ) {
         if primary.response["status"] != "completed" {
             self.failed_call();
             return;
@@ -987,12 +1046,31 @@ impl RequestEvidence {
                     facts.retained_visible?,
                 ))
             });
-        let facts = PrimaryFacts::extract(
+        let mut facts = PrimaryFacts::extract(
             primary,
             member,
             self.scenario,
             self.restoration.map(|e| e.tokens),
         );
+        // Only the exact validated native anchor is required on the next
+        // request. Other items from the same output are not part of admission.
+        facts.native_checkpoint_digest = checkpoint.map(hash);
+        if let Some(next) = &facts.input {
+            facts.follows_native_checkpoint = self
+                .observations
+                .iter()
+                .rev()
+                .find_map(|observation| match observation {
+                    Observation::Primary { facts, .. } => Some(facts),
+                    _ => None,
+                })
+                .is_some_and(|prior| {
+                    prior
+                        .native_checkpoint_digest
+                        .as_ref()
+                        .is_some_and(|anchor| next.contains(anchor))
+                });
+        }
         self.append(Observation::Primary {
             facts: Box::new(facts),
             restoration: self.restoration,
@@ -1295,6 +1373,154 @@ mod tests {
             serde_json::to_value(before).unwrap(),
             serde_json::to_value(restored.snapshot()).unwrap()
         );
+    }
+
+    #[test]
+    fn traditional_retirement_uses_the_same_append_quantity_as_restoration() {
+        let scenario = Scenario {
+            context_window: 4000,
+            reserve: 100,
+            keep_recent: 1500,
+            summary: 100,
+        };
+        let mut evidence = RequestEvidence {
+            scenario,
+            ..Default::default()
+        };
+        let mut measurements = crate::proxy_quantity::InputMeasurements::default();
+        let base = json!({"model":"gpt-6.1-sol", "max_output_tokens":1, "prompt_cache_options":{"mode":"explicit"}, "input":[{"role":"user","content":"initial"}]});
+        let mut full = base.clone();
+        full["input"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":"bundle result"}),
+            json!({"role":"user","content":"bundle followup"}),
+        ]);
+        let mut tail = full.clone();
+        tail["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"recent"}));
+        for (at, body, total, cached) in [
+            (1, &base, 1000, 0),
+            (2, &full, 3500, 2048),
+            (3, &tail, 6100, 0),
+        ] {
+            if at == 3 {
+                evidence = serde_json::from_slice(&serde_json::to_vec(&evidence).unwrap()).unwrap();
+                measurements =
+                    serde_json::from_slice(&serde_json::to_vec(&measurements).unwrap()).unwrap();
+                let restored = measurements
+                    .accounting_restoration(&full, &base, "route", None)
+                    .unwrap();
+                assert_eq!(restored.tokens, 2500);
+                assert!(restored.measured);
+            }
+            let response = json!({"status":"completed","output":[],"usage":{"input_tokens":total,"output_tokens":0,"input_tokens_details":{"cached_tokens":cached}}});
+            measurements.observe(body, &response["usage"], "route", None, at);
+            evidence.projected_evidence(
+                Some(crate::proxy_quantity::RestorationEstimate {
+                    tokens: 0,
+                    measured: true,
+                    estimated_opaque_items: 0,
+                }),
+                false,
+            );
+            evidence.primary_settled(PrimaryObservation {
+                body,
+                response: &response,
+                route: "route",
+                at,
+                standard: true,
+                resolved: None,
+                cost: Some(0.01),
+                measurements: Some(&measurements),
+            });
+        }
+        let estimate = evidence.snapshot();
+        assert_eq!(estimate.observed_primary_cost, Some(0.03));
+        assert_eq!(estimate.traditional_compactions, 1);
+        let fixed = measurements
+            .visible_text_tokens(&crate::savings::fixed_prompt_projection(&tail).unwrap());
+        let expected = modeled_cost(
+            "gpt-6.1-sol",
+            &Usage {
+                input_tokens: 1000 + 2500 - fixed,
+                output_tokens: scenario.summary,
+                ..Usage::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            (estimate.summary_cost - expected).abs() < 1e-12,
+            "{} != {expected}",
+            estimate.summary_cost
+        );
+    }
+
+    #[test]
+    fn same_owner_rebase_requires_a_prompt_witness_for_chronological_comparison() {
+        for witnessed in [true, false] {
+            let mut evidence = RequestEvidence {
+                scenario: Scenario {
+                    context_window: 4_000,
+                    reserve: 100,
+                    keep_recent: 1_500,
+                    summary: 100,
+                },
+                ..Default::default()
+            };
+            let mut body = json!({"model":"gpt-6.1-sol", "max_output_tokens":1, "prompt_cache_options":{"mode":"explicit"}, "input":[{"role":"user","content":"original task"}]});
+            let settle = |evidence: &mut RequestEvidence, body: &Value, native, at| {
+                let response = json!({"status":"completed","output":[],"usage":{"input_tokens":native,"output_tokens":0,"input_tokens_details":{"cached_tokens":0}}});
+                evidence.projected_evidence(
+                    Some(crate::proxy_quantity::RestorationEstimate {
+                        tokens: 0,
+                        measured: true,
+                        estimated_opaque_items: 0,
+                    }),
+                    false,
+                );
+                evidence.primary_settled(PrimaryObservation {
+                    body,
+                    response: &response,
+                    route: "route",
+                    at,
+                    standard: true,
+                    resolved: None,
+                    cost: Some(0.01),
+                    measurements: None,
+                });
+            };
+            settle(&mut evidence, &body, 1_500, 1);
+            let before = evidence.snapshot();
+            assert!(before.chronological.is_some());
+            evidence.reset_epoch();
+            body["instructions"] = json!("new settings");
+            if !witnessed {
+                body["input"][0]["content"] = json!("unrelated task");
+            }
+            body["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"more"}));
+            settle(&mut evidence, &body, 5_000, 2);
+            evidence = serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+            let after = evidence.snapshot();
+            assert_eq!(after.observed_primary_cost, Some(0.02));
+            assert_eq!(after.initial_compactions, 0);
+            if witnessed {
+                assert!(after.chronological.is_some());
+                assert_eq!(after.traditional_compactions, 1);
+                assert!(after.summary_cost > before.summary_cost);
+            } else {
+                assert!(
+                    after.chronological.is_none(),
+                    "unrelated input cannot extend a chronological comparison"
+                );
+                assert_eq!(after.traditional_cost, before.traditional_cost);
+                assert_eq!(after.summary_cost, before.summary_cost);
+            }
+        }
     }
 
     #[test]
