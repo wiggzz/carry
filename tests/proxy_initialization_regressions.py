@@ -481,6 +481,51 @@ class InitializationRegressions(support.FixtureCase):
             self.assertEqual(trajectory["traditional_compactions"], 0)
             self.assertEqual(trajectory["summary_cost"], 0.0)
 
+    def test_mixed_native_output_checkpoint_only_continuation_preserves_whole_window(self):
+        checkpoint = {"type": "compaction", "encrypted_content": "fixture_checkpoint"}
+        answer = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "not echoed"}]}
+        original = [{"role": "user", "content": "original task"}]
+        trigger = original + [{"type": "compaction_trigger"}]
+        continuation = [checkpoint, {"role": "user", "content": "continue the task"}]
+
+        def primary(_body, n):
+            return 200, support.completed([answer, checkpoint] if n == 2 else [],
+                                          f"checkpoint-continuation-{n}",
+                                          input_tokens=10000 if n < 3 else 2500)
+
+        fixture = self.fixture(primary, lambda *_: self.fail("unexpected reviewer"))
+        options = ["--review-every-requests", "100", "--review-min-primary-tokens", "1000000"]
+        proxy = support.Proxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        self.assertEqual(proxy.send(original, model="gpt-6.1-sol")[0], 200)
+        status, response = proxy.send(trigger, model="gpt-6.1-sol")
+        self.assertEqual(status, 200, response)
+        self.assertEqual(response["output"], [answer, checkpoint])
+        self.assertEqual(proxy.saved()["native_checkpoint"], [checkpoint])
+        before = support.cost_estimate(proxy)
+        self.assertIsNotNone(before["whole_window"])
+        proxy.close()
+
+        proxy = support.Proxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        status, response = proxy.send(continuation, model="gpt-6.1-sol")
+        self.assertEqual(status, 200, response)
+        self.assertEqual(fixture.primaries[-1]["input"], continuation)
+        saved = proxy.saved()["primary"]
+        self.assertEqual(saved["calls"], 3)
+        self.assertEqual(saved["input_tokens"], 22500)
+        proxy.close()
+
+        proxy = support.Proxy(self.state, fixture, options, mode="audit")
+        self.stack.callback(proxy.close)
+        after = support.cost_estimate(proxy)
+        self.assertAlmostEqual(after["observed_primary_cost"], saved["cost_usd"], places=12)
+        self.assertEqual(after["initial_compactions"], before["initial_compactions"])
+        self.assertIsNotNone(after["whole_window"], "a validated checkpoint echo preserves the comparison")
+        self.assertFalse(after["quantity_evidence"].get("trajectory_continuity_lost", False))
+        self.assertGreater(after["whole_window"]["traditional_cost"], before["whole_window"]["traditional_cost"])
+        self.assertEqual(fixture.errors, [])
+
     def test_unrelated_same_owner_history_makes_whole_window_unavailable(self):
         def primary(_body, n):
             response = support.completed(response_id=f"lost-continuity-{n}")
