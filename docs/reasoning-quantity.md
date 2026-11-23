@@ -80,9 +80,10 @@ restoration or retained-output transitions cannot grant free reinitialization or
 silently reconstruct missing historical summary/cache events.
 
 An active-history reset is distinct from a cache-only failure. A matching
-prompt prefix or a retained native compaction checkpoint can witness continuity
-at a reset. Without such a witness, the whole-window comparison is unavailable:
-Carry keeps the prior comparison subtotal and continues counting paid receipts,
+prompt prefix or an exact echo of the validated native compaction checkpoint
+can witness continuity at a reset. The client need not replay other output
+items from that response. Without such a witness, the whole-window comparison
+is unavailable: Carry keeps the prior subtotal and continues counting paid receipts,
 but neither bridges unrelated history nor grants a second free initialization.
 This rule applies to newly captured evidence, not to previously priced calls.
 

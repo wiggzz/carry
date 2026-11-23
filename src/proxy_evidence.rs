@@ -30,6 +30,8 @@ pub(super) struct PrimaryFacts {
     pub(super) recognition_v2: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     follows_native_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_checkpoint_digest: Option<String>,
     pub configuration: String,
     pub contract: HistoryContract,
     pub model: String,
@@ -206,6 +208,7 @@ impl PrimaryFacts {
         Self {
             recognition_v2: true,
             follows_native_checkpoint: false,
+            native_checkpoint_digest: None,
             prompt: None,
             configuration: receipts::configuration(body, route, resolved),
             contract: HistoryContract::extract(body, route, resolved, Scenario::default()),
@@ -1009,7 +1012,16 @@ impl RequestEvidence {
             measurements: None,
         });
     }
+    #[cfg(test)]
     pub fn primary_settled(&mut self, primary: PrimaryObservation<'_>) {
+        self.primary_settled_with_checkpoint(primary, None);
+    }
+
+    pub fn primary_settled_with_checkpoint(
+        &mut self,
+        primary: PrimaryObservation<'_>,
+        checkpoint: Option<&Value>,
+    ) {
         if primary.response["status"] != "completed" {
             self.failed_call();
             return;
@@ -1040,7 +1052,10 @@ impl RequestEvidence {
             self.scenario,
             self.restoration.map(|e| e.tokens),
         );
-        if let Some(next) = &facts.semantic_input {
+        // Only the exact validated native anchor is required on the next
+        // request. Other items from the same output are not part of admission.
+        facts.native_checkpoint_digest = checkpoint.map(hash);
+        if let Some(next) = &facts.input {
             facts.follows_native_checkpoint = self
                 .observations
                 .iter()
@@ -1050,11 +1065,10 @@ impl RequestEvidence {
                     _ => None,
                 })
                 .is_some_and(|prior| {
-                    prior.native_summary
-                        && prior.semantic_output.as_ref().is_some_and(|output| {
-                            !output.is_empty()
-                                && next.windows(output.len()).any(|window| window == output)
-                        })
+                    prior
+                        .native_checkpoint_digest
+                        .as_ref()
+                        .is_some_and(|anchor| next.contains(anchor))
                 });
         }
         self.append(Observation::Primary {

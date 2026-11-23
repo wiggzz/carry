@@ -4599,22 +4599,28 @@ async fn relay(
                 &commit.outbound,
                 status.is_success() && complete_transport && standard(&commit.outbound),
             );
-            let completed = observed.as_ref().is_some_and(|v| {
-                if commit.native {
-                    // Native V1 may omit status; V2 still requires its real
-                    // completed terminal. Neither a normal answer nor zero or
-                    // multiple anchors can advance a native checkpoint epoch.
-                    v.get("status").is_none_or(|status| status == "completed")
-                        && v["output"].as_array().is_some_and(|out| {
-                            out.iter()
-                                .filter(|item| item["type"] == "compaction")
-                                .count()
-                                == 1
-                        })
-                } else {
-                    v["status"] == "completed"
-                }
-            });
+            // Native V1 may omit status; V2 still requires its real completed
+            // terminal. Select exactly the one anchor admission will retain.
+            let checkpoint = observed
+                .as_ref()
+                .filter(|v| {
+                    commit.native && v.get("status").is_none_or(|status| status == "completed")
+                })
+                .and_then(|v| {
+                    let mut anchors = v["output"]
+                        .as_array()?
+                        .iter()
+                        .filter(|item| item["type"] == "compaction");
+                    let anchor = anchors.next()?;
+                    anchors.next().is_none().then_some(anchor)
+                });
+            let completed = if commit.native {
+                checkpoint.is_some()
+            } else {
+                observed
+                    .as_ref()
+                    .is_some_and(|v| v["status"] == "completed")
+            };
             if complete_transport && status.is_success() && completed {
                 commit.candidate.primary_pending = false;
                 commit.candidate.last_failure = None;
@@ -4664,27 +4670,24 @@ async fn relay(
                     } else {
                         value
                     };
-                    trajectory.primary_settled(crate::proxy_savings::PrimaryObservation {
-                        body: &commit.outbound,
-                        response,
-                        measurements: Some(&commit.candidate.primary_input),
-                        route: &commit.service.config.upstream_url,
-                        at: commit.dispatched_at,
-                        standard: standard(&commit.outbound)
-                            && value.get("service_tier").is_none_or(|v| v == "default"),
-                        resolved,
-                        cost: settled,
-                    });
+                    trajectory.primary_settled_with_checkpoint(
+                        crate::proxy_savings::PrimaryObservation {
+                            body: &commit.outbound,
+                            response,
+                            measurements: Some(&commit.candidate.primary_input),
+                            route: &commit.service.config.upstream_url,
+                            at: commit.dispatched_at,
+                            standard: standard(&commit.outbound)
+                                && value.get("service_tier").is_none_or(|v| v == "default"),
+                            resolved,
+                            cost: settled,
+                        },
+                        checkpoint,
+                    );
                 }
-                if commit.native {
+                if let Some(checkpoint) = checkpoint {
                     commit.candidate.reset_active();
-                    commit.candidate.native_checkpoint = value["output"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|item| item["type"] == "compaction")
-                        .cloned()
-                        .collect();
+                    commit.candidate.native_checkpoint = vec![checkpoint.clone()];
                     commit.candidate.native_compactions += 1;
                 } else {
                     for item in &mut commit.candidate.history {

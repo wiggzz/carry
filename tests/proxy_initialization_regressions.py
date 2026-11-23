@@ -508,6 +508,9 @@ class InitializationRegressions(support.FixtureCase):
 
         proxy = support.Proxy(self.state, fixture, options, mode="audit")
         self.stack.callback(proxy.close)
+        wrong_checkpoint = {**checkpoint, "encrypted_content": "unrelated_checkpoint"}
+        self.assertEqual(proxy.send([wrong_checkpoint, continuation[1]], model="gpt-6.1-sol")[0], 409)
+        self.assertEqual(len(fixture.primaries), 2, "an unrelated checkpoint must not reach the provider")
         status, response = proxy.send(continuation, model="gpt-6.1-sol")
         self.assertEqual(status, 200, response)
         self.assertEqual(fixture.primaries[-1]["input"], continuation)
