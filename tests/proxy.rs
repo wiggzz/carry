@@ -144,8 +144,8 @@ fn marginal_planner_preserves_cheaper_valid_warm_projection() {
     // method outcomes alongside independently uploaded synthetic wire data.
     std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
     if !output.status.success() {
-        let captured = output_directory
-            .join("test_tiny_edit_competes_with_valid_cold_continuation.json");
+        let captured =
+            output_directory.join("test_tiny_edit_competes_with_valid_cold_continuation.json");
         if let Ok(bytes) = std::fs::read(captured) {
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             eprintln!(
@@ -860,6 +860,7 @@ fn private_numeric_journal(bytes: &[u8], saved: &serde_json::Value, completed: u
                     refs.clone()
                 };
                 let expected_facts = json!({
+                    "recognition_v2":true,
                     "configuration": facts["configuration"],
                     "contract": {"version":1,"quantity":"ProviderRequestInputTotalV1",
                         "projection":"ReceiptBlocksOrVisibleTextV2","model":"fixture-model",

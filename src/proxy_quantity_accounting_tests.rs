@@ -12,59 +12,174 @@ fn observe(m: &mut InputMeasurements, body: &Value, input: u64, at: u64) {
 }
 
 #[test]
-fn measured_blocks_preserve_newest_disjoint_coverage_and_zero_quantities() {
-    let item = |id: &str| Item {
-        identity: id.into(),
-        opaque: true,
-    };
-    let block = |ids: &[&str], input| MeasuredBlock {
-        items: ids.iter().map(|id| (*id).into()).collect(),
-        input,
-        allocation: None,
-        opaque: true,
-    };
-    let items = [item("a"), item("b"), item("c")];
-    let changed = items.iter().collect::<Vec<_>>();
-    let mut m = InputMeasurements::default();
-    m.blocks.extend([
-        block(&["a", "b"], 900),
-        block(&["c"], 7),
-        block(&["b", "c"], 30),
+fn measured_append_belongs_to_its_original_prefix_even_after_restart() {
+    let base = request(vec![json!({"role":"user","content":"original"})]);
+    let full = request(vec![
+        base["input"][0].clone(),
+        json!({"role":"assistant","content":"result"}),
+        json!({"role":"user","content":"continue"}),
     ]);
-    assert!(!m.fully_measured(&changed));
-    assert_eq!(m.changed_quantity(&changed, &[], true, false), None);
-    m.blocks.push_back(block(&["a"], 5));
-    // Empty/oversized blocks do not match; overlapping older blocks cannot
-    // donate their totals after newer evidence has claimed an occurrence.
-    m.blocks.push_back(block(&[], 1000));
-    m.blocks.push_back(block(&["a", "b", "c", "d"], 1000));
-    for m in [
-        m.clone(),
-        serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap(),
-    ] {
-        assert!(m.fully_measured(&changed));
-        assert_eq!(
-            m.changed_quantity(&changed, &[], true, false),
-            Some((35, true))
+    let mut other_full = full.clone();
+    other_full["input"][0]["content"] = json!("different start");
+    let other_base = request(vec![other_full["input"][0].clone()]);
+    let mut measurements = InputMeasurements::default();
+    for (at, body, total, cached) in [(1, &base, 2000, 0), (2, &full, 5000, 4096)] {
+        measurements.observe(
+            body,
+            &json!({"input_tokens":total,"input_tokens_details":{"cached_tokens":cached}}),
+            "route",
+            None,
+            at,
         );
-        assert_eq!(m.changed_quantity(&changed, &[], false, false), None);
-        assert_eq!(m.changed_quantity(&[], &[], true, false), Some((0, false)));
     }
-    let repeated = [&items[0], &items[0]];
-    let mut m = InputMeasurements::default();
-    m.blocks.push_back(block(&["a"], 0));
-    assert_eq!(
-        m.changed_quantity(&repeated[..1], &[], true, false),
-        Some((0, true))
+    let restarted: InputMeasurements =
+        serde_json::from_value(serde_json::to_value(measurements).unwrap()).unwrap();
+    let recognized = restarted
+        .accounting_restoration(&full, &base, "route", None)
+        .unwrap();
+    assert!(recognized.measured);
+    assert_eq!(recognized.tokens, 3000);
+    let misplaced = restarted
+        .accounting_restoration(&other_full, &other_base, "route", None)
+        .unwrap();
+    assert!(
+        !misplaced.measured,
+        "the same contents do not prove the same occurrence"
     );
-    assert!(!m.fully_measured(&repeated));
-    assert_eq!(m.changed_quantity(&repeated, &[], true, false), None);
-    m.blocks.push_back(block(&["a"], 8));
-    assert!(m.fully_measured(&repeated));
-    assert_eq!(
-        m.changed_quantity(&repeated, &[], true, false),
-        Some((8, true))
+    assert_ne!(misplaced.tokens, 3000);
+}
+
+#[test]
+fn a_success_without_input_usage_breaks_the_measurement_interval() {
+    let base = request(vec![json!({"role":"user","content":"base"})]);
+    let middle = request(vec![
+        base["input"][0].clone(),
+        json!({"role":"assistant","content":"result"}),
+    ]);
+    let full = request(vec![
+        middle["input"][0].clone(),
+        middle["input"][1].clone(),
+        json!({"role":"user","content":"continue"}),
+    ]);
+    let mut measurements = InputMeasurements::default();
+    observe(&mut measurements, &base, 2000, 1);
+    measurements.observe(&middle, &json!({}), "route", None, 2);
+    observe(&mut measurements, &full, 5000, 3);
+    let restoration = measurements
+        .accounting_restoration(&full, &base, "route", None)
+        .unwrap();
+    assert!(!restoration.measured);
+    assert_ne!(restoration.tokens, 3000);
+}
+
+#[test]
+fn rewinding_revokes_descendant_bundles_but_preserves_shared_prefix_evidence() {
+    let base = request(vec![json!({"role":"user", "content":"base"})]);
+    let mut shared = base.clone();
+    shared["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user", "content":"shared"}));
+    let mut old_branch = shared.clone();
+    old_branch["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"assistant", "content":"old branch"}));
+    let mut new_branch = shared.clone();
+    new_branch["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"assistant", "content":"new branch"}));
+    let mut measurements = InputMeasurements::default();
+    for (at, body, input) in [
+        (1, &base, 1000),
+        (2, &shared, 2000),
+        (3, &old_branch, 5000),
+        (4, &shared, 2000),
+        (5, &new_branch, 7000),
+    ] {
+        observe(&mut measurements, body, input, at);
+    }
+    let common = measurements
+        .accounting_restoration(&shared, &base, "route", None)
+        .unwrap();
+    assert!(common.measured);
+    assert_eq!(common.tokens, 1000);
+    assert!(
+        !measurements
+            .accounting_restoration(&old_branch, &shared, "route", None)
+            .unwrap()
+            .measured
     );
+    assert_eq!(
+        measurements
+            .accounting_restoration(&new_branch, &shared, "route", None)
+            .unwrap()
+            .tokens,
+        5000
+    );
+}
+
+#[test]
+fn oldest_bundle_expires_without_expiring_recent_receipts() {
+    let base = request(vec![json!({"role":"user", "content":"base"})]);
+    let mut measurements = InputMeasurements::default();
+    observe(&mut measurements, &base, 1000, 1);
+    let mut full = base.clone();
+    for count in 1..=129 {
+        full["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user", "content":format!("item {count}")}));
+        observe(&mut measurements, &full, 1000 + count * 100, count + 1);
+    }
+    let mut oldest = full.clone();
+    oldest["input"].as_array_mut().unwrap().truncate(2);
+    let mut previous = full.clone();
+    previous["input"].as_array_mut().unwrap().pop();
+    let measurements: InputMeasurements =
+        serde_json::from_slice(&serde_json::to_vec(&measurements).unwrap()).unwrap();
+    assert!(
+        !measurements
+            .accounting_restoration(&oldest, &base, "route", None)
+            .unwrap()
+            .measured
+    );
+    assert_eq!(
+        measurements
+            .accounting_restoration(&full, &previous, "route", None)
+            .unwrap()
+            .tokens,
+        100
+    );
+}
+
+#[test]
+fn measured_blocks_preserve_newest_disjoint_coverage_and_zero_quantities() {
+    let base = request(vec![json!({"role":"user","content":"task"})]);
+    let member = json!({"role":"assistant","content":"same content"});
+    let mut full = base.clone();
+    full["input"].as_array_mut().unwrap().push(member.clone());
+    let mut measurements = InputMeasurements::default();
+    observe(&mut measurements, &base, 100, 1);
+    observe(&mut measurements, &full, 100, 2);
+    let zero = measurements
+        .accounting_restoration(&full, &base, "route", None)
+        .unwrap();
+    assert!(zero.measured);
+    assert_eq!(zero.tokens, 0);
+    let once = full.clone();
+    full["input"].as_array_mut().unwrap().push(member);
+    observe(&mut measurements, &full, 200, 3);
+    let both = measurements
+        .accounting_restoration(&full, &base, "route", None)
+        .unwrap();
+    assert!(both.measured);
+    assert_eq!(both.tokens, 100);
+    let ambiguous = measurements
+        .accounting_restoration(&full, &once, "route", None)
+        .unwrap();
+    assert!(!ambiguous.measured);
 }
 
 #[test]

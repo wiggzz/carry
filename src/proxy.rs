@@ -2004,6 +2004,7 @@ struct Commit {
     // compaction can clear the latter before this observation is committed.
     observed_input: Vec<Value>,
     outbound: Value,
+    primary_edited: bool,
     native: bool,
     dispatched_at: u64,
     _history_pin: history::Pin,
@@ -2654,6 +2655,7 @@ async fn prepare_primary(
             reviewed,
             observed_input: body["input"].as_array().cloned().unwrap_or_default(),
             outbound: outbound.clone(),
+            primary_edited,
             native,
             dispatched_at: now(),
             _history_pin: history_pin,
@@ -4648,22 +4650,28 @@ async fn relay(
                 &commit.outbound,
                 status.is_success() && complete_transport && standard(&commit.outbound),
             );
-            let completed = observed.as_ref().is_some_and(|v| {
-                if commit.native {
-                    // Native V1 may omit status; V2 still requires its real
-                    // completed terminal. Neither a normal answer nor zero or
-                    // multiple anchors can advance a native checkpoint epoch.
-                    v.get("status").is_none_or(|status| status == "completed")
-                        && v["output"].as_array().is_some_and(|out| {
-                            out.iter()
-                                .filter(|item| item["type"] == "compaction")
-                                .count()
-                                == 1
-                        })
-                } else {
-                    v["status"] == "completed"
-                }
-            });
+            // Native V1 may omit status; V2 still requires its real completed
+            // terminal. Select exactly the one anchor admission will retain.
+            let checkpoint = observed
+                .as_ref()
+                .filter(|v| {
+                    commit.native && v.get("status").is_none_or(|status| status == "completed")
+                })
+                .and_then(|v| {
+                    let mut anchors = v["output"]
+                        .as_array()?
+                        .iter()
+                        .filter(|item| item["type"] == "compaction");
+                    let anchor = anchors.next()?;
+                    anchors.next().is_none().then_some(anchor)
+                });
+            let completed = if commit.native {
+                checkpoint.is_some()
+            } else {
+                observed
+                    .as_ref()
+                    .is_some_and(|v| v["status"] == "completed")
+            };
             if complete_transport && status.is_success() && completed {
                 commit.candidate.primary_pending = false;
                 commit.candidate.last_failure = None;
@@ -4693,12 +4701,13 @@ async fn relay(
                     ),
                 );
                 if !commit.native {
-                    commit.candidate.primary_input.observe(
+                    commit.candidate.primary_input.observe_primary(
                         &commit.outbound,
                         &value["usage"],
                         &commit.service.config.upstream_url,
                         resolved,
                         commit.dispatched_at,
+                        commit.primary_edited,
                     );
                 }
                 if let Some(trajectory) = &mut commit.candidate.request_evidence {
@@ -4731,17 +4740,12 @@ async fn relay(
                             )
                             .class
                         }),
+                        checkpoint,
                     );
                 }
-                if commit.native {
+                if let Some(checkpoint) = checkpoint {
                     commit.candidate.reset_active();
-                    commit.candidate.native_checkpoint = value["output"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|item| item["type"] == "compaction")
-                        .cloned()
-                        .collect();
+                    commit.candidate.native_checkpoint = vec![checkpoint.clone()];
                     commit.candidate.native_compactions += 1;
                 } else {
                     for item in &mut commit.candidate.history {

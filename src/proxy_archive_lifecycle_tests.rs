@@ -245,6 +245,7 @@ async fn archive_sync_reviewer_stale_reservation_and_primary_fault_preserve_comm
                 reviewed: session,
                 observed_input: outbound["input"].as_array().unwrap().clone(),
                 outbound,
+                primary_edited: false,
                 native: false,
                 dispatched_at: now(),
                 _history_pin: history::pin(&service, &id).unwrap(),

@@ -190,6 +190,7 @@ impl Replay {
         let at = body.at;
         let resolved = body.resolved.as_ref();
         let settled = body.cost;
+        self.result.witnessed_prompt_policy |= body.recognition_v2;
         if self.receipts.initialization_policy_version != Some(1) {
             // The legacy window is an immutable cumulative boundary, not an
             // additive ledger. Begin only future comparisons with the new rule.
@@ -248,6 +249,11 @@ impl Replay {
         }
         let model = body.model.as_str();
         let (native, observed, billable) = self.record_primary_observation(body, settled);
+        if self.result.trajectory_continuity_lost {
+            self.result.coverage.unavailable_quantity_calls += 1;
+            self.result.excluded_unpriced_calls += 1;
+            return;
+        }
         if self.chronological
             && self.projection_known
             && let Some(native) = &native
@@ -663,7 +669,22 @@ impl Replay {
             .scenario
             .response_compaction(traditional, retained_output, fixed)
         {
-            Ok(kept) => kept,
+            Ok(kept) => kept.map(|estimated| {
+                body.measured_recent_kept
+                    .filter(|retained| {
+                        history_compatible
+                            && self.restored == 0
+                            && !self.carry_edited
+                            && *retained >= estimated
+                            && retained.saturating_add(self.scenario.summary) < total
+                            && retained.saturating_add(self.scenario.summary)
+                                <= self
+                                    .scenario
+                                    .context_window
+                                    .saturating_sub(self.scenario.reserve)
+                    })
+                    .unwrap_or(estimated)
+            }),
             Err(()) => {
                 self.result.excluded_unpriced_calls += 1;
                 self.reset_epoch();

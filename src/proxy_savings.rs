@@ -113,6 +113,10 @@ pub struct Estimate {
     /// Read-time archive integrity failure, not an invented missing call.
     #[serde(skip)]
     pub archive_unavailable: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trajectory_continuity_lost: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub witnessed_prompt_policy: bool,
     #[serde(default)]
     pub quantity_policy_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,7 +248,7 @@ impl Estimate {
     /// missing requests by expense parity or a reference cost ratio.
     fn whole_window(&self) -> Option<WholeWindowEstimate> {
         let evidence = self;
-        if evidence.archive_unavailable {
+        if evidence.archive_unavailable || evidence.trajectory_continuity_lost {
             return None;
         }
         let calls = evidence.coverage.primary_responses;
@@ -354,6 +358,13 @@ impl Estimate {
         });
         if self.archive_unavailable {
             quantity_evidence["numeric_archive_unavailable"] = json!(true);
+        }
+        if self.trajectory_continuity_lost {
+            quantity_evidence["trajectory_continuity_lost"] = json!(true);
+        }
+        if self.witnessed_prompt_policy {
+            quantity_evidence["prompt_provenance_policy"] =
+                json!("ordered_receipt_bundles_and_witnessed_rebases_v2_prospective");
         }
         let whole_window = self.whole_window();
         DashboardEstimate {
