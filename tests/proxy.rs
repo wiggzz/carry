@@ -145,7 +145,7 @@ fn marginal_planner_preserves_cheaper_valid_warm_projection() {
     std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
     if !output.status.success() {
         let captured = output_directory
-            .join("test_tiny_edit_cannot_beat_a_cheaper_valid_warm_continuation.json");
+            .join("test_tiny_edit_competes_with_valid_cold_continuation.json");
         if let Ok(bytes) = std::fs::read(captured) {
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             eprintln!(
