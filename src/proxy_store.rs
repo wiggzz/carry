@@ -542,6 +542,40 @@ impl Store {
             self.pins.contains(&owner) || at > self.at || self.at - at < self.policy.age
         }))
     }
+    pub(super) fn dashboard_validity(&self) -> std::io::Result<dashboard_cache::Validity> {
+        let mut expires_at = None;
+        // These are the age-dependent reads used by dashboard projections.
+        // Indexed min(at) seeks avoid decoding any history/accounting payloads.
+        // Pinned rows can cause an early rebuild, but never extend cache life.
+        for (kind, lifetime) in [
+            ("owners", self.policy.age),
+            ("snapshots", self.policy.age),
+            ("reviews", self.policy.age),
+            // Accounting uses an inclusive cutoff; raw live() is exclusive.
+            ("accounting", self.policy.accounting_age.saturating_add(1)),
+        ] {
+            let first: Option<u64> = self
+                .connection
+                .query_row(
+                    "SELECT min(at) FROM records WHERE kind=?1 AND at>=?2",
+                    params![
+                        kind,
+                        self.at
+                            .checked_sub(lifetime)
+                            .map_or(0, |cutoff| cutoff.saturating_add(1))
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(error)?;
+            if let Some(expiry) = first.and_then(|at| at.checked_add(lifetime)) {
+                expires_at = Some(expires_at.map_or(expiry, |prior: u64| prior.min(expiry)));
+            }
+        }
+        Ok(dashboard_cache::Validity {
+            built_at: self.at,
+            expires_at,
+        })
+    }
     pub(super) fn contains(&self, kind: &str, key: &str) -> std::io::Result<bool> {
         if self
             .pending
@@ -1148,6 +1182,7 @@ mod initialization_admission_tests {
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
             text_quantities: Default::default(),
+            dashboard_cache: Default::default(),
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
         };
         let owner = Store::open(&service, HashSet::new(), true).unwrap();

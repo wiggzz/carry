@@ -203,6 +203,7 @@ struct Service {
     locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     background_reviews: Arc<Mutex<HashSet<String>>>,
     text_quantities: crate::proxy_quantity::TextMemo,
+    dashboard_cache: Arc<Mutex<Option<dashboard_cache::Snapshot>>>,
     // Advice authority belongs to the live worker, independently of whether a
     // changed-direction checkpoint can be published. Cleared on settlement.
     #[cfg(test)]
@@ -224,6 +225,8 @@ use planning::plan;
 #[path = "proxy_log.rs"]
 mod logging;
 use logging::journal;
+#[path = "proxy_dashboard_cache.rs"]
+mod dashboard_cache;
 #[path = "proxy_timing.rs"]
 mod timing;
 
@@ -422,6 +425,7 @@ pub async fn serve(mut config: ProxyCli) -> Result<()> {
         locks: Arc::new(Mutex::new(HashMap::new())),
         background_reviews: Arc::new(Mutex::new(HashSet::new())),
         text_quantities: Default::default(),
+        dashboard_cache: Default::default(),
         #[cfg(test)]
         lock_waits: Arc::new(std::sync::Mutex::new(None)),
         _directory_lock: Arc::new(directory_lock),
@@ -1684,6 +1688,59 @@ async fn dashboard_stats(
     authorize_dashboard(&service, &headers, peer)?;
     let after = page.after()?;
     let limit = page.limit.unwrap_or(20).clamp(1, 100);
+    // One bounded page per Service; the mutex also coalesces concurrent polls.
+    // Authorization and cursor validation always precede cached data access.
+    let mut cache = service.dashboard_cache.lock().await;
+    let revision = dashboard_cache::revision(&service).ok();
+    let at = now();
+    let mut data = if let Some(snapshot) = cache
+        .as_ref()
+        .filter(|s| s.matches(revision, &after, limit, at))
+    {
+        snapshot.data.clone()
+    } else {
+        *cache = None;
+        let (data, validity) = build_dashboard_stats(&service, &after, limit)?;
+        // Do not publish a page built across a source change. A subsequent poll
+        // rebuilds it from the new authority rather than caching a mixed view.
+        if let Some(revision) = revision
+            && dashboard_cache::revision(&service).ok() == Some(revision)
+            && let Some(validity) = validity
+        {
+            *cache = Some(dashboard_cache::Snapshot {
+                revision,
+                after: after.clone(),
+                limit,
+                validity,
+                data: data.clone(),
+            });
+        }
+        data
+    };
+    drop(cache);
+    // Processing is live lock state, independent of persisted dashboard data.
+    let locks = service.locks.lock().await;
+    for row in data["sessions"].as_array_mut().unwrap() {
+        row["processing"] = json!(
+            locks
+                .get(row["id"].as_str().unwrap())
+                .and_then(Weak::upgrade)
+                .is_some_and(|lock| lock.try_lock().is_err())
+        );
+    }
+    drop(locks);
+    let mut response = axum::Json(data).into_response();
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    Ok(response)
+}
+
+fn build_dashboard_stats(
+    service: &Service,
+    after: &Option<SessionOrder>,
+    limit: usize,
+) -> Result<(Value, Option<dashboard_cache::Validity>), Failure> {
     // Select by authoritative primary activity during the existing numeric
     // accounting scan. Keep only limit+1 keys before restoring raw histories.
     // Missing dispatch times sort last; IDs break ties deterministically.
@@ -1696,7 +1753,11 @@ async fn dashboard_stats(
     })?;
     let mut unavailable_sessions = 0u64;
     let mut unavailable_accounting = 0u64;
-    let history = history::ReadView::new(&service);
+    let history = history::ReadView::new(service);
+    let validity = history
+        .as_ref()
+        .ok()
+        .and_then(|v| v.dashboard_validity().ok());
     let (mut cost_estimate, mut usage) = match &history {
         Ok(view) => view.expired_accounting_totals().map_err(|_| {
             failure(
@@ -1741,7 +1802,7 @@ async fn dashboard_stats(
             })?,
             Err(_) => false,
         };
-        let Ok(accounting) = load_dashboard_accounting(&service, id, &history) else {
+        let Ok(accounting) = load_dashboard_accounting(service, id, &history) else {
             unavailable_sessions += 1;
             unavailable_accounting += u64::from(!frozen_accounted);
             continue;
@@ -1836,7 +1897,7 @@ async fn dashboard_stats(
     for (order, entry) in selected {
         let path = entry.path();
         let id = path.file_stem().and_then(|s| s.to_str()).unwrap();
-        let Ok(mut session) = load_dashboard_session(&service, id, &history) else {
+        let Ok(mut session) = load_dashboard_session(service, id, &history) else {
             unavailable_sessions += 1;
             continue;
         };
@@ -1898,15 +1959,8 @@ async fn dashboard_stats(
             .and_then(|m| m.modified().ok())
             .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
             .map(|age| age.as_secs());
-        let processing = service
-            .locks
-            .lock()
-            .await
-            .get(id)
-            .and_then(Weak::upgrade)
-            .is_some_and(|lock| lock.try_lock().is_err());
         let row = json!({
-            "updated_at": updated_at, "processing": processing,
+            "updated_at": updated_at, "processing": false,
             "last_failure": dashboard_current_failure(&session), "planner": planner,
             "id": id, "title": session.title(), "primary": session.primary, "shadow": session.shadow,
             "client": session.client,
@@ -1946,11 +2000,7 @@ async fn dashboard_stats(
     data["sessions"] = json!(sessions);
     data["unavailable_sessions"] = json!(unavailable_sessions);
     data["session_page"] = json!({"has_more":has_more,"next_after":next_after});
-    let mut response = axum::Json(data).into_response();
-    response
-        .headers_mut()
-        .insert("cache-control", "no-store".parse().unwrap());
-    Ok(response)
+    Ok((data, validity))
 }
 
 fn standard(body: &Value) -> bool {
@@ -4918,6 +4968,7 @@ mod tests {
             locks: Arc::new(Mutex::new(HashMap::new())),
             background_reviews: Arc::new(Mutex::new(HashSet::new())),
             text_quantities: Default::default(),
+            dashboard_cache: Default::default(),
             #[cfg(test)]
             lock_waits: Arc::new(std::sync::Mutex::new(None)),
         }
