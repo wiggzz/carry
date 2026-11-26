@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.22.0](https://github.com/wiggzz/carry/compare/v0.21.3...v0.22.0) (2026-11-26)
+
+
+### Features
+
+* **bench:** pair native Codex with Carry on official tasks ([#221](https://github.com/wiggzz/carry/issues/221)) ([898cbdb](https://github.com/wiggzz/carry/commit/898cbdbbee8197ce01ca11765492ca56b41c63b8))
+* **bench:** support replicated multi-problem SCB cohorts ([#231](https://github.com/wiggzz/carry/issues/231)) ([1a06a6a](https://github.com/wiggzz/carry/commit/1a06a6aa607ed3c48377e5ddae55c789393ffe49))
+* **models:** support GPT-6.2 Sol and Astra ([#235](https://github.com/wiggzz/carry/issues/235)) ([7f5d211](https://github.com/wiggzz/carry/commit/7f5d211537b271194a513d9c4f4b380e01383d53))
+* **proxy:** show reviewer-generated conversation titles ([#237](https://github.com/wiggzz/carry/issues/237)) ([28e51de](https://github.com/wiggzz/carry/commit/28e51de29169e658f10282c0a76c732efce9b960))
+
+
+### Bug Fixes
+
+* **dashboard:** avoid repeated retained-accounting scans ([#234](https://github.com/wiggzz/carry/issues/234)) ([0bbbf38](https://github.com/wiggzz/carry/commit/0bbbf385e63c63eaf8fc31283b4ccd22cfc1818f))
+* **dashboard:** simplify session list and correct savings accounting ([#240](https://github.com/wiggzz/carry/issues/240)) ([51f27d7](https://github.com/wiggzz/carry/commit/51f27d75b101a3b002e2af34de3c657463ad5fb1))
+* **proxy:** keep inference available when local storage fails ([#233](https://github.com/wiggzz/carry/issues/233)) ([aefaea1](https://github.com/wiggzz/carry/commit/aefaea139cbcd8eeba6e6a942d174f97398ae0c7))
+* **proxy:** keep reviewer titles until the task changes ([#241](https://github.com/wiggzz/carry/issues/241)) ([243bd93](https://github.com/wiggzz/carry/commit/243bd93e445b9ff6f3e0c30d71b238157e18cb2c))
+* **proxy:** reject replacement memories that do not shrink their sources ([#238](https://github.com/wiggzz/carry/issues/238)) ([31b34f3](https://github.com/wiggzz/carry/commit/31b34f327bd715a13772869a6c8e580022db51a8))
+* **savings:** bind append quantities and preserve window continuity ([#242](https://github.com/wiggzz/carry/issues/242)) ([252c2f2](https://github.com/wiggzz/carry/commit/252c2f2b1d4a72adee27c779af8c5d75317e3d6f))
+* **storage:** reuse bounded SQLite overflow pages ([#236](https://github.com/wiggzz/carry/issues/236)) ([3ac401f](https://github.com/wiggzz/carry/commit/3ac401f5958929667969d55a5f3ce56b6b25ba9b))
+
+
+### Performance Improvements
+
+* **dashboard:** cache unchanged proxy dashboard lookups ([#244](https://github.com/wiggzz/carry/issues/244)) ([de901aa](https://github.com/wiggzz/carry/commit/de901aa41ca8be95097e844b6f1e1303c53d0309))
+
 ## [0.21.3](https://github.com/wiggzz/carry/compare/v0.21.2...v0.21.3) (2026-11-13)
 
 
