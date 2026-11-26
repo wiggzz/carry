@@ -31,7 +31,7 @@ class CacheWriteRegressions(support.FixtureCase):
                     path = next(self.state.glob("*.json"))
                     saved = json.loads(path.read_text())
                     # Future version is fixture metadata, not an implemented tariff.
-                    saved["model_resolution"]["primary"]["scenario_cache_policy"]["version"] = 3
+                    saved["model_resolution"]["primary"]["scenario_cache_policy"]["version"] = 4
                     path.write_text(json.dumps(saved))
                 history.append({"role": "user", "content": f"append {index}"})
             proxy = support.Proxy(self.state, fixture, mode="audit",
@@ -56,7 +56,7 @@ class CacheWriteRegressions(support.FixtureCase):
 
     def assert_summary_survives_policy(self, snapshots, *, migrate):
         first, second, third = snapshots
-        self.assertAlmostEqual(first['estimate']['traditional_cost'], 21000 * 2.5 / 1e6, places=12)
+        self.assertAlmostEqual(first['estimate']['traditional_cost'], 21000 * 2 / 1e6, places=12)
         self.assertEqual(next(o['Primary']['facts']['native']['input_tokens'] for o in first['evidence']['observations'] if isinstance(o, dict) and 'Primary' in o), 300000)
         for index, snapshot in enumerate(snapshots):
             estimate = snapshot["estimate"]
@@ -72,15 +72,15 @@ class CacheWriteRegressions(support.FixtureCase):
         # Free initialization precedes the first primary, so its next append is
         # warm unless the policy changes. The transition alone makes it cold.
         self.assertAlmostEqual(second["estimate"]["traditional_cost"] - first["estimate"]["traditional_cost"],
-                               (21100 * 2.5 if migrate else 21000 * 0.1 + 100 * 2.5) / 1e6,
+                               (21100 * 2 if migrate else 21000 * 0.1 + 100 * 2) / 1e6,
                                places=12)
         self.assertAlmostEqual(third["estimate"]["traditional_cost"] - second["estimate"]["traditional_cost"],
-                               (21100 * 0.1 + 100 * 2.5) / 1e6, places=12)
+                               (21100 * 0.1 + 100 * 2) / 1e6, places=12)
         boundaries = second["estimate"]["cache_policy_boundaries"]
         self.assertEqual(len(boundaries), int(migrate))
         if migrate:
-            self.assertEqual(boundaries[0]["previous_version"], 2)
-            self.assertEqual(boundaries[0]["next_version"], 3)
+            self.assertEqual(boundaries[0]["previous_version"], 3)
+            self.assertEqual(boundaries[0]["next_version"], 4)
             self.assertEqual(boundaries[0]["cumulative"]["traditional_cost"], first["estimate"]["traditional_cost"])
             self.assertEqual(third["estimate"]["cache_policy_boundaries"], boundaries)
 
@@ -103,9 +103,9 @@ class CacheWriteRegressions(support.FixtureCase):
         # The summarized branch is already warm before the transition. Thus its
         # cold request cannot be explained by traditional_edited from a summary.
         for index, expected in [
-            (2, (21100 * 0.1 + 100 * 2.5) / 1e6),
-            (3, 21300 * 2.5 / 1e6),
-            (4, (21300 * 0.1 + 100 * 2.5) / 1e6),
+            (2, (21100 * 0.1 + 100 * 2) / 1e6),
+            (3, 21300 * 2 / 1e6),
+            (4, (21300 * 0.1 + 100 * 2) / 1e6),
         ]:
             self.assertAlmostEqual(
                 snapshots[index]["estimate"]["traditional_cost"]
@@ -363,12 +363,13 @@ class CacheWriteRegressions(support.FixtureCase):
                     cached = 300000 if mode == "implicit" and index > 1 else 0
                     written = incoming-cached if mode == "implicit" and incoming >= 1024 else 0
                     ordinary, read, write, output = (4, .2, 5, 15) if incoming > 272000 else (2, .1, 2.5, 10)
-                    actual += ((incoming-cached-written)*ordinary+cached*read+written*write+100*output)/1e6
+                    primary_charge = ((incoming-cached-written)*ordinary+cached*read+written*write+100*output)/1e6
+                    actual += primary_charge
                     alt = [1000, 300000, 1700, 1800][index]
                     alt_cached = 1700 if mode == "implicit" and index == 3 else 0
-                    alt_written = alt-alt_cached if mode == "implicit" and alt >= 1024 else 0
-                    ordinary, read, write, output = (4, .2, 5, 15) if alt > 272000 else (2, .1, 2.5, 10)
-                    traditional += ((alt-alt_cached-alt_written)*ordinary+alt_cached*read+alt_written*write+100*output)/1e6
+                    ordinary, read, output = (4, .2, 15) if alt > 272000 else (2, .1, 10)
+                    traditional += (((alt-alt_cached)*ordinary+alt_cached*read+100*output)/1e6
+                                    if index > 1 else primary_charge)
                     if index == 1:
                         summary = (298500*4+100*15)/1e6
                         traditional += summary

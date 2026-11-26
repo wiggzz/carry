@@ -244,6 +244,11 @@ pub(super) fn plan(
             .map(|(keep, compact)| ViewCosts { keep, compact });
         let output =
             body["max_output_tokens"].as_u64().unwrap_or(0) as f64 * config.payoff_requests as f64;
+        let cache_sensitivity = primary.as_ref().map(|cost| {
+            json!({
+                "keep":cost.keep_cache,"compact":cost.compact_cache
+            })
+        });
         let primary = primary.and_then(|cost| {
             primary_rates(
                 config,
@@ -273,7 +278,7 @@ pub(super) fn plan(
                 Sha256::digest(serde_json::to_vec(&members).unwrap())
             )
         };
-        reports.push(json!({"candidate_id":id,"action":if members.is_empty() {"keep"} else {"projection"},"baseline":is_baseline,"removed_groups":eligible.iter().filter(|g| g.members.iter().all(|m| projection.omitted.contains(m))).map(|g|g.id).collect::<Vec<_>>(),"omitted_members":members,"feasible":feasible,"selection_joint":joint,"primary_retained_estimated_tokens":compact_input.map(|input|input.tokens),"primary_input_basis":compact_input.map(|input|input.basis),"primary_retained_required_tokens":required}));
+        reports.push(json!({"candidate_id":id,"action":if members.is_empty() {"keep"} else {"projection"},"baseline":is_baseline,"removed_groups":eligible.iter().filter(|g| g.members.iter().all(|m| projection.omitted.contains(m))).map(|g|g.id).collect::<Vec<_>>(),"omitted_members":members,"feasible":feasible,"selection_joint":joint,"primary_input_cache_sensitivity":cache_sensitivity,"primary_retained_estimated_tokens":compact_input.map(|input|input.tokens),"primary_input_basis":compact_input.map(|input|input.basis),"primary_retained_required_tokens":required}));
         if feasible && (is_baseline || forced || joint.is_some_and(|j| j.accepted)) {
             let score = if forced {
                 compact_input.map_or(f64::INFINITY, |input| input.tokens as f64)
@@ -301,8 +306,13 @@ pub(super) fn plan(
             config.model_resolution.as_ref().map(|p|&p.reviewer))).map(|input|input.tokens),"primary_context_tokens":config.primary_context_tokens,
         "selected_candidate_id":best.as_ref().map(|(_,_,id)|id.as_str()).or(if forced {None} else {Some("keep")}),
         "selected_action":if selected {"projection"} else {"keep"},
+        "selection_reason":if forced {"capacity"} else if selected {"joint_payback"} else if eligible.is_empty() {"no_authorized_removal"} else {"no_safe_economic_change"},
         "payoff_requests":config.payoff_requests,"min_payback_percent":config.min_payback_percent,
-        "cache_basis":"actual_compatible_wire_terminal_receipts_30_minute_ttl",
+        "cache_basis":"qualified_compatible_wire_receipts_at_dispatch",
+        "cache_evidence":crate::proxy_cache::diagnostics(&session.upstream_cache,&wire,resolved,&config.primary_cache_auth,at),
+        "future_cache_basis":{"selection":"unknown_timing_no_future_cache_credit",
+          "cold_sensitivity":"each_future_gap_at_or_beyond_retention_or_no_hit",
+          "warm_sensitivity":"fixed_history_each_future_gap_within_qualified_retention_and_all_eligible_input_hits"},
         "estimate_basis":"frozen_primary_horizon_and_actual_current_review_schedule",
         "candidates":reports});
     if wire_tokens.is_none() {

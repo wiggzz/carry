@@ -210,14 +210,18 @@ impl Replay {
             // history/cache owner. Never replay/reprice old opaque omissions.
             self.receipts.quantity_policy_version = Some(1);
         }
-        let policy_version = resolved
-            .map_or(Some(carry::models::ScenarioCachePolicy::VERSION), |r| {
-                r.scenario_cache_policy.as_ref().map(|p| p.version)
-            });
+        let policy_version = match resolved {
+            Some(model) => model
+                .scenario_cache_policy
+                .as_ref()
+                .map(|policy| policy.version),
+            None if self.chronological && body.forecast_write_billing.is_none() => Some(2),
+            None => Some(carry::models::ScenarioCachePolicy::VERSION),
+        };
         let previous_version = self.receipts.scenario_cache_policy_version;
         let cache_policy_changed = previous_version != policy_version;
         if cache_policy_changed {
-            if !self.chronological {
+            if !self.chronological || policy_version.is_some_and(|version| version >= 3) {
                 // Freeze cumulative provenance before ANY version transition. Cache
                 // becomes cold, but ancestry checks still own summary invalidation.
                 let prior = self.snapshot();
@@ -598,13 +602,34 @@ impl Replay {
         // Only an identical initial prompt inherits real cache evidence. After
         // divergence the modeled branch evolves independently of native hits.
         let pair = self.history.price_primary(observed, || {
+            let cached = cached?;
+            if body.cache_mode == carry::models::ScenarioCacheMode::Implicit
+                && minimum.is_some_and(|minimum| traditional >= minimum)
+                && cached < traditional
+                && (body.forecast_write_billing == Some(carry::models::CacheWriteBilling::Unknown)
+                    || resolved.is_some_and(|resolved| {
+                        resolved
+                            .scenario_cache_policy
+                            .as_ref()
+                            .is_some_and(|policy| policy.version >= 3)
+                            && resolved.cache_write_billing(body.cache_mode)
+                                == carry::models::CacheWriteBilling::Unknown
+                    }))
+            {
+                self.result.coverage.withheld_write_premium_requests += 1;
+            }
             crate::savings::scenario_input_cost_with_mode(
                 model,
                 traditional,
-                cached?,
+                cached,
                 minimum,
                 body.cache_mode,
-                |model, usage| modeled_cost(model, usage, resolved),
+                |model, usage| match body.forecast_write_billing {
+                    Some(billing) => Some(usage.cost_at_rates(billing.forecast_rates(
+                        carry::models::Rates::for_model(model, usage.input_tokens as f64)?,
+                    ))),
+                    None => modeled_cost(model, usage, resolved),
+                },
             )
             .and_then(|input| {
                 Some(

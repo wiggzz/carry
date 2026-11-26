@@ -435,6 +435,7 @@ fn primary_output_cap_reverses_warm_keep_vs_cold_tier_rewrite_with_zero_missing_
     let drop_tokens = estimate(&primary_wire_body(&config, &compact));
     let primary = &mut session.model_resolution.as_mut().unwrap().primary;
     primary.cache = carry::models::model_spec("gpt-6-sol").unwrap().cache;
+    primary.route = Route::new("https://api.openai.com/v1/responses", false);
     primary.cheap_input_boundary = Some(((keep_tokens + drop_tokens) / 2.0) as u32);
     primary.long_input_multiplier = Some(1.0);
     primary.long_output_multiplier = Some(2.0);

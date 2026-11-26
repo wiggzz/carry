@@ -50,7 +50,8 @@ fn partition_credit(usage: Value, valid: bool) {
     } else {
         assert!(cache.iter().all(|e| e.write_window.is_none()));
     }
-    assert_eq!(reusable(&cache, &body, Some(&model), "scope", 107), 0.0);
+    assert_eq!(reusable(&cache, &body, Some(&model), "scope", 107), if valid { credit } else { 0.0 });
+    assert_eq!(reusable(&cache, &body, Some(&model), "scope", 1900), 0.0);
     assert_eq!(serde_json::to_vec(&cache).unwrap(), encoded);
 }
 

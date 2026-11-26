@@ -1241,8 +1241,9 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
         ("http://127.0.0.1:12345/responses", true),
         ("https://example.invalid/responses", false),
     ] {
-        let resolved =
-            resolve_model(model, Route::new(endpoint, subscription), None, None, 0, 0).unwrap();
+        let resolved = resolve_model(model, Route::new(endpoint, subscription), None, None, 0, 0)
+            .unwrap()
+            .with_scenario_cache_policy();
         let route_cache = resolved.cache;
         let mut t = Trajectory::default();
         // A genuine equal-token rewrite keeps this a divergent-forecast control.
@@ -1278,8 +1279,13 @@ fn receipt_subscription_traditional_cache_uses_model_policy_not_transport_capabi
             Some(&resolved),
         );
         let warm = t.snapshot();
-        let rates = resolved.forecast_rates_for_input(2100.0).unwrap();
-        let expected_warm = 2000.0 * rates.cached + 100.0 * rates.write;
+        let rates = resolved.rates_for_input(2100.0).unwrap();
+        let write_rate = if endpoint == "https://api.openai.com/v1/responses" {
+            rates.write
+        } else {
+            rates.input
+        };
+        let expected_warm = 2000.0 * rates.cached + 100.0 * write_rate;
         assert!((warm.traditional_cost - cold.traditional_cost - expected_warm).abs() < 1e-12);
         assert_eq!(warm.coverage.unknown_cache_requests, 0);
         assert_eq!(

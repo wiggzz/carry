@@ -657,7 +657,7 @@ class DashboardDispatchContract(unittest.TestCase):
                 Path(directory, "second-shrink-restoration.json").write_text(json.dumps({"counts": counts, "restored": restored}, indent=2))
 
     def test_distinct_rewrites_use_real_continuation_across_restart_and_append(self):
-        tracer = marginal.PlannerMarginalBaseline("test_tiny_edit_cannot_beat_a_cheaper_valid_warm_continuation")
+        tracer = marginal.PlannerMarginalBaseline()
         tracer.setUp()
         try:
             evidence = tracer.run_arm("dashboard_rewrites", False, restart=True, followups=True)

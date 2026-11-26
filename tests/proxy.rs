@@ -144,8 +144,8 @@ fn marginal_planner_preserves_cheaper_valid_warm_projection() {
     // method outcomes alongside independently uploaded synthetic wire data.
     std::io::Write::write_all(&mut std::io::stdout(), &output.stderr).unwrap();
     if !output.status.success() {
-        let captured = output_directory
-            .join("test_tiny_edit_cannot_beat_a_cheaper_valid_warm_continuation.json");
+        let captured =
+            output_directory.join("test_tiny_edit_competes_with_valid_cold_continuation.json");
         if let Ok(bytes) = std::fs::read(captured) {
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             eprintln!(
@@ -873,7 +873,8 @@ fn private_numeric_journal(bytes: &[u8], saved: &serde_json::Value, completed: u
                     "cost":null,"billable":true,"retained":0,"retained_visible":0,"retained_opaque":0,
                     "retained_member":null,"estimated_retained":false,"unsupported_opaque":false,
                     "allowance":null,"fixed":facts["fixed"].as_u64()?,"protected":facts["protected"].as_u64()?,
-                    "cache_scope":facts["cache_scope"],"cache_mode":"Implicit","read_refresh":null,
+                    "cache_scope":facts["cache_scope"],"cache_mode":"Implicit",
+                    "forecast_write_billing":"unknown","read_refresh":null,
                     "native_summary":false,
                     "prompt":{"items":1,"wire":digest(&refs),"semantic":digest(&refs),
                         "prior_prefix":[usize::from(sequence != 1),digest(&prefix),digest(&prefix)]}

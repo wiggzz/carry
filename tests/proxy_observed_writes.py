@@ -76,13 +76,13 @@ class ObservedWrites(support.FixtureCase):
             self.assertEqual(saved["shadow"]["calls"], 0)
             self.assertEqual(fixture.primaries[-1]["input"], history)
             if step:
-                # Immutable write proof and the latest raw read observation are
-                # distinct facts; a read must not rewrite the original receipt.
-                expected_records = 2 if partition == "full" and step == 2 else 1
-                self.assertEqual(len(records), expected_records)
+                # A gateway can retain the latest raw observation, not a
+                # historical write window it had no authority to establish.
+                self.assertEqual(len(records), 1)
                 self.assertEqual(records[-1]["native_cached_fraction"], cached / 2000)
                 self.assertEqual(records[-1]["native_input_tokens"], 2000)
                 self.assertEqual(records[-1]["native_write_tokens"], written)
+                self.assertEqual(records[-1]["native_read_tokens"], cached)
             snapshots.append(copy.deepcopy(records))
             brackets.append((before, after))
             wires.append(copy.deepcopy(fixture.primaries[-1]))
@@ -105,39 +105,16 @@ class ObservedWrites(support.FixtureCase):
         self.assertEqual(len(wires), len(receipts))
         self.assertTrue(all(wire == wires[0] for wire in wires), "whole native wire is unchanged")
 
-        # Every wire/paid/raw-observation/restart control above runs before the
-        # first missing producer assertion. A read cannot manufacture a write or
-        # resurrect one revoked by a newer miss. A later full write can rewarm.
-        first_window = snapshots[1][0].get("write_window")
-        with self.subTest(stage="initial_write"):
-            if partition == "full":
-                self.assertIsInstance(first_window, dict,
-                    "OBSERVED_WRITE_PRODUCER: real full write needs transport bounds, not terminal-time freshness")
-                self.assertGreaterEqual(first_window["not_before"], brackets[1][0])
-                self.assertLessEqual(first_window["not_before"], provider_times[1])
-                self.assertGreaterEqual(first_window["not_after"], provider_times[1])
-                self.assertLessEqual(first_window["not_after"], brackets[1][1])
-                self.assertEqual(first_window["lifetime"], 1800)
-            else:
-                self.assertIsNone(first_window, "partial/unlocated writes and reads do not prove whole-prefix timing")
-        with self.subTest(stage="read_not_refresh"):
-            self.assertEqual(snapshots[2][0].get("write_window"), first_window)
-            if partition == "full":
-                self.assertEqual(snapshots[2][0], snapshots[1][0],
-                                 "read cannot rewrite the original full-write fact")
-                self.assertIsNone(snapshots[2][-1].get("write_window"),
-                                  "latest read has no new write timing")
-        for step in (3, 4):
-            with self.subTest(stage="miss_then_unknown_hit", step=step):
-                self.assertIsNone(snapshots[step][0].get("write_window"))
-        with self.subTest(stage="actual_rewarm"):
-            window = snapshots[5][0].get("write_window")
-            self.assertIsInstance(window, dict, "OBSERVED_WRITE_PRODUCER: a new full write must rewarm")
-            self.assertGreaterEqual(window["not_before"], brackets[5][0])
-            self.assertLessEqual(window["not_before"], provider_times[5])
-            self.assertGreaterEqual(window["not_after"], provider_times[5])
-            self.assertLessEqual(window["not_after"], brackets[5][1])
-            self.assertEqual(window["lifetime"], 1800)
+        # The qualified-provider producer has dedicated Rust transport and
+        # expiry controls. The real gateway CLI must not give a repeated
+        # full write or a complete read timing authority even after restart.
+        for step, records in enumerate(snapshots[1:], 1):
+            with self.subTest(stage="gateway_receipt_only", step=step):
+                record, = records
+                self.assertIsNone(record.get("write_window"))
+                self.assertIsNone(record.get("read_window"))
+                self.assertEqual(record["ttl_seconds"], 0)
+                self.assertEqual(record["estimated_tokens"], 0)
 
 
 def install_cases():
