@@ -133,6 +133,11 @@ fn pinned(service: &Service) -> HashSet<String> {
         .map(|(_, id)| id.clone())
         .collect()
 }
+pub(super) fn dashboard_pins(service: &Service) -> Vec<String> {
+    let mut owners = pinned(service).into_iter().collect::<Vec<_>>();
+    owners.sort_unstable();
+    owners
+}
 fn reserve(service: &Service, key: String, store: &Store) -> Result<(String, Pin), Failure> {
     let mut pins = PINS.lock().unwrap();
     for ((dir, id), owner) in pins.iter() {
@@ -442,6 +447,9 @@ pub(super) struct ReadView {
     policy: String,
 }
 impl ReadView {
+    pub(super) fn dashboard_validity(&self) -> std::io::Result<dashboard_cache::Validity> {
+        self.store.lock().unwrap().dashboard_validity()
+    }
     pub(super) fn new(service: &Service) -> std::io::Result<Self> {
         let _guard = IO.lock().unwrap();
         let store = read(service)?;

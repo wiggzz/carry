@@ -1535,3 +1535,325 @@ async fn dashboard_context_states_partition_sources_not_memories() {
         "memory facts are separate from source states"
     );
 }
+
+async fn cached_dashboard_poll(service: &Arc<Service>, page: SessionPage) -> Value {
+    let response = dashboard_stats(
+        State(service.clone()),
+        ConnectInfo("127.0.0.1:1".parse().unwrap()),
+        HeaderMap::new(),
+        axum::extract::Query(page),
+    )
+    .await
+    .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn dashboard_unchanged_polls_reuse_lookups_but_processing_stays_live() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(checkpoint_service(directory.path()));
+    let id = format!("{:064x}", 901);
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("cached-dashboard".into()),
+        ..Default::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"unchanged source ".repeat(1000)})])
+        .unwrap();
+    save(&service, &id, &session).unwrap();
+    let reads = || {
+        history::ReadView::new(&service)
+            .unwrap()
+            .read_profile()
+            .1
+            .values()
+            .sum::<u64>()
+    };
+    let began = Instant::now();
+    let first = cached_dashboard_poll(&service, SessionPage::default()).await;
+    let cold = began.elapsed();
+    let before = reads();
+    let lock = Arc::new(Mutex::new(()));
+    service
+        .locks
+        .lock()
+        .await
+        .insert(id.clone(), Arc::downgrade(&lock));
+    let guard = lock.lock().await;
+    let began = Instant::now();
+    let mut second = cached_dashboard_poll(&service, SessionPage::default()).await;
+    let warm = began.elapsed();
+    assert_eq!(second["sessions"][0]["processing"], true);
+    second["sessions"][0]["processing"] = json!(false);
+    assert_eq!(first, second);
+    eprintln!(
+        "dashboard-cache cold_us={} warm_us={} additional_reads={}",
+        cold.as_micros(),
+        warm.as_micros(),
+        reads() - before
+    );
+    assert_eq!(
+        reads(),
+        before,
+        "unchanged polls must not decode history/accounting again"
+    );
+    drop(guard);
+    assert_eq!(
+        cached_dashboard_poll(&service, SessionPage::default()).await,
+        first
+    );
+}
+
+#[tokio::test]
+async fn dashboard_cache_refreshes_checkpoints_wal_and_removed_authority() {
+    for shared in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(checkpoint_service(directory.path()));
+        let id = format!("{:064x}", 902);
+        let mut session = Session {
+            history_shared: shared,
+            history_namespace: Some("cache-publication".into()),
+            ..Default::default()
+        };
+        session
+            .ingest(&[json!({"role":"user","content":"cache source"})])
+            .unwrap();
+        save(&service, &id, &session).unwrap();
+        let first = cached_dashboard_poll(&service, SessionPage::default()).await;
+        assert_eq!(first["sessions"][0]["completed_requests"], 0);
+        session.completed_requests = 1;
+        save(&service, &id, &session).unwrap();
+        let second = cached_dashboard_poll(&service, SessionPage::default()).await;
+        assert_eq!(second["sessions"][0]["completed_requests"], 1);
+        if shared {
+            // Stage an authoritative snapshot update in WAL only. Neither
+            // the checkpoint mirror nor main database changes.
+            let db = rusqlite::Connection::open(directory.path().join("history.index")).unwrap();
+            db.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+            let mirror = std::fs::read(directory.path().join(format!("{id}.json"))).unwrap();
+            let main = std::fs::metadata(directory.path().join("history.index"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let raw: Vec<u8> = db
+                .query_row(
+                    "SELECT data FROM records WHERE kind='snapshots' AND key=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut snapshot: Value = serde_json::from_slice(&raw).unwrap();
+            snapshot["completed_requests"] = json!(2);
+            db.execute(
+                "UPDATE records SET data=?1 WHERE kind='snapshots' AND key=?2",
+                rusqlite::params![serde_json::to_vec(&snapshot).unwrap(), id],
+            )
+            .unwrap();
+            assert!(
+                std::fs::metadata(directory.path().join("history.index"))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    == main,
+                "WAL fixture must preserve the main file"
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join(format!("{id}.json"))).unwrap(),
+                mirror
+            );
+            assert_eq!(
+                cached_dashboard_poll(&service, SessionPage::default()).await["sessions"][0]["completed_requests"],
+                2
+            );
+            drop(db);
+            // No cached mirror may stand in for missing indexed authority.
+            std::fs::remove_file(directory.path().join("history.index")).unwrap();
+            let missing = cached_dashboard_poll(&service, SessionPage::default()).await;
+            assert!(missing["sessions"].as_array().unwrap().is_empty());
+            assert_eq!(missing["unavailable_sessions"], 1);
+        } else {
+            std::fs::remove_file(directory.path().join(format!("{id}.json"))).unwrap();
+            assert!(
+                cached_dashboard_poll(&service, SessionPage::default()).await["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn dashboard_cache_expires_without_writes_including_epoch_zero() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for start in [0, 20_000_000] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut service = checkpoint_service(directory.path());
+        service.config.history_max_age_secs = 10;
+        service.config.accounting_max_age_secs = 20;
+        let service = Arc::new(service);
+        let id = format!("{:064x}", 903);
+        let mut session = Session {
+            history_shared: true,
+            history_namespace: Some("cache-expiry".into()),
+            request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+            ..Default::default()
+        };
+        session
+            .ingest(&[json!({"role":"user","content":"expiring source"})])
+            .unwrap();
+        numeric_primary(&mut session, 0);
+        at_decision_clock(&[start], || save(&service, &id, &session).unwrap());
+        let poll = |at| {
+            at_decision_clock(&[at], || {
+                runtime.block_on(cached_dashboard_poll(&service, SessionPage::default()))
+            })
+        };
+        let live = poll(start + 9);
+        assert_eq!(live["sessions"].as_array().unwrap().len(), 1);
+        let expired = poll(start + 10);
+        assert!(
+            expired["sessions"].as_array().unwrap().is_empty(),
+            "raw authority must expire without writes, start={start}"
+        );
+        assert_eq!(expired["usage"]["primary"]["calls"], 1);
+        assert_eq!(
+            poll(start + 20)["usage"]["primary"]["calls"],
+            1,
+            "inclusive accounting cutoff"
+        );
+        assert_eq!(poll(start + 21)["usage"]["primary"]["calls"], 0);
+        assert_eq!(
+            poll(start + 9)["sessions"].as_array().unwrap().len(),
+            1,
+            "a backward clock must invalidate the cache"
+        );
+    }
+}
+
+#[test]
+fn dashboard_cache_tracks_live_retention_pins() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.config.history_max_age_secs = 10;
+    let service = Arc::new(service);
+    let id = format!("{:064x}", 904);
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("cache-pins".into()),
+        ..Default::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"pinned source"})])
+        .unwrap();
+    at_decision_clock(&[100], || save(&service, &id, &session).unwrap());
+    let pin = at_decision_clock(&[109], || history::pin(&service, &id).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    at_decision_clock(&[110], || {
+        let pinned = runtime.block_on(cached_dashboard_poll(&service, SessionPage::default()));
+        assert_eq!(pinned["sessions"].as_array().unwrap().len(), 1);
+        drop(pin);
+        let expired = runtime.block_on(cached_dashboard_poll(&service, SessionPage::default()));
+        assert!(expired["sessions"].as_array().unwrap().is_empty());
+    });
+}
+
+#[tokio::test]
+async fn dashboard_cache_rechecks_numeric_archives_and_success_seeds() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(checkpoint_service(directory.path()));
+    let id = format!("{:064x}", 905);
+    let mut session = Session {
+        history_shared: true,
+        history_namespace: Some("cache-evidence".into()),
+        request_evidence: Some(crate::proxy_savings::RequestEvidence::default()),
+        ..Default::default()
+    };
+    session
+        .ingest(&[json!({"role":"user","content":"archived numeric source"})])
+        .unwrap();
+    session.request_evidence.as_mut().unwrap().bind_archive(
+        &history::FilePolicy::new(&service.config),
+        &id,
+        Some("cache-evidence"),
+    );
+    numeric_primary(&mut session, 0);
+    save(&service, &id, &session).unwrap();
+    let original = cached_dashboard_poll(&service, SessionPage::default()).await;
+    let archive = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".request-evidence-")
+        })
+        .unwrap()
+        .path();
+    let bytes = std::fs::read(&archive).unwrap();
+    std::fs::write(&archive, b"invalid archive").unwrap();
+    let damaged = cached_dashboard_poll(&service, SessionPage::default()).await;
+    assert_ne!(
+        damaged["cost_estimate"], original["cost_estimate"],
+        "cached comparison must not hide an archive integrity failure"
+    );
+    assert_eq!(
+        damaged,
+        build_dashboard_stats(&service, &None, 20).unwrap().0
+    );
+    std::fs::write(&archive, bytes).unwrap();
+    assert_eq!(
+        cached_dashboard_poll(&service, SessionPage::default()).await,
+        original
+    );
+    let seed = directory.path().join("historical-success.seed");
+    std::fs::write(&seed, b"invalid seed").unwrap();
+    let damaged = cached_dashboard_poll(&service, SessionPage::default()).await;
+    assert_eq!(damaged["unavailable_sessions"], 1);
+    assert!(damaged["sessions"].as_array().unwrap().is_empty());
+    std::fs::remove_file(seed).unwrap();
+    assert_eq!(
+        cached_dashboard_poll(&service, SessionPage::default()).await,
+        original
+    );
+}
+
+#[tokio::test]
+async fn dashboard_cache_hits_still_require_authorization_and_valid_cursors() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = checkpoint_service(directory.path());
+    service.auth_token = Some("dashboard-test-token".into());
+    let service = Arc::new(service);
+    cached_dashboard_poll(&service, SessionPage::default()).await;
+    let denied = dashboard_stats(
+        State(service.clone()),
+        ConnectInfo("192.0.2.1:1".parse().unwrap()),
+        HeaderMap::new(),
+        axum::extract::Query(SessionPage::default()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
+    let invalid = dashboard_stats(
+        State(service),
+        ConnectInfo("127.0.0.1:1".parse().unwrap()),
+        HeaderMap::new(),
+        axum::extract::Query(SessionPage {
+            after_id: "invalid".into(),
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
+}
